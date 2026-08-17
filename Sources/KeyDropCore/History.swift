@@ -1,6 +1,6 @@
 import Foundation
 
-struct HistoryEntry: Codable {
+public struct HistoryEntry: Codable {
     private enum CodingKeys: String, CodingKey {
         case id, ts, raw, format, name, url, model, models, key, keyMasked, targets
         case ccProviderID, ccRenamedFrom, ccRenamedTo, cpaConfigPath, status, note
@@ -8,30 +8,30 @@ struct HistoryEntry: Codable {
         case ccMissing
     }
 
-    var id: String
-    var ts: TimeInterval
-    var raw: String
-    var format: String
-    var name: String?
-    var url: String?
-    var model: String?
-    var models: [String]?
-    var key: String?
-    var keyMasked: String
-    var targets: [String]
-    var ccProviderID: String?
-    var ccRenamedFrom: String?
-    var ccRenamedTo: String?
-    var cpaConfigPath: String?
-    var status: String
-    var note: String?
-    var health: String?
-    var healthDetail: String?
-    var healthAt: TimeInterval?
+    public var id: String
+    public var ts: TimeInterval
+    public var raw: String
+    public var format: String
+    public var name: String?
+    public var url: String?
+    public var model: String?
+    public var models: [String]?
+    public var key: String?
+    public var keyMasked: String
+    public var targets: [String]
+    public var ccProviderID: String?
+    public var ccRenamedFrom: String?
+    public var ccRenamedTo: String?
+    public var cpaConfigPath: String?
+    public var status: String
+    public var note: String?
+    public var health: String?
+    public var healthDetail: String?
+    public var healthAt: TimeInterval?
     /// cc-switch 中 provider 已缺失,但 key 仍可用(可手动重新导入)
-    var ccMissing: Bool?
+    public var ccMissing: Bool?
 
-    var healthColor: (ok: Bool, dead: Bool) {
+    public var healthColor: (ok: Bool, dead: Bool) {
         switch health {
         case "dead": return (false, true)
         case "err": return (false, false)
@@ -39,7 +39,7 @@ struct HistoryEntry: Codable {
         }
     }
 
-    init(
+    public init(
         id: String,
         ts: TimeInterval,
         raw: String,
@@ -85,7 +85,7 @@ struct HistoryEntry: Codable {
         self.ccMissing = ccMissing
     }
 
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         ts = try c.decode(TimeInterval.self, forKey: .ts)
@@ -110,7 +110,7 @@ struct HistoryEntry: Codable {
         ccMissing = try c.decodeIfPresent(Bool.self, forKey: .ccMissing)
     }
 
-    func encode(to encoder: Encoder) throws {
+    public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
         try c.encode(ts, forKey: .ts)
@@ -135,13 +135,13 @@ struct HistoryEntry: Codable {
         try c.encodeIfPresent(ccMissing, forKey: .ccMissing)
     }
 
-    var timeStr: String {
+    public var timeStr: String {
         let df = DateFormatter()
         df.dateFormat = "MM-dd HH:mm"
         return df.string(from: Date(timeIntervalSince1970: ts))
     }
 
-    var summary: String {
+    public var summary: String {
         var parts: [String] = []
         let ms = models ?? (model.map { [$0] })
         if let ms, !ms.isEmpty {
@@ -156,7 +156,7 @@ struct HistoryEntry: Codable {
     }
 }
 
-final class HistoryStore {
+public final class HistoryStore {
     static let shared = HistoryStore()
 
     var storeDir: URL {
@@ -172,9 +172,9 @@ final class HistoryStore {
     /// 非线程安全快照入口;UI/CLI 请用 snapshot()
     var items: [HistoryEntry] { snapshot() }
 
-    init() { load() }
+    public init() { load() }
 
-    func snapshot() -> [HistoryEntry] {
+    public func snapshot() -> [HistoryEntry] {
         lock.lock(); defer { lock.unlock() }
         return _items
     }
@@ -191,14 +191,32 @@ final class HistoryStore {
         }
     }
 
-    func save() throws {
+    public func save() throws {
         lock.lock()
         let copy = _items
         lock.unlock()
         struct Wrapper: Codable { var items: [HistoryEntry] }
+        var merged = copy
+        // 竞态保护(跨进程,如 CLI 删除 vs app 内存):
+        //   - 文件存在而内存缺失(文件独有)= CLI 新增 → 保留
+        //   - 内存存在而文件缺失:
+        //       条目的 ts 晚于文件全部条目 → 本次会话新增 → 保留
+        //       否则 → 其他进程已删除 → 丢弃(防复活)
+        //   - 同 id 以内存版为准(健康更新等)
+        if let data = try? Data(contentsOf: fileURL),
+           let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
+            let fileMaxTS = w.items.map { $0.ts }.max() ?? 0
+            let fileByID = Dictionary(uniqueKeysWithValues: w.items.map { ($0.id, $0) })
+            let memIDs = Set(copy.map { $0.id })
+            merged = copy.filter { e in
+                if fileByID[e.id] != nil { return true }
+                return e.ts > fileMaxTS
+            } + w.items.filter { !memIDs.contains($0.id) }
+            merged.sort { $0.ts > $1.ts }
+        }
         try FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storeDir.path)
-        let data = try JSONEncoder().encode(Wrapper(items: copy))
+        let data = try JSONEncoder().encode(Wrapper(items: merged))
         let tmp = fileURL.appendingPathExtension("tmp")
         try data.write(to: tmp, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
@@ -207,9 +225,12 @@ final class HistoryStore {
         } else {
             try FileManager.default.moveItem(at: tmp, to: fileURL)
         }
+        lock.lock()
+        _items = merged
+        lock.unlock()
     }
 
-    func append(_ e: HistoryEntry) throws {
+    public func append(_ e: HistoryEntry) throws {
         lock.lock()
         _items.insert(e, at: 0)
         if _items.count > 500 { _items = Array(_items.prefix(500)) }
@@ -217,7 +238,7 @@ final class HistoryStore {
         try save()
     }
 
-    func update(_ e: HistoryEntry) throws {
+    public func update(_ e: HistoryEntry) throws {
         lock.lock()
         if let i = _items.firstIndex(where: { $0.id == e.id }) {
             _items[i] = e
@@ -228,7 +249,7 @@ final class HistoryStore {
         }
     }
 
-    func find(idPrefix: String) -> HistoryEntry? {
+    public func find(idPrefix: String) -> HistoryEntry? {
         let prefix = idPrefix.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !prefix.isEmpty else { return nil }
         let matches = snapshot().filter { $0.id.hasPrefix(prefix) }
@@ -247,7 +268,7 @@ final class HistoryStore {
     }
 
     /// 按 API key 查找已存在的活跃记录(同一 key 全局唯一)
-    func findActiveByKey(_ key: String) -> HistoryEntry? {
+    public func findActiveByKey(_ key: String) -> HistoryEntry? {
         let wantKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !wantKey.isEmpty else { return nil }
         return snapshot().first {
@@ -260,13 +281,13 @@ final class HistoryStore {
         findActiveByKey(key)
     }
 
-    func lastURL() -> String? {
+    public func lastURL() -> String? {
         snapshot().first { ($0.url ?? "").isEmpty == false && $0.status == "active" }?.url
     }
 }
 
-final class Prefs {
-    static let shared = Prefs()
+public final class Prefs {
+    public static let shared = Prefs()
 
     private var fileURL: URL {
         let base = ProcessInfo.processInfo.environment["KEYDROP_HOME"]
@@ -281,24 +302,24 @@ final class Prefs {
     private var _cpaConfigPath: String? = nil
     private var _proxy = ""
 
-    var useCC: Bool {
+    public var useCC: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _useCC }
         set { lock.lock(); _useCC = newValue; lock.unlock() }
     }
-    var useCPA: Bool {
+    public var useCPA: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _useCPA }
         set { lock.lock(); _useCPA = newValue; lock.unlock() }
     }
-    var useDSH: Bool {
+    public var useDSH: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _useDSH }
         set { lock.lock(); _useDSH = newValue; lock.unlock() }
     }
-    var cpaConfigPath: String? {
+    public var cpaConfigPath: String? {
         get { lock.lock(); defer { lock.unlock() }; return _cpaConfigPath }
         set { lock.lock(); _cpaConfigPath = newValue; lock.unlock() }
     }
     /// 本地代理(如 http://127.0.0.1:7890);为空表示直连
-    var proxy: String {
+    public var proxy: String {
         get { lock.lock(); defer { lock.unlock() }; return _proxy }
         set { lock.lock(); _proxy = newValue; lock.unlock() }
     }
@@ -320,7 +341,7 @@ final class Prefs {
         loaded = true
     }
 
-    func resolvedCPAConfig() -> String? {
+    public func resolvedCPAConfig() -> String? {
         if let override = ProcessInfo.processInfo.environment["KEYDROP_CPA_CONFIG"],
            FileManager.default.fileExists(atPath: override) {
             return override
@@ -334,7 +355,7 @@ final class Prefs {
         return CPAWriter.locateConfig()
     }
 
-    func save() throws {
+    public func save() throws {
         lock.lock()
         let cc = _useCC
         let cpa = _useCPA

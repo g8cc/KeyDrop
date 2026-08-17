@@ -1,3 +1,4 @@
+import KeyDropCore
 import AppKit
 import SwiftUI
 import UserNotifications
@@ -24,6 +25,10 @@ final class AppState: ObservableObject {
     @Published var highlightID: String?
     @Published var highlightPulse = 0
     @Published var helpShown = false
+    @Published var editShown = false
+    @Published var editTarget: HistoryEntry?
+    @Published var editModelsText = ""
+    @Published var editNameText = ""
     private var statusClearTask: DispatchWorkItem?
     private var healthTimer: Timer?
 
@@ -350,6 +355,51 @@ final class AppState: ObservableObject {
         }
     }
 
+    func showEdit(_ entry: HistoryEntry) {
+        editTarget = entry
+        editModelsText = (entry.models ?? (entry.model.map { [$0] } ?? [])).joined(separator: ", ")
+        editNameText = entry.name ?? ""
+        editShown = true
+    }
+
+    func doEdit() {
+        guard let entry = editTarget else { return }
+        guard !isBusy else { return }
+        let models = editModelsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let name = editNameText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !models.isEmpty || !name.isEmpty else {
+            setStatus("模型或名称至少填一项", ok: false)
+            return
+        }
+        editShown = false
+        isBusy = true
+        busyLabel = "保存编辑…"
+        Task { @MainActor in
+            defer {
+                isBusy = false
+                busyLabel = ""
+            }
+            do {
+                let msg = try await Task.detached(priority: .userInitiated) { () throws -> String in
+                    try Core.shared.editEntry(
+                        entryIDPrefix: entry.id,
+                        models: models.isEmpty ? nil : models,
+                        name: name.isEmpty ? nil : name
+                    )
+                }.value
+                setStatus(msg, ok: true)
+                historyVersion += 1
+                notify(summary: "已保存编辑", body: msg)
+            } catch {
+                setStatus("编辑失败: \(error.localizedDescription)", ok: false)
+                historyVersion += 1
+            }
+        }
+    }
+
     func doLaunchApp(entryID: String, cmd: String) {
         guard !isBusy else { return }
         let entry = core.history.find(idPrefix: entryID)
@@ -453,7 +503,7 @@ final class AppState: ObservableObject {
 
     func clearDead() {
         let ids = core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err") }
+            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err" || $0.health == "proxy-ok") }
             .map { $0.id }
         guard !ids.isEmpty, !isBusy else { return }
         isBusy = true
@@ -552,6 +602,7 @@ struct HistoryRow: View {
     let onLaunchApp: (String, String) -> Void
     let onCopyCurl: () -> Void
     let onReimport: () -> Void
+    let onEdit: () -> Void
     let highlighted: Bool
     @State private var showDeleteConfirm = false
     @State private var hovered = false
@@ -581,6 +632,7 @@ struct HistoryRow: View {
             switch entry.health {
             case "dead": return Color(red: 0.86, green: 0.28, blue: 0.24)
             case "err": return Color(red: 0.90, green: 0.55, blue: 0.18)
+            case "proxy-ok": return Color(red: 0.93, green: 0.68, blue: 0.20)
             default: return Color(red: 0.28, green: 0.68, blue: 0.42)
             }
         }()
@@ -589,6 +641,7 @@ struct HistoryRow: View {
             case "ok": return "可用 · 最近测试通过"
             case "dead": return "key 已失效 · 建议删除"
             case "err": return "测试异常 · 点 ↻ 重测"
+            case "proxy-ok": return "需代理 · 直连不可用,经代理可用"
             default: return "尚未测试"
             }
         }()
@@ -710,6 +763,16 @@ struct HistoryRow: View {
                                 : "打开 \(app.cmd)"
                             )
                         }
+                        Button {
+                            onEdit()
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(Color(red: 0.55, green: 0.55, blue: 0.62))
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(busy)
+                        .help("编辑模型 / 名称")
                         Button {
                             showDeleteConfirm = true
                         } label: {
@@ -1034,6 +1097,60 @@ struct HelpView: View {
     }
 }
 
+// MARK: - Edit sheet
+
+struct EditView: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("编辑条目")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Button {
+                    state.editShown = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+            if let entry = state.editTarget {
+                Text("\(entry.id.prefix(8)) · \(entry.summary)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                TextField("模型(逗号分隔)", text: $state.editModelsText)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+                    .help("留空则不改动模型;填写后逐一自动验证(大小写敏感)")
+                TextField("名称(可选)", text: $state.editNameText)
+                    .font(.system(size: 12))
+                    .textFieldStyle(.roundedBorder)
+                HStack {
+                    Text("保存后将自动重新验证并同步 cc-switch / dsh")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("取消") {
+                        state.editShown = false
+                    }
+                    .buttonStyle(.bordered)
+                    Button("保存") {
+                        state.doEdit()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 420)
+    }
+}
+
 // MARK: - Main panel
 
 struct PanelView: View {
@@ -1128,7 +1245,7 @@ struct PanelView: View {
     private var deadItems: [HistoryEntry] {
         _ = state.historyVersion
         return state.core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err") }
+            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err" || $0.health == "proxy-ok") }
             .sorted { $0.ts > $1.ts }
             .prefix(60)
             .map { $0 }
@@ -1179,6 +1296,9 @@ struct PanelView: View {
         }
         .sheet(isPresented: $state.helpShown) {
             HelpView(state: state)
+        }
+        .sheet(isPresented: $state.editShown) {
+            EditView(state: state)
         }
         .overlay(alignment: .top) {
             if let toastText {
@@ -1429,6 +1549,7 @@ struct PanelView: View {
                                         showToast("已复制 curl")
                                     },
                                     onReimport: { state.doReimport(e.id) },
+                                    onEdit: { state.showEdit(e) },
                                     highlighted: state.highlightID == e.id && state.highlightPulse > 0
                                 )
                             }
@@ -1512,6 +1633,7 @@ struct PanelView: View {
                                                 showToast("已复制 curl")
                                             },
                                             onReimport: { state.doReimport(e.id) },
+                                            onEdit: { state.showEdit(e) },
                                             highlighted: false
                                         )
                                     }

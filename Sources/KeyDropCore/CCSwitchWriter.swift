@@ -1,9 +1,9 @@
 import Foundation
 import AppKit
 
-struct CCAddResult {
-    let providerID: String
-    let providerName: String
+public struct CCAddResult {
+    public let providerID: String
+    public let providerName: String
     var renamedFrom: String? = nil
     var renamedTo: String? = nil
     var directMode = false
@@ -27,17 +27,18 @@ enum WriterError: LocalizedError {
     }
 }
 
-final class CCSwitchWriter {
+public final class CCSwitchWriter {
+    public init() {}
 
-    static var dbPath: String {
+    public static var dbPath: String {
         ProcessInfo.processInfo.environment["KEYDROP_CC_DB"]
             ?? (NSHomeDirectory() + "/.cc-switch/cc-switch.db")
     }
-    static var switchSettingsPath: String {
+    public static var switchSettingsPath: String {
         ProcessInfo.processInfo.environment["KEYDROP_CC_SETTINGS"]
             ?? (NSHomeDirectory() + "/.cc-switch/settings.json")
     }
-    static var claudeSettingsPath: String {
+    static public var claudeSettingsPath: String {
         ProcessInfo.processInfo.environment["KEYDROP_CLAUDE_SETTINGS"]
             ?? (NSHomeDirectory() + "/.claude/settings.json")
     }
@@ -52,7 +53,7 @@ final class CCSwitchWriter {
 
     // MARK: - add
 
-    func add(_ p: ParsedKey, nameOverride: String? = nil, appType: String = "claude", models: [String] = [], proxy: String? = nil) throws -> CCAddResult {
+    public func add(_ p: ParsedKey, nameOverride: String? = nil, appType: String = "claude", models: [String] = [], proxy: String? = nil) throws -> CCAddResult {
         guard let key = p.key, !key.isEmpty else { throw WriterError.missingKey }
         guard let url = p.url, !url.isEmpty else { throw WriterError.missingURL }
         try Self.ensureDB()
@@ -60,12 +61,18 @@ final class CCSwitchWriter {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         let id = UUID().uuidString.lowercased()
         let name = (nameOverride?.isEmpty == false ? nameOverride! : p.name) ?? defaultName(for: url)
+        let wireApi = "responses"
+        let supportsResponses = appType == "codex" ? APITester.supportsResponsesAPI(base: url, key: key, proxy: proxy) : true
+        let apiFormat = supportsResponses ? "openai_responses" : "openai_chat"
+        let meta = appType == "codex"
+            ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
+            : "{}"
 
         let settingsConfig: String
         if appType == "opencode" {
             settingsConfig = try opencodeSettingsConfig(p, models: models)
         } else if appType == "codex" {
-            settingsConfig = try codexSettingsConfig(p, models: models)
+            settingsConfig = try codexSettingsConfig(p, models: models, wireApi: wireApi)
         } else {
             settingsConfig = try claudeSettingsConfig(p, models: models, proxy: proxy)
         }
@@ -76,14 +83,20 @@ final class CCSwitchWriter {
         let db = try DB(path: Self.dbPath)
         try db.exec("BEGIN IMMEDIATE")
         do {
-            if appType == "opencode" {
-                let normURL = opencodeBaseURL(url)
-                if let existing = try db.scalar(
-                    "SELECT p.id FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type='opencode' AND e.url=? LIMIT 1",
-                    [normURL]
-                ) {
-                    try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [existing])
-                    try db.run("DELETE FROM providers WHERE id=?", [existing])
+            if appType == "opencode" || appType == "codex" {
+                let normURL = appType == "opencode" ? opencodeBaseURL(url) : normalizeEndpointURL(url)
+                // endpoint url 可能带或不带 /v1/尾部斜杠,规范化后比较
+                let candidates = try db.query(
+                    "SELECT p.id, e.url FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
+                    [appType]
+                )
+                let existing = candidates.first { row in
+                    guard row.count > 1, let u = row[1] else { return false }
+                    return normalizeEndpointURL(u) == normURL
+                }
+                if let id = existing?[0] {
+                    try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [id])
+                    try db.run("DELETE FROM providers WHERE id=?", [id])
                 }
             }
             try db.run(
@@ -91,9 +104,9 @@ final class CCSwitchWriter {
                 INSERT INTO providers
                 (id, app_type, name, settings_config, website_url, category,
                  created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue)
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, '{}', 1, 0)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, 1, 0)
                 """,
-                [id, appType, name, settingsConfig, now]
+                [id, appType, name, settingsConfig, now, meta]
             )
             try db.run("UPDATE providers SET is_current = 0 WHERE app_type = ? AND id != ?", [appType, id])
             try db.run(
@@ -112,6 +125,9 @@ final class CCSwitchWriter {
             try db.exec("COMMIT")
 
             var result = CCAddResult(providerID: id, providerName: name)
+            if appType == "codex" && !supportsResponses {
+                result.warnings.append("该网关不支持 Responses API(codex 新版仅支持 responses 格式),codex 可能无法使用;建议将同 key 导入到 opencode")
+            }
             result.renamedFrom = renamedFrom
             result.renamedTo = renamedTo
 
@@ -132,11 +148,22 @@ final class CCSwitchWriter {
             }
 
             if appType == "codex" {
-                do {
-                    try mergeCodexConfig(p, models: models)
-                    result.directMode = true
-                } catch {
-                    result.warnings.append("codex config.toml 更新失败: \(error.localizedDescription)")
+                let proxied = (try? String(contentsOfFile: Self.codexConfigPath, encoding: .utf8))
+                    .flatMap { c -> Bool in
+                        let custom = c.components(separatedBy: "[model_providers.custom]").dropFirst().first ?? ""
+                        return custom.contains("PROXY_MANAGED") || custom.contains("127.0.0.1:15721")
+                    } ?? false
+                if proxied {
+                    // cc-switch 接管中:不直写 config.toml,仅 DB + switch settings 由 cc-switch 应用
+                    // (base_url 必须保持指向本地代理,转换链路才生效)
+                    result.proxyMode = true
+                } else {
+                    do {
+                        try mergeCodexConfig(p, models: models)
+                        result.directMode = true
+                    } catch {
+                        result.warnings.append("codex config.toml 更新失败: \(error.localizedDescription)")
+                    }
                 }
                 return result
             }
@@ -223,14 +250,14 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         ])
     }
 
-    private func codexSettingsConfig(_ p: ParsedKey, models: [String]) throws -> String {
+    private func codexSettingsConfig(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws -> String {
         try jsonString([
             "auth": ["OPENAI_API_KEY": p.key ?? ""],
-            "config": codexConfigToml(p, models: models)
+            "config": codexConfigToml(p, models: models, wireApi: wireApi)
         ])
     }
 
-    private func codexConfigToml(_ p: ParsedKey, models: [String]) throws -> String {
+    private func codexConfigToml(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws -> String {
         let url = p.url ?? ""
         let model = models.first(where: { !$0.isEmpty })
             ?? (p.model?.isEmpty == false ? p.model : nil)
@@ -267,6 +294,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                         .trimmingCharacters(in: .whitespaces) ?? ""
                     switch key {
                     case "base_url": customLines?.append("base_url = \"\(url)\"")
+                    case "wire_api": customLines?.append("wire_api = \"\(wireApi)\"")
                     case "name": customLines?.append("name = \"custom\"")
                     case "env_key": break
                     case "requires_openai_auth": customLines?.append("requires_openai_auth = true"); hasAuthLine = true
@@ -305,7 +333,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 out.append("")
                 out.append("[model_providers.custom]")
                 out.append("name = \"custom\"")
-                out.append("wire_api = \"responses\"")
+                out.append("wire_api = \"\(wireApi)\"")
                 out.append("requires_openai_auth = true")
                 out.append("base_url = \"\(url)\"")
             }
@@ -318,19 +346,19 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             "",
             "[model_providers.custom]",
             "name = \"custom\"",
-            "wire_api = \"responses\"",
+            "wire_api = \"\(wireApi)\"",
             "requires_openai_auth = true",
             "base_url = \"\(url)\""
         ].joined(separator: "\n")
     }
 
-    func mergeCodexConfig(_ p: ParsedKey, models: [String]) throws {
+    func mergeCodexConfig(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws {
         let cfgPath = Self.codexConfigPath
         if FileManager.default.fileExists(atPath: cfgPath) {
             _ = try? FileManager.default.removeItem(atPath: cfgPath + ".bak")
             try? FileManager.default.copyItem(atPath: cfgPath, toPath: cfgPath + ".bak")
         }
-        try writeText(try codexConfigToml(p, models: models), to: cfgPath)
+        try writeText(try codexConfigToml(p, models: models, wireApi: wireApi), to: cfgPath)
         let authPath = Self.codexAuthPath
         if FileManager.default.fileExists(atPath: authPath) {
             _ = try? FileManager.default.removeItem(atPath: authPath + ".bak")
@@ -377,7 +405,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     }
 
     /// 复制用:模型在 opencode 里实际存的显示名;不在 opencode 里则回退 模型-条目ID前8位(稳定)
-    static func copyModelName(for entry: HistoryEntry, model: String) -> String {
+    public static func copyModelName(for entry: HistoryEntry, model: String) -> String {
         let path = opencodeConfigPath
         if FileManager.default.fileExists(atPath: path),
            let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
@@ -439,6 +467,14 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         return u + "/v1"
     }
 
+    /// endpoint 去重比较用:去尾斜杠,/chat/completions 归一到 /v1
+    private func normalizeEndpointURL(_ url: String) -> String {
+        let u = url.hasSuffix("/") ? String(url.dropLast()) : url
+        if u.hasSuffix("/chat/completions") { return String(u.dropLast("/chat/completions".count)) + "/v1" }
+        if u.hasSuffix("/v1") || u.hasSuffix("/api") { return u }
+        return u + "/v1"
+    }
+
     func mergeOpencodeProvider(_ p: ParsedKey, providerID: String, models: [String]) throws {
         let path = Self.opencodeConfigPath
         if FileManager.default.fileExists(atPath: path) {
@@ -491,7 +527,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
 
     // MARK: - self-heal
 
-    func repairMissingProvider(entry: HistoryEntry) throws -> Bool {
+    public func repairMissingProvider(entry: HistoryEntry) throws -> Bool {
         guard let pid = entry.ccProviderID, entry.status == "active",
               entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
               let key = entry.key, !key.isEmpty,
@@ -511,12 +547,13 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         p.name = entry.name
         let models = entry.models ?? (entry.model.map { [$0] } ?? [])
         let name = (entry.name?.isEmpty == false ? entry.name! : defaultName(for: url))
+        let wireApi = "responses"
 
         let settingsConfig: String
         if appType == "opencode" {
             settingsConfig = try opencodeSettingsConfig(p, models: models)
         } else if appType == "codex" {
-            settingsConfig = try codexSettingsConfig(p, models: models)
+            settingsConfig = try codexSettingsConfig(p, models: models, wireApi: wireApi)
         } else {
             settingsConfig = try jsonString(["env": claudeEnv(for: p, models: models)])
         }
@@ -527,9 +564,13 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             promote = (alive == nil)
         }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let apiFormat = APITester.supportsResponsesAPI(base: url, key: key, proxy: nil) ? "openai_responses" : "openai_chat"
+        let meta = appType == "codex"
+            ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
+            : "{}"
         try db.run(
             "INSERT INTO providers (id, app_type, name, settings_config, created_at, meta, is_current) VALUES (?,?,?,?,?,?,?)",
-            [pid, appType, name, settingsConfig, now, "{}", promote ? 1 : 0]
+            [pid, appType, name, settingsConfig, now, meta, promote ? 1 : 0]
         )
         if promote {
             try updateSwitchSettings(pid, for: appType)
@@ -727,7 +768,7 @@ try db.exec("COMMIT")
     /// 刷新模型后同步 cc-switch:总是更新 DB settings_config(切换回该 provider 时用新列表),
     /// 仅当该 provider 是当前激活时同步真实配置文件,避免覆盖其他 provider 的环境。
     func syncModelsAfterRefresh(
-        _ p: ParsedKey, providerID: String, appType: String, models: [String]
+        _ p: ParsedKey, providerID: String, appType: String, models: [String], proxy: String? = nil
     ) throws {
         guard FileManager.default.fileExists(atPath: Self.dbPath) else { return }
         let db = try DB(path: Self.dbPath)
@@ -735,12 +776,13 @@ try db.exec("COMMIT")
             "SELECT is_current FROM providers WHERE id = ? AND app_type = ?",
             [providerID, appType]
         )) == "1"
+        let wireApi = "responses"
 
         let settingsConfig: String
         if appType == "opencode" {
             settingsConfig = try opencodeSettingsConfig(p, models: models)
         } else if appType == "codex" {
-            settingsConfig = try codexSettingsConfig(p, models: models)
+            settingsConfig = try codexSettingsConfig(p, models: models, wireApi: wireApi)
         } else {
             settingsConfig = try jsonString(["env": claudeEnv(for: p, models: models)])
         }
@@ -758,13 +800,26 @@ try db.exec("COMMIT")
         guard isCurrent else { return }
         switch appType {
         case "codex":
-            try mergeCodexConfig(p, models: models)
+            let proxied = (try? String(contentsOfFile: Self.codexConfigPath, encoding: .utf8))
+                .flatMap { c -> Bool in
+                    let custom = c.components(separatedBy: "[model_providers.custom]").dropFirst().first ?? ""
+                    return custom.contains("PROXY_MANAGED") || custom.contains("127.0.0.1:15721")
+                } ?? false
+            if !proxied {
+                try mergeCodexConfig(p, models: models, wireApi: wireApi)
+            }
         default:
             try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models))
         }
     }
 
-    static func ccSwitchRunning() -> Bool {
+    func providerExists(_ id: String, appType: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: Self.dbPath) else { return false }
+        let db = try? DB(path: Self.dbPath)
+        return (try? db?.scalar("SELECT count(*) FROM providers WHERE id=? AND app_type=?", [id, appType])) == "1"
+    }
+
+    static public func ccSwitchRunning() -> Bool {
         if ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "1" { return true }
         if ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "0" { return false }
         return NSWorkspace.shared.runningApplications.contains {
@@ -788,11 +843,11 @@ try db.exec("COMMIT")
         return "\(host)-\(df.string(from: Date()))"
     }
 
-    func readSwitchSettings() -> [String: Any]? {
+    public func readSwitchSettings() -> [String: Any]? {
         readJSON(Self.switchSettingsPath)
     }
 
-    func readClaudeSettings() -> [String: Any]? {
+    public func readClaudeSettings() -> [String: Any]? {
         readJSON(Self.claudeSettingsPath)
     }
 
@@ -904,9 +959,9 @@ try db.exec("COMMIT")
     }
 }
 
-enum Logger {
-    static func warn(_ s: String) { write(s) }
-    static func info(_ s: String) { write(s) }
+public enum Logger {
+    static public func warn(_ s: String) { write(s) }
+    static public func info(_ s: String) { write(s) }
     private static func write(_ s: String) {
         let data = (s + "\n").data(using: .utf8) ?? Data()
         FileHandle.standardError.write(data)

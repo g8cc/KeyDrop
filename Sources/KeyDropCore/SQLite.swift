@@ -15,11 +15,11 @@ enum SQLiteError: LocalizedError {
     }
 }
 
-final class DB {
+public final class DB {
     private var handle: OpaquePointer?
 
-    init(path: String) throws {
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
+    public init(path: String) throws {
+        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         let rc = sqlite3_open_v2(path, &handle, flags, nil)
         guard rc == SQLITE_OK, let handle else {
             let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "rc=\(rc)"
@@ -33,7 +33,7 @@ final class DB {
         if let h = handle { sqlite3_close(h) }
     }
 
-    func exec(_ sql: String) throws {
+    public func exec(_ sql: String) throws {
         var errPtr: UnsafeMutablePointer<CChar>?
         let rc = sqlite3_exec(handle, sql, nil, nil, &errPtr)
         if rc != SQLITE_OK {
@@ -43,7 +43,7 @@ final class DB {
         }
     }
 
-    func run(_ sql: String, _ binds: [Any?] = []) throws {
+    public func run(_ sql: String, _ binds: [Any?] = []) throws {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
             throw SQLiteError.exec(String(cString: sqlite3_errmsg(handle)))
@@ -56,7 +56,7 @@ final class DB {
         }
     }
 
-    func query(_ sql: String, _ binds: [Any?] = []) throws -> [[String?]] {
+    public func query(_ sql: String, _ binds: [Any?] = []) throws -> [[String?]] {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
             throw SQLiteError.query(String(cString: sqlite3_errmsg(handle)))
@@ -84,7 +84,7 @@ final class DB {
         return rows
     }
 
-    func scalar(_ sql: String, _ binds: [Any?] = []) throws -> String? {
+    public func scalar(_ sql: String, _ binds: [Any?] = []) throws -> String? {
         try query(sql, binds).first?.first ?? nil
     }
 

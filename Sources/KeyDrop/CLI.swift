@@ -1,4 +1,5 @@
 import Foundation
+import KeyDropCore
 
 enum CLI {
     static func run(_ args: [String]) -> Int32 {
@@ -28,6 +29,7 @@ enum CLI {
             case "--dsh": dshOverride = true
             case "--no-dsh": dshOverride = false
             case "--force": force = true
+            case "--yes", "-y": break
             case "--no-verify": noVerify = true
             case "--name":
                 if i + 1 < a.count {
@@ -80,6 +82,7 @@ enum CLI {
                     models: modelsOverride.isEmpty ? nil : modelsOverride,
                     force: force,
                     appType: appType ?? Core.defaultAppType,
+                    appTypeForced: appType != nil,
                     proxy: proxy ?? ProcessInfo.processInfo.environment["KEYDROP_PROXY"]
                 ) { models in
                     ModelPicker.pick(from: models, title: "测试通过,获取到 \(models.count) 个模型(空格勾选,可多选):") ?? models

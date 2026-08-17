@@ -1,21 +1,29 @@
 import Foundation
 
-struct ClashProxy: Codable {
-    var name: String
-    var type: String = "anytls"
-    var server: String
-    var port: Int
-    var uuid: String
-    var sni: String
-    var skipCertVerify: Bool = true
-    var udp: Bool = true
+public struct ClashProxy: Codable {
+    public var name: String
+    public var type: String = "anytls"
+    public var server: String
+    public var port: Int
+    public var uuid: String
+    public var sni: String
+    public var skipCertVerify: Bool = true
+    public var udp: Bool = true
+    public init(name: String, type: String = "anytls", server: String, port: Int, uuid: String, sni: String) {
+        self.name = name
+        self.type = type
+        self.server = server
+        self.port = port
+        self.uuid = uuid
+        self.sni = sni
+    }
 }
 
-enum Parser {
+public enum Parser {
 
     private struct Cand { let value: String; let lhs: String? }
 
-    static func parse(_ raw: String, depth: Int = 0) throws -> ParsedKey {
+    public static func parse(_ raw: String, depth: Int = 0) throws -> ParsedKey {
         let text = stripPasteNoise(normalizeFullWidth(raw)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw ParseError.emptyInput }
 
@@ -42,7 +50,7 @@ enum Parser {
         return try parsePlain(text)
     }
 
-    static func parseWithFallback(_ raw: String) throws -> ParsedKey {
+    public static func parseWithFallback(_ raw: String) throws -> ParsedKey {
         let parsed: ParsedKey
         do {
             parsed = try parse(raw)
@@ -75,7 +83,7 @@ enum Parser {
         return parsed
     }
 
-    static func extractAllKeys(_ raw: String) -> [String] {
+    public static func extractAllKeys(_ raw: String) -> [String] {
         let tokens = raw.split(whereSeparator: { $0.isNewline || $0 == " " || $0 == "\t" })
             .map(String.init)
             .filter { !$0.isEmpty }
@@ -130,10 +138,45 @@ enum Parser {
             extractJSON(obj, into: &p)
             if p.key != nil {
                 p.format = "json"
+                applyOfficialURLFallback(&p, raw: text)
                 return p
             }
         }
-        return try parseMultiline(trimmed)
+        var p = try parseMultiline(trimmed)
+        applyOfficialURLFallback(&p, raw: text)
+        return p
+    }
+
+    // MARK: - 官方站点 fallback
+
+    /// 无 URL 时按名称/文本匹配官方提供商 base URL
+    static let officialBaseURLs: [(pattern: String, url: String)] = [
+        ("deepseek", "https://api.deepseek.com"),
+        ("moonshot|kimi", "https://api.moonshot.cn/v1"),
+        ("dashscope|qwen|通义", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("zhipu|glm|bigmodel", "https://open.bigmodel.cn/api/paas/v4"),
+        ("openai|chatgpt", "https://api.openai.com/v1"),
+        ("anthropic|claude", "https://api.anthropic.com"),
+        ("gemini|generativelanguage|gemini官方", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+        ("groq", "https://api.groq.com/openai/v1"),
+        ("mistral", "https://api.mistral.ai/v1"),
+        ("volcengine|火山|ark", "https://ark.cn-beijing.volces.com/api/v3"),
+        ("siliconflow|硅基流动", "https://api.siliconflow.cn/v1"),
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("together", "https://api.together.xyz/v1"),
+        ("fireworks", "https://api.fireworks.ai/inference/v1"),
+        ("stepfun|阶跃", "https://api.stepfun.com/v1"),
+        ("minimax|海螺", "https://api.minimaxi.com/v1"),
+        ("讯飞|xfyun|spark", "https://spark-api-open.xf-yun.com/v1")
+    ]
+
+    public static func applyOfficialURLFallback(_ p: inout ParsedKey, raw: String) {
+        guard p.url == nil else { return }
+        let haystack = ((p.name ?? "") + " " + raw).lowercased()
+        for item in officialBaseURLs where haystack.range(of: item.pattern, options: .regularExpression) != nil {
+            p.url = item.url
+            return
+        }
     }
 
     static func normalizeQuotes(_ s: String) -> String {
@@ -581,12 +624,18 @@ enum Parser {
             .replacingOccurrences(of: "及", with: ",")
             .replacingOccurrences(of: "与", with: ",")
             .replacingOccurrences(of: "或", with: ",")
+        let tokens = withSeqs.components(separatedBy: CharacterSet(charactersIn: ",，、; "))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
         let cleaned = stripCJK(withSeqs)
-        let tokens = cleaned.components(separatedBy: CharacterSet(charactersIn: ",，、; "))
+        let cleanedTokens = cleaned.components(separatedBy: CharacterSet(charactersIn: ",，、; "))
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         var out: [String] = []
-        for t in tokens {
+        for (i, t) in cleanedTokens.enumerated() {
+            // 原 token 含中文 → 名称/描述(如 "deepseek官方api"→"deepseekapi"),非模型
+            let origHasCJK = i < tokens.count && tokens[i].unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }
+            if origHasCJK { continue }
             if looksLikeModel(t) {
                 let l = t.lowercased()
                 if l.range(of: #"(claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex)"#, options: .regularExpression) != nil
@@ -752,7 +801,7 @@ enum Parser {
 
     // MARK: - heuristics
 
-    static func stripPasteNoise(_ s: String) -> String {
+    static public func stripPasteNoise(_ s: String) -> String {
         var t = s.replacingOccurrences(of: "`", with: "")
         t = t.replacingOccurrences(of: #"^```[A-Za-z0-9]*\s*\n"#, with: "", options: .regularExpression)
         t = t.replacingOccurrences(of: #"\n```[A-Za-z0-9]*\s*$"#, with: "", options: .regularExpression)
@@ -767,7 +816,7 @@ enum Parser {
         }.joined(separator: "\n")
     }
 
-    static func normalizeFullWidth(_ s: String) -> String {
+    static public func normalizeFullWidth(_ s: String) -> String {
         let map: [Character: Character] = [
             "：": ":", "（": "(", "）": ")",
             "，": ",", "、": ",", "；": ";",
@@ -934,6 +983,7 @@ enum Parser {
         guard s.contains(where: { $0.isLetter }) else { return false }
         if s.contains(where: { $0 == "$" || $0 == "！" || $0 == "？" || $0 == "!" || $0 == "?" }) { return false }
         let l = s.lowercased()
+        if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
         let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
         if l.range(of: families, options: .regularExpression) != nil { return true }
         if l.range(of: #"\d"#, options: .regularExpression) != nil { return true }
@@ -941,11 +991,11 @@ enum Parser {
         return false
     }
 
-    static func isAnyTLS(_ s: String) -> Bool {
+    static public func isAnyTLS(_ s: String) -> Bool {
         s.lowercased().hasPrefix("anytls://")
     }
 
-    static func isProxyURL(_ s: String) -> Bool {
+    static public func isProxyURL(_ s: String) -> Bool {
         let l = s.lowercased()
         return l.hasPrefix("anytls://") || l.hasPrefix("vless://") || l.hasPrefix("vmess://")
             || l.hasPrefix("ss://") || l.hasPrefix("trojan://") || l.hasPrefix("hysteria2://")
@@ -994,7 +1044,7 @@ enum Parser {
         return ClashProxy(name: name.isEmpty ? "\(host):\(port)" : name, type: type, server: host, port: port, uuid: uuid, sni: sni)
     }
 
-    static func parseAnyTLS(_ url: String) -> ClashProxy? {
+    static public func parseAnyTLS(_ url: String) -> ClashProxy? {
         guard isAnyTLS(url) else { return nil }
         let s = String(url.dropFirst("anytls://".count))
         guard let at = s.firstIndex(of: "@") else { return nil }

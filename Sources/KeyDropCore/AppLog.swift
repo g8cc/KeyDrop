@@ -1,6 +1,6 @@
 import Foundation
 
-enum AppLog {
+public enum AppLog {
 
     static let dir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Logs/KeyDrop", isDirectory: true)
@@ -11,9 +11,9 @@ enum AppLog {
     private static let lock = NSLock()
     private static let tokenRegex = try! NSRegularExpression(pattern: #"[A-Za-z0-9+/_\-.]{6,}"#)
 
-    static func info(_ msg: String) { write("INFO", msg) }
-    static func warn(_ msg: String) { write("WARN", msg) }
-    static func error(_ msg: String) { write("ERROR", msg) }
+    public static func info(_ msg: String) { write("INFO", msg) }
+    public static func warn(_ msg: String) { write("WARN", msg) }
+    public static func error(_ msg: String) { write("ERROR", msg) }
 
     static func write(_ level: String, _ msg: String) {
         let safe = maskSecrets(msg)

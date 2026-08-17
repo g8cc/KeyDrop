@@ -1,3 +1,4 @@
+import KeyDropCore
 import AppKit
 import SwiftUI
 import ServiceManagement
@@ -253,7 +254,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func togglePanel() {
         if let p = panel, p.isVisible {
-            p.orderOut(nil)
+            if NSApp.isActive {
+                p.orderOut(nil)
+            } else {
+                // 窗口存在但 app 失焦(被其他窗口盖住):带回前台而非隐藏
+                p.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                retryFocus()
+            }
             return
         }
         showPanel()
@@ -272,8 +280,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             p.title = "KeyDrop"
             p.contentView = hosting
             p.delegate = self
-            p.level = .floating
-            p.isFloatingPanel = true
+            p.level = .normal
+            p.isFloatingPanel = false
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             p.isReleasedWhenClosed = false
