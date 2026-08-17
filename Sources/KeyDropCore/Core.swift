@@ -1,33 +1,41 @@
 import Foundation
 
-struct AddOutcome {
-    let entry: HistoryEntry
-    let lines: [String]
-    let ok: Bool
+public struct AddOutcome {
+    public let entry: HistoryEntry
+    public let lines: [String]
+    public let ok: Bool
+    public init(entry: HistoryEntry, lines: [String], ok: Bool) {
+        self.entry = entry
+        self.lines = lines
+        self.ok = ok
+    }
 }
 
-final class Core {
-    static let shared = Core()
+public final class Core {
+    public static let shared = Core()
+    public init() {}
 
-    static var defaultAppType: String {
+    public static var defaultAppType: String {
         ProcessInfo.processInfo.environment["KEYDROP_APP"] ?? "opencode"
     }
 
     let cc = CCSwitchWriter()
-    let history = HistoryStore.shared
-    let prefs = Prefs.shared
+    public let history = HistoryStore.shared
+    public let prefs = Prefs.shared
 
-    func add(
+    public func add(
         raw: String,
         ccOverride: Bool? = nil,
         cpaOverride: Bool? = nil,
         dshOverride: Bool? = nil,
         models: [String]? = nil,
         force: Bool = false,
-        appType: String = Core.defaultAppType,
+        appType: String? = nil,
+        appTypeForced: Bool = false,
         proxy: String? = nil,
         pickModels: (([String]) -> [String])? = nil
     ) throws -> AddOutcome {
+        let appType = appType ?? Core.defaultAppType
         AppLog.info("add 开始(force=\(force))")
         defer { AppLog.info("add 结束") }
         let proxyURL: String? = {
@@ -108,12 +116,18 @@ final class Core {
             throw ParseError.noKeyFound("解析未得到 key。")
         }
 
-        if !force, let dup = history.findActiveByKey(key) {
-            throw ParseError.duplicate(
-                id: dup.id,
-                message: "该 API key 已存在(\(dup.id) · \(dup.summary)),未重复导入。"
-                    + "如需覆盖请先删除旧记录,或 CLI 使用 --force。"
-            )
+        var dup: HistoryEntry? = nil
+        if let d = history.findActiveByKey(key) {
+            if (d.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == url {
+                dup = d
+                notes.append("幂等更新: 同 key 同 URL 已存在(\(d.id.prefix(8))),将刷新该条目而非新建")
+            } else if !force {
+                throw ParseError.duplicate(
+                    id: d.id,
+                    message: "该 API key 已存在(\(d.id) · \(d.summary)),但 URL 不同(\(d.url ?? "") vs \(url))。"
+                        + "如需覆盖请先删除旧记录,或 CLI 使用 --force。"
+                )
+            }
         }
 
         let allKeys = Parser.extractAllKeys(raw)
@@ -231,7 +245,7 @@ final class Core {
         }
         parsed.model = selectedModels.first
 
-        let resolvedAppType = Self.routeAppType(selectedModels: selectedModels, modelsOverride: models, default: appType)
+        let resolvedAppType = Self.routeAppType(selectedModels: selectedModels, modelsOverride: models, default: appType, forced: appTypeForced)
         if resolvedAppType != appType {
             notes.append("按所选模型导入到 \(resolvedAppType)")
         }
@@ -241,8 +255,8 @@ final class Core {
         let useDSH = dshOverride ?? prefs.useDSH
 
         var entry = HistoryEntry(
-            id: UUID().uuidString.lowercased(),
-            ts: Date().timeIntervalSince1970,
+            id: dup?.id ?? UUID().uuidString.lowercased(),
+            ts: dup?.ts ?? Date().timeIntervalSince1970,
             raw: raw,
             format: parsed.format,
             name: name,
@@ -252,7 +266,7 @@ final class Core {
             key: parsed.key,
             keyMasked: parsed.keyMasked,
             targets: [],
-            ccProviderID: nil,
+            ccProviderID: dup?.ccProviderID,
             ccRenamedFrom: nil,
             ccRenamedTo: nil,
             cpaConfigPath: nil,
@@ -275,27 +289,38 @@ final class Core {
 
         if useCC {
             anyTarget = true
+            let appTag = resolvedAppType == "claude" ? "ccswitch" : "ccswitch-\(resolvedAppType)"
             do {
-                let r = try cc.add(parsed, appType: resolvedAppType, models: selectedModels, proxy: proxyURL)
-                entry.targets.append(resolvedAppType == "claude" ? "ccswitch" : "ccswitch-\(resolvedAppType)")
-                entry.ccProviderID = r.providerID
-                entry.ccRenamedFrom = r.renamedFrom
-                entry.ccRenamedTo = r.renamedTo
-                anyOK = true
-                let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
-                lines.append("✓ cc-switch: 已添加 provider「\(r.providerName)」到 \(appLabel) 并激活")
-                if r.renamedFrom != nil {
-                    lines.append("  热激活: 原 provider 已暂存,删除本条时自动还原")
-                }
-                if r.directMode {
-                    lines.append("  直写模式: 已更新配置文件,重开会话生效")
-                } else if r.proxyMode {
-                    lines.append("  代理模式: cc-switch 本地代理已热切换,立即可用,无需重启")
+                if let dup, let pid = dup.ccProviderID, dup.targets.contains(appTag), cc.providerExists(pid, appType: resolvedAppType) {
+                    // 幂等:provider 已存在,刷新 DB 配置与当前激活 provider 的配置文件
+                    try cc.syncModelsAfterRefresh(parsed, providerID: pid, appType: resolvedAppType, models: selectedModels, proxy: proxyURL)
+                    entry.ccProviderID = pid
+                    entry.targets.append(appTag)
+                    anyOK = true
+                    let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
+                    lines.append("✓ cc-switch: 已更新已有 provider「\(dup.name)」到 \(appLabel)(幂等)")
                 } else {
-                    lines.append("  已写入 cc-switch 数据库,请确认 cc-switch 正在运行")
-                }
-                for warning in r.warnings {
-                    lines.append("  ⚠ \(warning)")
+                    let r = try cc.add(parsed, appType: resolvedAppType, models: selectedModels, proxy: proxyURL)
+                    entry.targets.append(appTag)
+                    entry.ccProviderID = r.providerID
+                    entry.ccRenamedFrom = r.renamedFrom
+                    entry.ccRenamedTo = r.renamedTo
+                    anyOK = true
+                    let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
+                    lines.append("✓ cc-switch: 已添加 provider「\(r.providerName)」到 \(appLabel) 并激活")
+                    if r.renamedFrom != nil {
+                        lines.append("  热激活: 原 provider 已暂存,删除本条时自动还原")
+                    }
+                    if r.directMode {
+                        lines.append("  直写模式: 已更新配置文件,重开会话生效")
+                    } else if r.proxyMode {
+                        lines.append("  代理模式: cc-switch 本地代理已热切换,立即可用,无需重启")
+                    } else {
+                        lines.append("  已写入 cc-switch 数据库,请确认 cc-switch 正在运行")
+                    }
+                    for warning in r.warnings {
+                        lines.append("  ⚠ \(warning)")
+                    }
                 }
             } catch {
                 lines.append("✗ cc-switch 失败: \(error.localizedDescription)")
@@ -354,7 +379,11 @@ final class Core {
 
         if anyOK {
             do {
-                try history.append(entry)
+                if dup != nil {
+                    try history.update(entry)
+                } else {
+                    try history.append(entry)
+                }
                 try prefs.save()
             } catch {
                 lines.append("⚠ 历史/偏好保存失败: \(error.localizedDescription)")
@@ -365,7 +394,10 @@ final class Core {
         return AddOutcome(entry: entry, lines: lines, ok: anyOK)
     }
 
-    static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {
+    public static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {
+        if test.needsProxy {
+            return ("proxy-ok", test.detail + " ⚠ 该网关直连不可用,需代理;无代理的工具(dsh 等)需自行配置 HTTPS_PROXY 才可用")
+        }
         if test.ok { return ("ok", test.detail) }
         if test.authFailed { return ("dead", test.detail) }
         return ("err", test.detail)
@@ -376,7 +408,7 @@ final class Core {
         return p.isEmpty ? nil : p
     }
 
-    func scanHealth(staleAfter: TimeInterval = 1800, completion: (([String]) -> Void)? = nil) {
+    public func scanHealth(staleAfter: TimeInterval = 1800, completion: (([String]) -> Void)? = nil) {
         let synced = reconcileWithCCSwitch()
         if !synced.isEmpty {
             AppLog.info("health 扫描前对账: " + synced.joined(separator: "; "))
@@ -458,7 +490,7 @@ final class Core {
     }
 
     /// 手动重新导入:把 ccMissing 的 provider 重新写入 cc-switch
-    func reimportToCC(entryIDPrefix: String) throws -> String {
+    public func reimportToCC(entryIDPrefix: String) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
@@ -483,7 +515,7 @@ final class Core {
         return "✓ 已重新导入 cc-switch(\(appType)): \(entry.name ?? String(entry.id.prefix(8)))"
     }
 
-    func selfHeal() -> [String] {
+    public func selfHeal() -> [String] {
         reconcileWithCCSwitch()
     }
 
@@ -495,17 +527,17 @@ final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
         let test = APITester.test(url: url, key: key, proxy: proxyForHealth())
+        let h = Self.healthFor(test)
         if test.ok {
             if var found = history.find(idPrefix: entryIDPrefix) {
-                found.health = "ok"
-                found.healthDetail = test.detail
+                found.health = h.health
+                found.healthDetail = h.detail
                 found.healthAt = Date().timeIntervalSince1970
                 try? history.update(found)
             }
-            return "✓ 可用: \(test.detail) (\(test.models.count) 个模型)"
+            return "✓ 可用: \(h.detail) (\(test.models.count) 个模型)"
         }
         if var found = history.find(idPrefix: entryIDPrefix) {
-            let h = Self.healthFor(test)
             found.health = h.health
             found.healthDetail = h.detail
             found.healthAt = Date().timeIntervalSince1970
@@ -514,14 +546,15 @@ final class Core {
         return "✗ 不可用: \(test.detail)"
     }
 
-    static func parseClashProxies(raw: String) -> [ClashProxy] {
+    public static func parseClashProxies(raw: String) -> [ClashProxy] {
         raw.split(whereSeparator: { $0.isNewline })
             .map(String.init)
             .compactMap { Parser.parseProxyURL($0) }
             .filter { !$0.server.isEmpty && $0.port > 0 && !$0.uuid.isEmpty }
     }
 
-    static func routeAppType(selectedModels: [String], modelsOverride: [String]?, default appType: String) -> String {
+    public static func routeAppType(selectedModels: [String], modelsOverride: [String]?, default appType: String, forced: Bool = false) -> String {
+        if forced { return appType }
         func isGptModel(_ m: String) -> Bool {
             let l = m.lowercased()
             if l.contains("gpt-") || l.contains("/gpt") || l == "gpt" { return true }
@@ -539,7 +572,7 @@ final class Core {
         return "opencode"
     }
 
-    static func fetchSubscriptionProxies(url: String) throws -> [ClashProxy] {
+    public static func fetchSubscriptionProxies(url: String) throws -> [ClashProxy] {
         guard let u = URL(string: url),
               let scheme = u.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
@@ -593,11 +626,11 @@ final class Core {
         return proxies
     }
 
-    static func addClashProxies(_ proxies: [ClashProxy]) throws -> String {
+    public static func addClashProxies(_ proxies: [ClashProxy]) throws -> String {
         try ClashWriter.add(proxies: proxies)
     }
 
-    func refreshModels(
+    public func refreshModels(
         entryIDPrefix: String,
         pickModels: (([String]) -> [String])? = nil
     ) throws -> String {
@@ -623,6 +656,17 @@ final class Core {
         let testModels = test.models.filter { Parser.looksLikeModel($0) }
         if testModels.isEmpty {
             try? history.update(entry)
+            // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
+            if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
+               let pid = entry.ccProviderID {
+                let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                var p = ParsedKey()
+                p.url = url
+                p.key = key
+                p.model = entry.model
+                try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: currentModels.sorted(), proxy: proxyForHealth())
+            }
             let keep = currentModels.isEmpty ? "无" : currentModels.joined(separator: ", ")
             return "✓ 可用: \(test.detail) (端点无模型列表,保留已有模型: \(keep))"
         }
@@ -630,6 +674,17 @@ final class Core {
 
         if !modelsChanged {
             try? history.update(entry)
+            // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
+            if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
+               let pid = entry.ccProviderID {
+                let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                var p = ParsedKey()
+                p.url = url
+                p.key = key
+                p.model = entry.model
+                try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: currentModels.sorted(), proxy: proxyForHealth())
+            }
             return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,无变化)"
         }
 
@@ -656,7 +711,7 @@ final class Core {
             p.url = url
             p.key = key
             p.model = filtered.first
-            try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: filtered)
+            try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: filtered, proxy: proxyForHealth())
         }
 
         if entry.targets.contains("dsh") {
@@ -667,7 +722,7 @@ final class Core {
     }
 
     /// 编辑条目:改模型列表/名称,重新验证模型并同步所有目标(cc-switch/dsh)
-    func editEntry(
+    public func editEntry(
         entryIDPrefix: String,
         models: [String]? = nil,
         name: String? = nil,
@@ -730,7 +785,7 @@ final class Core {
             p.key = key
             p.model = newModels.first
             do {
-                try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: newModels)
+                try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: newModels, proxy: proxyForHealth())
                 lines.append("✓ cc-switch: 已同步模型")
             } catch {
                 lines.append("⚠ cc-switch 同步失败: \(error.localizedDescription)")
@@ -751,7 +806,7 @@ final class Core {
         return lines.joined(separator: "\n")
     }
 
-    func activateCPA(entryIDPrefix: String) throws -> String {
+    public func activateCPA(entryIDPrefix: String) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix)
             ?? history.findActiveByRaw(entryIDPrefix)
         else {
@@ -789,7 +844,7 @@ final class Core {
         return msg
     }
 
-    func delete(entryIDPrefix: String) throws -> String {
+    public func delete(entryIDPrefix: String) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix)
             ?? history.findActiveByRaw(entryIDPrefix)
         else {
@@ -888,7 +943,7 @@ final class Core {
         return nil
     }
 
-    func list(limit: Int = 20) -> String {
+    public func list(limit: Int = 20) -> String {
         var out: [String] = []
         for e in history.snapshot().prefix(limit) {
             let mark = e.status == "active" ? "●" : "○"

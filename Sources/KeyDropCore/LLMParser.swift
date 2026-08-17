@@ -1,6 +1,6 @@
 import Foundation
 
-enum LLMParser {
+public enum LLMParser {
 
     struct LLMResult {
         let url: String?
@@ -10,23 +10,23 @@ enum LLMParser {
         let raw: String
     }
 
-    static var enabled: Bool {
+    public static var enabled: Bool {
         ProcessInfo.processInfo.environment["KEYDROP_LLM_PARSE"] != "0"
     }
-    static var endpoint: String {
+    public static var endpoint: String {
         ProcessInfo.processInfo.environment["KEYDROP_LLM_ENDPOINT"] ?? "http://127.0.0.1:8317/v1"
     }
-    static var model: String {
+    public static var model: String {
         ProcessInfo.processInfo.environment["KEYDROP_LLM_MODEL"] ?? "shangtang"
     }
-    static var apiKey: String {
+    public static var apiKey: String {
         if let k = ProcessInfo.processInfo.environment["KEYDROP_LLM_KEY"], !k.isEmpty {
             return k
         }
         return clientKeyFromConfig()
     }
 
-    static func configSummary() -> String {
+    public static func configSummary() -> String {
         guard enabled else { return "LLM 解析: 已禁用 (KEYDROP_LLM_PARSE=0)" }
         let key = apiKey
         let keyMasked = key.count > 8 ? String(key.prefix(6)) + "…" : (key.isEmpty ? "(未配置)" : "***")
@@ -35,7 +35,7 @@ enum LLMParser {
         return s
     }
 
-    static func clientKeyFromConfig() -> String {
+    public static func clientKeyFromConfig() -> String {
         guard let cfg = CPAWriter.locateConfig(),
               let content = try? String(contentsOfFile: cfg, encoding: .utf8)
         else { return "" }

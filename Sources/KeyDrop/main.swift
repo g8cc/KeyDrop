@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import KeyDropCore
 
 weak var appDelegateWeak: AppDelegate?
 enum AppDelegateRef {

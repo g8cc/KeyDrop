@@ -1,4 +1,5 @@
 import Foundation
+import KeyDropCore
 import Darwin
 
 enum ModelPicker {

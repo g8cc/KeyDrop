@@ -1,20 +1,37 @@
 import Foundation
 
-struct APITestResult {
-    let ok: Bool
-    let style: String
-    let models: [String]
-    let detail: String
-    let authFailed: Bool
+public struct APITestResult {
+    public let ok: Bool
+    public let style: String
+    public let models: [String]
+    public let detail: String
+    public let authFailed: Bool
+    public let needsProxy: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool) {
+        self.ok = ok
+        self.style = style
+        self.models = models
+        self.detail = detail
+        self.authFailed = authFailed
+        self.needsProxy = needsProxy
+    }
 }
 
-enum APITester {
+extension APITestResult {
+    init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool) {
+        self.init(ok: ok, style: style, models: models, detail: detail, authFailed: authFailed, needsProxy: false)
+    }
+}
+
+public enum APITester {
 
     private static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 12
         c.timeoutIntervalForResource = 20
         c.httpMaximumConnectionsPerHost = 2
+        // 空字典覆盖系统代理设置 → 真直连测试(真实环境判定)
+        c.connectionProxyDictionary = [:]
         return URLSession(configuration: c)
     }()
 
@@ -36,7 +53,26 @@ enum APITester {
         return URLSession(configuration: c)
     }
 
-    static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil) -> APITestResult {
+    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil) -> APITestResult {
+        // 先按真实环境(直连)测试;直连失败仅当配置了代理时才补测代理,并标记需代理
+        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil)
+        if direct.ok || direct.authFailed {
+            return direct
+        }
+        let p = proxy?.trimmingCharacters(in: .whitespaces)
+        if p == nil || p!.isEmpty {
+            return direct
+        }
+        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p)
+        if via.ok {
+            return APITestResult(ok: true, style: via.style, models: via.models,
+                                 detail: via.detail + " | 直连失败,需代理,经代理验证通过",
+                                 authFailed: false, needsProxy: true)
+        }
+        return via
+    }
+
+    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil) -> APITestResult {
         let base = url.hasSuffix("/") ? String(url.dropLast()) : url
         let candidates = endpointCandidates(base)
         let s = session(for: proxy)
@@ -187,7 +223,7 @@ enum APITester {
     }
 
     /// 生成一条可直接粘贴运行的 curl(优先 chat,其次 models 探测)
-    static func curlCommand(
+    static public func curlCommand(
         url: String,
         key: String,
         model: String? = nil,
@@ -269,6 +305,38 @@ enum APITester {
             }
         }
         return (false, "模型验证请求超时/无响应")
+    }
+
+    /// 探测网关是否支持 OpenAI Responses API(供 codex wire_api 选择)
+    /// 2xx/401/403 → 端点存在(支持);404/405/501 → 不支持;网络错误 → 保守返回 true(保持默认)
+    static func supportsResponsesAPI(base: String, key: String, timeout: TimeInterval = 8, proxy: String? = nil) -> Bool {
+        let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
+        let path = hasV1 ? "/responses" : "/v1/responses"
+        guard let u = URL(string: base + path) else { return true }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "model": "gpt-4.1-mini",
+            "input": "ping",
+            "max_output_tokens": 1
+        ])
+        let s = session(for: proxy)
+        let sem = DispatchSemaphore(value: 0)
+        var status = 0
+        let task = s.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            task.cancel()
+            return true
+        }
+        if status == 0 { return true }
+        return status != 404 && status != 405 && status != 501
     }
 
     private static func shQuote(_ s: String) -> String {

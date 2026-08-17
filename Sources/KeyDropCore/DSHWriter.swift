@@ -3,7 +3,7 @@ import Foundation
 /// Writes providers into DeepSeek Harness (`$DSH_HOME/settings.yaml`) and API
 /// keys into `$DSH_HOME/.credentials.yaml`. Route keys are `keydrop-<id prefix>`
 /// so entries stay trackable from KeyDrop history.
-enum DSHWriter {
+public enum DSHWriter {
     static var dshHome: String {
         ProcessInfo.processInfo.environment["DSH_HOME"]
             ?? (NSHomeDirectory() + "/.dsh")
@@ -17,19 +17,26 @@ enum DSHWriter {
             ?? (dshHome + "/.credentials.yaml")
     }
 
-    static func routeKey(providerID: String) -> String {
+    public static func routeKey(providerID: String) -> String {
         "keydrop-" + String(providerID.prefix(8))
     }
-    static func envName(providerID: String) -> String {
+    public static func envName(providerID: String) -> String {
         "KEYDROP_" + String(providerID.prefix(8)).uppercased() + "_API_KEY"
     }
 
-    static func isDeepseekModel(_ m: String) -> Bool {
+    public static func isDeepseekModel(_ m: String) -> Bool {
         m.lowercased().contains("deepseek")
     }
 
+    /// openai-completions 语义要求 baseURL 以 /v1 结尾(不带 /v1 的网关会被兜底到网页首页)
+    public static func normalizeBaseURL(_ url: String) -> String {
+        let u = url.hasSuffix("/") ? String(url.dropLast()) : url
+        if u.hasSuffix("/v1") || u.hasSuffix("/api") || u.hasSuffix("/chat/completions") { return u }
+        return u + "/v1"
+    }
+
     /// Appends (or updates) a provider route and its credential.
-    static func add(providerID: String, key: String, url: String, models: [String]) throws -> String {
+    public static func add(providerID: String, key: String, url: String, models: [String]) throws -> String {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
@@ -52,7 +59,7 @@ enum DSHWriter {
     }
 
     /// Removes the provider route and its credential.
-    static func remove(providerID: String) throws {
+    public static func remove(providerID: String) throws {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
@@ -112,7 +119,7 @@ enum DSHWriter {
         var b = "    \(route):\n"
         b += "      apiKeyEnv: \(env)\n"
         b += "      api: openai-completions\n"
-        b += "      baseURL: \(url)\n"
+        b += "      baseURL: \(normalizeBaseURL(url))\n"
         b += "      models:\n"
         for m in models {
             b += "        - id: \(m)\n"
