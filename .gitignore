@@ -1,0 +1,21 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+DerivedData/
+
+# 构建产物
+dist/
+*.app
+*.zip
+*.dmg
+
+# 本地数据(误放的 gemini 代理残留,与 KeyDrop 无关)
+data/
+
+# macOS
+.DS_Store
+
+# 日志/临时
+*.log
+*.tmp
+*.bak
