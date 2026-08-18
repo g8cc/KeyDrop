@@ -1013,7 +1013,8 @@ public enum Parser {
         let l = s.lowercased()
         if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
         if s.contains("."), s.range(of: #"^[a-z0-9][a-z0-9.-]*$"#, options: [.regularExpression, .caseInsensitive]) != nil,
-           !s.hasPrefix("gpt-") { return false }
+           s.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])-"#, options: .regularExpression) == nil
+        { return false }
         let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
         if l.range(of: families, options: .regularExpression) != nil { return true }
         if l.range(of: #"\d"#, options: .regularExpression) != nil { return true }
