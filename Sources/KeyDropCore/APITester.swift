@@ -280,7 +280,7 @@ public enum APITester {
         ].joined(separator: "\n")
     }
 
-    static func testModelChat(base: String, key: String, model: String, timeout: TimeInterval = 12, proxy: String? = nil) -> (ok: Bool, detail: String) {
+    public static func testModelChat(base: String, key: String, model: String, timeout: TimeInterval = 12, proxy: String? = nil) -> (ok: Bool, detail: String) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
@@ -310,6 +310,9 @@ public enum APITester {
             }
             if status == 200 {
                 return (true, "POST \(base)\(path) → 200")
+            }
+            if status == 404 || status == 405 {
+                continue
             }
             if status != 0 {
                 return (false, "POST \(base)\(path) → HTTP \(status)" + (body.isEmpty ? "" : " \(body.prefix(80))"))

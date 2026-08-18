@@ -183,6 +183,10 @@ enum APITesterTests {
             let fail = APITester.test(url: "http://127.0.0.1:\(bad.port)/v1", key: "sk-test-123", timeout: 5)
             t.expect(!fail.ok, "404 服务器判失败")
 
+            // testModelChat:第一候选 404(路径不对)应继续试下一候选(/v1)→ 200
+            let mc = APITester.testModelChat(base: "http://127.0.0.1:\(server.port)", key: "sk-test-123", model: "gpt-5.6-sol", timeout: 5)
+            t.expect(mc.ok, "chat 候选 404 后命中 /v1: \(mc.detail)")
+
             // 404 + JSON error body(网关可达,模型校验类)→ 判定可用(ark plan 网关真实行为)
             if let gw = try? MockHTTPServer(mode: .gateway404) {
                 let g = APITester.test(url: "http://127.0.0.1:\(gw.port)/api/plan/v3", key: "ark-test-123", timeout: 5)
