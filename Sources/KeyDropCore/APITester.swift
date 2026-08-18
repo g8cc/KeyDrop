@@ -166,9 +166,11 @@ public enum APITester {
             if sem.wait(timeout: .now() + timeout) == .timedOut {
                 task.cancel()
             }
-            let ok = status == 400 || (status == 200 && isJSONBody(body))
+            let ok = status == 400
+                || (status == 200 && isJSONBody(body))
+                || (status == 404 && isJSONBody(body))
             if ok {
-                return (true, false, "POST \(base)\(path) → HTTP \(status)")
+                return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)")
             }
             lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }

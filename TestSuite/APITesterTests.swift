@@ -7,8 +7,9 @@ final class MockHTTPServer {
     var port: Int { listener.port }
 
     enum Mode {
-        case openAI   // 200 {"data":[{id}]}
-        case notFound // 404
+        case openAI    // 200 {"data":[{id}]}
+        case notFound  // 404 空
+        case gateway404 // GET 全 404;POST /chat/completions → 404 + JSON error(网关可达,模型校验)
     }
     let mode: Mode
 
@@ -62,6 +63,8 @@ final class MockHTTPServer {
         var body = ""
         if mode == .openAI {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"},{\"id\":\"glm-5.2\",\"object\":\"model\"}]}"
+        } else if mode == .gateway404, method == "POST" {
+            body = "{\"error\":{\"code\":\"UnsupportedModel\",\"message\":\"model does not support the agent plan feature\"}}"
         }
         let status = mode == .openAI ? "200 OK" : "404 Not Found"
         let resp = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
@@ -172,13 +175,21 @@ enum APITesterTests {
             t.expect(!ok.needsProxy, "直连成功不算 needsProxy")
             t.equal(ok.models, ["gpt-5.6-sol", "glm-5.2"], "模型列表解析")
 
-            // 404 服务器 → 直连失败
+            // 404 空 → 直连失败
             guard let bad = try? MockHTTPServer(mode: .notFound) else {
                 t.expect(false, "mock 404 服务器失败")
                 return
             }
             let fail = APITester.test(url: "http://127.0.0.1:\(bad.port)/v1", key: "sk-test-123", timeout: 5)
             t.expect(!fail.ok, "404 服务器判失败")
+
+            // 404 + JSON error body(网关可达,模型校验类)→ 判定可用(ark plan 网关真实行为)
+            if let gw = try? MockHTTPServer(mode: .gateway404) {
+                let g = APITester.test(url: "http://127.0.0.1:\(gw.port)/api/plan/v3", key: "ark-test-123", timeout: 5)
+                t.expect(g.ok, "404+JSON error 网关判可用: \(g.detail)")
+            } else {
+                t.expect(false, "mock gateway404 失败")
+            }
 
             // 不可达地址 + 无代理 → 失败
             let unreachable = APITester.test(url: "http://10.255.255.1:9/v1", key: "sk-test-123", timeout: 3, proxy: nil)
