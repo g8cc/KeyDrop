@@ -504,9 +504,29 @@ public enum Parser {
         return s
     }
 
+    /// base16/hex 编码 key(如 736b2d… = "sk-…"):纯 hex、偶数长度、解码为 ASCII key
+    static func decodeKeyIfHex(_ t: String) -> String? {
+        let cleaned = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.count >= 32, cleaned.count % 2 == 0,
+              cleaned.range(of: #"^[0-9a-fA-F]+$"#, options: .regularExpression) != nil
+        else { return nil }
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(cleaned.count / 2)
+        var it = cleaned.makeIterator()
+        while let hi = it.next(), let lo = it.next() {
+            guard let h = UInt8(String(hi), radix: 16), let l = UInt8(String(lo), radix: 16) else { return nil }
+            bytes.append(h << 4 | l)
+        }
+        guard let inner = String(bytes: bytes, encoding: .utf8) else { return nil }
+        let stripped = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stripped.isEmpty, isRealKey(stripped) else { return nil }
+        return stripped
+    }
+
     static func decodeKeyIfBase64(_ t: String, depth: Int = 0) -> String? {
         guard depth < 3 else { return nil }
         let cleaned = stripCJK(t)
+        if let hex = decodeKeyIfHex(cleaned) { return hex }
         guard let match = cleaned.range(of: #"[A-Za-z0-9+/_-]{16,}={0,2}"#, options: .regularExpression),
               match.lowerBound == cleaned.startIndex || cleaned[..<match.lowerBound].allSatisfy({ !$0.isASCII || $0 == "(" || $0 == ")" || $0 == "," || $0 == ";" })
         else { return nil }
@@ -847,9 +867,16 @@ public enum Parser {
 
     static func looksLikeURL(_ s: String) -> Bool {
         let l = stripCJK(s).lowercased()
-        guard l.hasPrefix("https://") || l.hasPrefix("http://") else { return false }
         guard !l.contains(where: { $0.isWhitespace }) else { return false }
-        return URL(string: l)?.host?.isEmpty == false
+        if l.hasPrefix("https://") || l.hasPrefix("http://") {
+            return URL(string: l)?.host?.isEmpty == false
+        }
+        // 裸域名(如 s.0v0.club):无协议、形如 hostname 且至少一个点
+        guard l.range(of: #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#, options: .regularExpression) != nil,
+              !l.contains(".."),
+              l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])-"#, options: .regularExpression) == nil
+        else { return false }
+        return URL(string: "https://" + l)?.host?.isEmpty == false
     }
 
     static func normalizeURL(_ raw: String) -> String? {
@@ -970,6 +997,7 @@ public enum Parser {
         }
         if t.count >= 28,
            t.range(of: #"^[A-Za-z0-9_\-./=]+$"#, options: .regularExpression) != nil,
+           !(t.range(of: #"^[0-9a-fA-F]+$"#, options: .regularExpression) != nil && decodeKeyIfHex(t) == nil),
            t.lowercased().range(of: #"(claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex)"#, options: .regularExpression) == nil {
             return true
         }
@@ -984,6 +1012,8 @@ public enum Parser {
         if s.contains(where: { $0 == "$" || $0 == "！" || $0 == "？" || $0 == "!" || $0 == "?" }) { return false }
         let l = s.lowercased()
         if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
+        if s.contains("."), s.range(of: #"^[a-z0-9][a-z0-9.-]*$"#, options: [.regularExpression, .caseInsensitive]) != nil,
+           !s.hasPrefix("gpt-") { return false }
         let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
         if l.range(of: families, options: .regularExpression) != nil { return true }
         if l.range(of: #"\d"#, options: .regularExpression) != nil { return true }
