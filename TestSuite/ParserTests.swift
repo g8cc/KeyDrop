@@ -36,6 +36,19 @@ enum ParserTests {
             let b64 = try! Parser.parseWithFallback("c2stYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFh")
             t.expect(b64.key != nil, "base64 可解析")
 
+            // base16/hex 编码 key + 裸域名(无协议)→ 补 https://,hex 解码,域名不当模型
+            let hex = try! Parser.parseWithFallback(
+                "sub.gwy.example.org\n53414e4954495a45442d544553542d4b45592d33"
+            )
+            t.equal(hex.key, "SANITIZED-TEST-KEY-3", "hex 解码 key")
+            t.equal(hex.url, "https://sub.gwy.example.org", "裸域名补 https://")
+            t.expect((hex.models ?? []).isEmpty, "裸域名不进模型")
+
+            // 裸域名 key+模型 混合行(域名与模型并存)
+            let bare = try! Parser.parseWithFallback("sk-abc123def456ghi789jkl api.b.ai deepseek-v4-flash")
+            t.equal(bare.url, "https://api.b.ai", "裸域名 URL 识别")
+            t.equal(bare.model, "deepseek-v4-flash", "模型不被域名干扰")
+
             // curl 命令
             let curl = try! Parser.parseWithFallback(
                 "curl -sS 'https://relay-test.example.com/v1/chat/completions' -H 'Authorization: Bearer SANITIZED-TEST-KEY-1' -d '{\"model\":\"deepseek-v4-flash-free\"}'"
