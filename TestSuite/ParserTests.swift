@@ -44,6 +44,11 @@ enum ParserTests {
             t.equal(hex.url, "https://s.0v0.club", "裸域名补 https://")
             t.expect((hex.models ?? []).isEmpty, "裸域名不进模型")
 
+            // 带点模型名(glm-5.2)不被域名排除规则误杀
+            let dotted = try! Parser.parseWithFallback("sk-abc123def456ghi789jkl https://api.fengshao1227.com glm-5.2")
+            t.equal(dotted.model, "glm-5.2", "带点模型名识别")
+            t.equal(dotted.url, "https://api.fengshao1227.com", "URL 不受影响")
+
             // 裸域名 key+模型 混合行(域名与模型并存)
             let bare = try! Parser.parseWithFallback("sk-abc123def456ghi789jkl api.b.ai deepseek-v4-flash")
             t.equal(bare.url, "https://api.b.ai", "裸域名 URL 识别")
