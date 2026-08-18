@@ -168,7 +168,7 @@ public enum APITester {
             }
             let ok = status == 400
                 || (status == 200 && isJSONBody(body))
-                || (status == 404 && isJSONBody(body))
+                || (status == 404 && isGatewayErrorBody(body))
             if ok {
                 return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)")
             }
@@ -180,6 +180,15 @@ public enum APITester {
     private static func isJSONBody(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.hasPrefix("{") || t.hasPrefix("[")
+    }
+
+    /// 404 + 结构化 JSON error(code/message)→ 网关可达但模型校验失败
+    /// (ark plan 网关真实形态:无 /models、无 /v1,仅 POST /chat/completions 有效)
+    private static func isGatewayErrorBody(_ s: String) -> Bool {
+        guard let data = s.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let err = obj["error"] as? [String: Any] else { return false }
+        return err["code"] != nil || err["message"] != nil
     }
 
     private static func endpointCandidates(_ base: String) -> [String] {
