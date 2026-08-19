@@ -62,7 +62,9 @@ public final class CCSwitchWriter {
         let id = UUID().uuidString.lowercased()
         let name = (nameOverride?.isEmpty == false ? nameOverride! : p.name) ?? defaultName(for: url)
         let wireApi = "responses"
-        let supportsResponses = appType == "codex" ? APITester.supportsResponsesAPI(base: url, key: key, proxy: proxy) : true
+        let fakeRunning = ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "1"
+        let supportsResponses = appType == "codex" && !fakeRunning
+            ? APITester.supportsResponsesAPI(base: url, key: key, proxy: proxy) : true
         let apiFormat = supportsResponses ? "openai_responses" : "openai_chat"
         let meta = appType == "codex"
             ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
@@ -119,6 +121,7 @@ public final class CCSwitchWriter {
             if appRunning, let cur = diskCurrent, cur != id {
                 let retired = UUID().uuidString.lowercased()
                 try db.run("UPDATE providers SET id = ? WHERE id = ? AND app_type = ?", [retired, cur, appType])
+                try db.run("UPDATE provider_endpoints SET provider_id = ? WHERE provider_id = ? AND app_type = ?", [retired, cur, appType])
                 renamedFrom = cur
                 renamedTo = retired
             }
@@ -643,7 +646,8 @@ try db.exec("COMMIT")
             if let rf = renamedFrom, let rt = renamedTo {
                 try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [rf])
                 try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [providerID])
-                try db.run("UPDATE providers SET id = ? WHERE id = ? AND app_type = 'claude'", [rf, rt])
+                try db.run("UPDATE providers SET id = ? WHERE id = ? AND app_type = ?", [rf, rt, appType])
+                try db.run("UPDATE provider_endpoints SET provider_id = ? WHERE provider_id = ? AND app_type = ?", [rf, rt, appType])
                 try db.run("DELETE FROM providers WHERE id = ? AND app_type = 'claude'", [providerID])
                 try db.run("UPDATE providers SET is_current = 0 WHERE app_type = 'claude'")
                 try db.run("UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = 'claude'", [rf])
