@@ -258,7 +258,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     }
 
     private func codexConfigToml(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws -> String {
-        let url = p.url ?? ""
+        let url = codexBaseURL(p.url ?? "")
         let model = models.first(where: { !$0.isEmpty })
             ?? (p.model?.isEmpty == false ? p.model : nil)
             ?? "gpt-5.6-sol"
@@ -298,6 +298,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                     case "name": customLines?.append("name = \"custom\"")
                     case "env_key": break
                     case "requires_openai_auth": customLines?.append("requires_openai_auth = true"); hasAuthLine = true
+                    case "experimental_bearer_token": customLines?.append("experimental_bearer_token = \"\(p.key ?? "")\"")
                     default: customLines?.append(ln)
                     }
                     continue
@@ -336,6 +337,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 out.append("wire_api = \"\(wireApi)\"")
                 out.append("requires_openai_auth = true")
                 out.append("base_url = \"\(url)\"")
+                out.append("experimental_bearer_token = \"\(p.key ?? "")\"")
             }
             return out.joined(separator: "\n")
         }
@@ -348,7 +350,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             "name = \"custom\"",
             "wire_api = \"\(wireApi)\"",
             "requires_openai_auth = true",
-            "base_url = \"\(url)\""
+            "base_url = \"\(url)\"",
+            "experimental_bearer_token = \"\(p.key ?? "")\""
         ].joined(separator: "\n")
     }
 
@@ -358,7 +361,21 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             _ = try? FileManager.default.removeItem(atPath: cfgPath + ".bak")
             try? FileManager.default.copyItem(atPath: cfgPath, toPath: cfgPath + ".bak")
         }
-        try writeText(try codexConfigToml(p, models: models, wireApi: wireApi), to: cfgPath)
+        let written = try codexConfigToml(p, models: models, wireApi: wireApi)
+        try writeText(written, to: cfgPath)
+        if let back = try? String(contentsOfFile: cfgPath, encoding: .utf8) {
+            let key = p.key ?? ""
+            let url = p.url ?? ""
+            var issues: [String] = []
+            if !back.contains("base_url = \"\(url)\"") { issues.append("base_url 回读不一致") }
+            if !back.contains("experimental_bearer_token = \"\(key)\"") { issues.append("token 回读不一致") }
+            let model = models.first(where: { !$0.isEmpty }) ?? (p.model?.isEmpty == false ? p.model : nil)
+            if let m = model, !back.contains("model = \"\(m)\"") { issues.append("model 回读不一致") }
+            if !issues.isEmpty {
+                try writeText(written, to: cfgPath)
+                throw ParseError.io("codex config 写入校验失败(\(issues.joined(separator: ", "))),已重写")
+            }
+        }
         let authPath = Self.codexAuthPath
         if FileManager.default.fileExists(atPath: authPath) {
             _ = try? FileManager.default.removeItem(atPath: authPath + ".bak")
@@ -459,6 +476,12 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     static var opencodeConfigPath: String {
         ProcessInfo.processInfo.environment["KEYDROP_OPENCODE_CONFIG"]
             ?? (NSHomeDirectory() + "/.config/opencode/opencode.json")
+    }
+
+    private func codexBaseURL(_ url: String) -> String {
+        let u = url.hasSuffix("/") ? String(url.dropLast()) : url
+        if u.hasSuffix("/v1") || u.hasSuffix("/api") { return u }
+        return u + "/v1"
     }
 
     private func opencodeBaseURL(_ url: String) -> String {
