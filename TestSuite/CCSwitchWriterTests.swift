@@ -67,6 +67,32 @@ enum CCSwitchWriterTests {
             let cnt2 = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='codex'")
             t.equal(cnt2, "1", "0v0.club 与 0v0.club/v1 视为同 URL")
 
+            // 直写 codex config:token 行必须写入且覆盖旧残留(防张冠李戴回归)
+            let env2 = try! TestEnv("cc-token")
+            defer { env2.cleanup() }
+            try! createSchema(env2)
+            // 预置旧 token 残留(cc-switch 直写遗留 bug 场景)
+            env2.write("codex.toml", """
+            model_provider = "custom"
+            model = "old-model"
+            [model_providers.custom]
+            name = "custom"
+            wire_api = "responses"
+            requires_openai_auth = true
+            base_url = "https://old-gateway/v1"
+            experimental_bearer_token = "sk-STALE-TOKEN"
+            """)
+            let w2 = CCSwitchWriter()
+            var p2 = ParsedKey()
+            p2.key = "sk-abcdef123456"
+            p2.url = "https://0v0.club"
+            _ = try! w2.add(p2, appType: "codex", models: ["gpt-5.6-sol"], proxy: nil)
+            let cfg = env2.read("codex.toml")
+            t.contains(cfg, "experimental_bearer_token = \"sk-abcdef123456\"", "旧 token 被新 key 覆盖")
+            t.contains(cfg, "base_url = \"https://0v0.club/v1\"", "base_url 补 /v1 写入")
+            t.contains(cfg, "model = \"gpt-5.6-sol\"", "model 写入")
+            t.expect(!cfg.contains("sk-STALE-TOKEN"), "无旧 token 残留")
+
             // repairMissingProvider:不崩,补 provider
             var healed = try! writer.repairMissingProvider(entry: HistoryEntry(
                 id: "repair1-1111-2222-3333-444444444444", ts: 1, raw: "x", format: "test",

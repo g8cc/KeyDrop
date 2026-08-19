@@ -646,8 +646,11 @@ public final class Core {
             entry.health = h.health
             entry.healthDetail = h.detail
             entry.healthAt = Date().timeIntervalSince1970
+            if test.authFailed || test.detail.contains("401") || test.detail.contains("403") {
+                entry.status = "dead"
+            }
             try? history.update(entry)
-            throw ParseError.io("✗ 不可用: \(test.detail)")
+            throw ParseError.io("✗ 不可用: \(test.detail)" + (entry.status == "dead" ? "(key 已失效,条目已标记 dead)" : ""))
         }
         entry.health = "ok"
         entry.healthDetail = test.detail
