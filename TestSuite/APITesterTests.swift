@@ -13,6 +13,7 @@ final class MockHTTPServer {
         case balanceOK    // /models 200 + /auth/key limit>usage(有余额)
         case balanceZero  // /models 200 + /auth/key usage>=limit(无余额)
         case balanceNoInfo // /models 200,余额接口 404
+        case html200     // /models → 200 HTML 兜底页(假阳性);/v1/models → 401
     }
     let mode: Mode
 
@@ -82,8 +83,21 @@ final class MockHTTPServer {
             }
         } else if mode == .balanceNoInfo {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
+        } else if mode == .html200 {
+            if target.hasSuffix("/models") && !target.hasSuffix("/v1/models") {
+                body = "<!doctype html><html><body>app</body></html>"
+            } else if target.hasSuffix("/v1/models") {
+                body = "{\"error\":{\"message\":\"Invalid token\"}}"
+            }
         }
-        let status = (mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo) ? "200 OK" : "404 Not Found"
+        let status: String
+        if mode == .html200 && target.hasSuffix("/v1/models") {
+            status = "401 Unauthorized"
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo {
+            status = "200 OK"
+        } else {
+            status = "404 Not Found"
+        }
         let resp = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
         client.write(resp)
         client.close()
