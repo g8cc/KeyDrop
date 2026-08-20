@@ -17,6 +17,7 @@ enum CLI {
         var force = false
         var appType: String? = nil
         var proxy: String? = nil
+        var sizeOverride = ""
         var remaining: [String] = []
         var i = 0
         while i < a.count {
@@ -57,6 +58,11 @@ enum CLI {
             case "--proxy":
                 if i + 1 < a.count {
                     proxy = a[i + 1]
+                    i += 1
+                }
+            case "--size":
+                if i + 1 < a.count {
+                    sizeOverride = a[i + 1]
                     i += 1
                 }
             default: remaining.append(t)
@@ -224,6 +230,15 @@ enum CLI {
             }
             return 0
 
+        case "image-add":
+            return cmdImageAdd(remaining, models: modelsOverride, proxy: proxy)
+
+        case "image":
+            return cmdImageGenerate(remaining, models: modelsOverride, size: sizeOverride, proxy: proxy)
+
+        case "mcp-image":
+            return MCPImageServer.run()
+
         case "help", "h":
             print(helpText)
             return 0
@@ -254,6 +269,79 @@ enum CLI {
         return args.joined(separator: " ")
     }
 
+    private static func cmdImageAdd(_ args: [String], models: [String], proxy: String?) -> Int32 {
+        guard args.count >= 2 else {
+            print("用法: keydrop image-add <key> <url> [--model 名称]")
+            return 2
+        }
+        let key = args[0].trimmingCharacters(in: .whitespaces)
+        let url = args[1].trimmingCharacters(in: .whitespaces)
+        guard !key.isEmpty, !url.isEmpty else {
+            print("用法: keydrop image-add <key> <url>")
+            return 2
+        }
+        print("探测 \(url) 生图能力…")
+        let probe = ImageAPI.probe(baseURL: url, key: key, proxy: proxy)
+        guard probe.supported else {
+            print("✗ 该渠道不支持生图: \(probe.detail)")
+            return 1
+        }
+        let model = models.first ?? probe.models.first ?? "gpt-image-1"
+        let channel = ImageChannel(url: url, key: key, model: model)
+        do {
+            try ImageChannelStore.save(channel)
+        } catch {
+            print("✗ 保存渠道失败: \(error.localizedDescription)")
+            return 1
+        }
+        var existed: [String: Bool] = [:]
+        do {
+            existed = try ImageMCPWriter.writeAll()
+        } catch {
+            print("⚠ MCP 配置写入失败: \(error.localizedDescription)")
+        }
+        print("✓ 生图渠道已保存")
+        print("  接口: \(url)/images/generations")
+        print("  key:  \(channel.keyMasked)")
+        print("  模型: \(model)")
+        if !probe.models.isEmpty {
+            print("  可用模型: \(probe.models.joined(separator: ", "))")
+        }
+        if !existed.isEmpty {
+            let parts = existed.map { k, v in "\(k)=\(v ? "已存在" : "已写入")" }
+            print("  MCP 注册: \(parts.joined(separator: " "))")
+        }
+        print("对话中直接说「画一张…」,agent 会调用 generate_image 工具")
+        print("命令行直出: keydrop image \"一只猫\" --model \(model)")
+        return 0
+    }
+
+    private static func cmdImageGenerate(_ args: [String], models: [String], size: String, proxy: String?) -> Int32 {
+        guard !args.isEmpty else {
+            print("用法: keydrop image \"图片描述\" [--model 名称] [--size 1024x1024]")
+            return 2
+        }
+        guard let channel = ImageChannelStore.load() else {
+            print("✗ 未配置生图渠道,先运行: keydrop image-add <key> <url>")
+            return 1
+        }
+        let prompt = args.joined(separator: " ")
+        let model = models.first ?? channel.model
+        let sz = size.isEmpty ? "1024x1024" : size
+        print("生成中… model=\(model) size=\(sz)")
+        do {
+            let path = try ImageAPI.generate(
+                baseURL: channel.url, key: channel.key,
+                prompt: prompt, model: model, size: sz, proxy: proxy
+            )
+            print("✓ 图片已保存: \(path)")
+            return 0
+        } catch {
+            print("✗ 生成失败: \(error.localizedDescription)")
+            return 1
+        }
+    }
+
     static let helpText = """
     KeyDrop — 贴 key 即用
     用法:
@@ -268,5 +356,9 @@ enum CLI {
       KeyDrop --refresh <ID前缀>     重新测试并更新模型列表
       KeyDrop --status               查看当前状态
       KeyDrop --self-heal            检查并重建丢失的 cc-switch provider
+      KeyDrop --image-add <key> <url> 导入生图渠道(探测 /v1/images/generations)
+                                       [--model 名称] → 自动注册 claude/codex MCP
+      KeyDrop --image "描述"          用已存渠道直接生图 [--model] [--size]
+      KeyDrop --mcp-image             MCP stdio server(供 claude/codex agent 调用)
     """
 }

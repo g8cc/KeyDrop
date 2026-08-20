@@ -34,7 +34,7 @@ public struct HistoryEntry: Codable {
     public var healthColor: (ok: Bool, dead: Bool) {
         switch health {
         case "dead": return (false, true)
-        case "err": return (false, false)
+        case "err", "quota": return (false, false)
         default: return (true, false)
         }
     }

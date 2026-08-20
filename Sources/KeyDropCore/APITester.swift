@@ -23,6 +23,12 @@ extension APITestResult {
     }
 }
 
+public enum BalanceStatus: Equatable {
+    case unknown  // 网关无余额接口,无法判断
+    case ok       // 明确有余额
+    case zero     // 明确无余额/配额耗尽
+}
+
 public enum APITester {
 
     private static let session: URLSession = {
@@ -51,6 +57,85 @@ public enum APITester {
             kCFNetworkProxiesHTTPSPort: url.port ?? (url.scheme == "https" ? 443 : 80),
         ]
         return URLSession(configuration: c)
+    }
+
+    /// 余额探测:优先 OpenRouter /auth/key(limit/usage),其次 new-api 系 billing 组合
+    /// 拿不到明确数据返回 .unknown(不影响可用判定)
+    public static func checkBalance(url: String, key: String, timeout: TimeInterval = 10, proxy: String? = nil) -> BalanceStatus {
+        let base = url.hasSuffix("/") ? String(url.dropLast()) : url
+        if let st = authKeyBalance(base: base, key: key, timeout: timeout, proxy: proxy) { return st }
+        if let st = newAPIBillingBalance(base: base, key: key, timeout: timeout, proxy: proxy) { return st }
+        return .unknown
+    }
+
+    /// GET /auth/key (OpenRouter 兼容): {"data":{"limit":N,"usage":M}}
+    private static func authKeyBalance(base: String, key: String, timeout: TimeInterval, proxy: String?) -> BalanceStatus? {
+        guard let u = URL(string: base + "/auth/key") else { return nil }
+        let s = session(for: proxy)
+        var req = URLRequest(url: u)
+        req.httpMethod = "GET"
+        req.timeoutInterval = timeout
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        let sem = DispatchSemaphore(value: 0)
+        var status = 0
+        var obj: [String: Any]?
+        let task = s.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if let data, let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { obj = o }
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
+        guard status == 200, let data = obj?["data"] as? [String: Any],
+              let limit = data["limit"] as? Double, limit > 0,
+              let usage = data["usage"] as? Double else { return nil }
+        return usage >= limit ? .zero : .ok
+    }
+
+    /// new-api 系: GET /dashboard/billing/subscription(hard_limit_usd) + /dashboard/billing/usage(total_usage)
+    private static func newAPIBillingBalance(base: String, key: String, timeout: TimeInterval, proxy: String?) -> BalanceStatus? {
+        let s = session(for: proxy)
+        func fetch(_ path: String) -> Double? {
+            guard let u = URL(string: base + path) else { return nil }
+            var req = URLRequest(url: u)
+            req.httpMethod = "GET"
+            req.timeoutInterval = timeout
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            let sem = DispatchSemaphore(value: 0)
+            var status = 0
+            var val: Double?
+            let task = s.dataTask(with: req) { data, resp, _ in
+                defer { sem.signal() }
+                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if let data, let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    val = o["total_usage"] as? Double ?? o["hard_limit_usd"] as? Double
+                }
+            }
+            task.resume()
+            if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
+            return status == 200 ? val : nil
+        }
+        // subscription 返回 hard_limit_usd;usage 返回 total_usage;两个都拿到才算数
+        guard let u = URL(string: base + "/dashboard/billing/subscription") else { return nil }
+        var req = URLRequest(url: u)
+        req.httpMethod = "GET"
+        req.timeoutInterval = timeout
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        let sem = DispatchSemaphore(value: 0)
+        var status = 0
+        var hardLimit: Double?
+        let task = s.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if let data, let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                hardLimit = o["hard_limit_usd"] as? Double
+            }
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
+        guard status == 200, let limit = hardLimit else { return nil }
+        guard let usage = fetch("/dashboard/billing/usage") else { return nil }
+        return usage >= limit ? .zero : .ok
     }
 
     public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil) -> APITestResult {

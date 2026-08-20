@@ -10,6 +10,9 @@ final class MockHTTPServer {
         case openAI    // 200 {"data":[{id}]}
         case notFound  // 404 空
         case gateway404 // GET 全 404;POST /chat/completions → 404 + JSON error(网关可达,模型校验)
+        case balanceOK    // /models 200 + /auth/key limit>usage(有余额)
+        case balanceZero  // /models 200 + /auth/key usage>=limit(无余额)
+        case balanceNoInfo // /models 200,余额接口 404
     }
     let mode: Mode
 
@@ -65,8 +68,22 @@ final class MockHTTPServer {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"},{\"id\":\"glm-5.2\",\"object\":\"model\"}]}"
         } else if mode == .gateway404, method == "POST" {
             body = "{\"error\":{\"code\":\"UnsupportedModel\",\"message\":\"model does not support the agent plan feature\"}}"
+        } else if mode == .balanceOK {
+            if target.hasSuffix("/auth/key") {
+                body = "{\"data\":{\"label\":\"t\",\"limit\":10,\"usage\":2}}"
+            } else {
+                body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
+            }
+        } else if mode == .balanceZero {
+            if target.hasSuffix("/auth/key") {
+                body = "{\"data\":{\"label\":\"t\",\"limit\":5,\"usage\":5}}"
+            } else {
+                body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
+            }
+        } else if mode == .balanceNoInfo {
+            body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
         }
-        let status = mode == .openAI ? "200 OK" : "404 Not Found"
+        let status = (mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo) ? "200 OK" : "404 Not Found"
         let resp = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
         client.write(resp)
         client.close()
