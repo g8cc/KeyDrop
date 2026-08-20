@@ -7,6 +7,7 @@ ParserTests.run(harness)
 DSHWriterTests.run(harness)
 APITesterTests.run(harness)
 CCSwitchWriterTests.run(harness)
+UpdaterTests.run(harness)
 HistoryTests.run(harness)
 CoreTests.run(harness)
 

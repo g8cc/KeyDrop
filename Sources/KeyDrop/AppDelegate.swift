@@ -77,6 +77,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         registerHotKey()
 
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.setupUpdater()
+        }
+
         let healed = Core.shared.selfHeal()
         if !healed.isEmpty {
             AppLog.info("self-heal: " + healed.joined(separator: "; "))
@@ -228,12 +232,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         loginItem.state = loginEnabled() ? .on : .off
         menu.addItem(loginItem)
         menu.addItem(.separator())
+        self.appendUpdateItems(to: menu)
+        menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "退出 KeyDrop", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
+    }
+
+    // MARK: - 软件更新
+
+    private var updater = Updater.shared
+
+    private func setupUpdater() {
+        updater.onStateChange = { [weak self] state in
+            self?.handleUpdateState(state)
+        }
+        updater.checkForUpdates()
+    }
+
+    private func appendUpdateItems(to menu: NSMenu) {
+        switch updater.state {
+        case .checking:
+            let item = NSMenuItem(title: "检查更新…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        case .available(let version, _, let notes):
+            let item = NSMenuItem(
+                title: "🔄 新版本 v\(version) 可更新",
+                action: #selector(promptUpdate),
+                keyEquivalent: ""
+            )
+            item.target = self
+            menu.addItem(item)
+            if !notes.isEmpty {
+                let note = NSMenuItem(title: notes.replacingOccurrences(of: "\n", with: " "), action: nil, keyEquivalent: "")
+                note.isEnabled = false
+                menu.addItem(note)
+            }
+        case .downloading(let version, let progress):
+            let pct = Int(progress * 100)
+            let item = NSMenuItem(title: "⬇︎ 下载 v\(version) \(pct)%", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        case .installing:
+            let item = NSMenuItem(title: "正在安装,即将重启…", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        case .failed(let msg):
+            let item = NSMenuItem(title: "更新失败: \(msg)", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        default:
+            break
+        }
+        let check = NSMenuItem(title: "检查更新…", action: #selector(checkForUpdatesAction), keyEquivalent: "")
+        check.target = self
+        menu.addItem(check)
+    }
+
+    @objc private func checkForUpdatesAction() {
+        updater.checkForUpdates(force: true)
+    }
+
+    @objc private func promptUpdate() {
+        guard case .available(let version, _, _) = updater.state else { return }
+        let alert = NSAlert()
+        alert.messageText = "发现新版本 v\(version)"
+        alert.informativeText = "当前版本 v\(Updater.currentVersion())\n\n是否立即下载并更新?"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "更新")
+        alert.addButton(withTitle: "以后再说")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            updater.downloadAndInstall()
+        }
+    }
+
+    private func handleUpdateState(_ state: Updater.State) {
+        switch state {
+        case .available(let version, _, _):
+            AppLog.info("发现新版本 v\(version)")
+            if updater.shouldPromptFor(version) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    self?.promptUpdate()
+                }
+            }
+        case .failed(let msg):
+            AppLog.info("更新检查失败: \(msg)")
+        default:
+            break
+        }
     }
 
     @objc func showPanelAction() {
