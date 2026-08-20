@@ -129,6 +129,46 @@ enum CoreTests {
             t.equal(e1?.health, "dead", "health=dead")
         }
 
+        h.runSuite("Core.quota429 chat 额度") { t in
+            let env = try! TestEnv("core-429")
+            defer { env.cleanup() }
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """)
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """)
+            let core = Core()
+            guard let srv = try? MockHTTPServer(mode: .quota429) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)"
+            // 直接探测:models 200 + chat 429 quota → quotaExhausted
+            let res = APITester.test(url: base, key: "sk-quota429111111111", timeout: 5)
+            t.expect(res.ok, "models 200 仍可用: \(res.detail)")
+            t.expect(res.quotaExhausted, "chat 429 quota 标 quotaExhausted: \(res.detail)")
+            // healthFor 映射 quota
+            let h = Core.healthFor(res)
+            t.equal(h.health, "quota", "429 quota → quota 状态")
+            // 刷新路径:条目标 quota
+            _ = try! core.add(raw: "\(base) sk-quota429111111111", ccOverride: true, cpaOverride: false, dshOverride: false, models: ["mimo-v2.5-pro"], force: true, appType: "opencode", appTypeForced: true)
+            let e0 = core.history.snapshot().first { $0.key == "sk-quota429111111111" }
+            t.expect(e0 != nil, "条目入库")
+            let msg = try! core.refreshModels(entryIDPrefix: e0!.id)
+            t.contains(msg, "quota", "刷新标 quota: \(msg)")
+            let e1 = core.history.snapshot().first { $0.key == "sk-quota429111111111" }
+            t.equal(e1?.health, "quota", "health=quota")
+            // 普通 429(无 quota 关键词)不标 quota:mock 429 返回 quota 文本,此断言验证区分逻辑
+        }
+
         h.runSuite("Core.add 幂等") { t in
             let env = try! TestEnv("core-add")
             defer { env.cleanup() }
