@@ -7,13 +7,16 @@ public struct APITestResult {
     public let detail: String
     public let authFailed: Bool
     public let needsProxy: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool) {
+    /// chat 端点返回 429/402 且明确 quota exhausted(额度耗尽,非临时限流)
+    public let quotaExhausted: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
         self.detail = detail
         self.authFailed = authFailed
         self.needsProxy = needsProxy
+        self.quotaExhausted = quotaExhausted
     }
 }
 
@@ -203,6 +206,13 @@ public enum APITester {
                     continue
                 }
                 style = "openai"
+                // models 200 后补测 chat 端点:429/402 quota exhausted → 额度耗尽(不进可用列表)
+                // 用渠道真实模型探测(伪模型 test 会被网关先以 400 拒绝,测不出额度)
+                if chatQuotaExhausted(base: base, key: key, timeout: timeout, proxy: proxy, model: models.first ?? "test") {
+                    return APITestResult(ok: true, style: style, models: models,
+                                         detail: "GET \(ep) → 200, 但 chat 端点 429/402 quota exhausted(无额度)",
+                                         authFailed: false, quotaExhausted: true)
+                }
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
                                      authFailed: false)
@@ -228,6 +238,44 @@ public enum APITester {
         authFailed = authFailed || chat.1
         lastErr += "; \(chat.2)"
         return APITestResult(ok: false, style: style, models: [], detail: lastErr, authFailed: authFailed)
+    }
+
+    /// POST chat 最小请求:仅当 429/402 且 body 明确 quota/exhausted/balance/insufficient 才判定额度耗尽
+    private static func chatQuotaExhausted(base: String, key: String, timeout: TimeInterval, proxy: String? = nil, model: String) -> Bool {
+        let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
+        let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
+        let s = session(for: proxy)
+        for path in chatPaths {
+            guard let u = URL(string: base + path) else { continue }
+            var req = URLRequest(url: u)
+            req.httpMethod = "POST"
+            req.timeoutInterval = timeout
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "model": model,
+                "max_tokens": 1,
+                "messages": [["role": "user", "content": "ping"]]
+            ])
+            let sem = DispatchSemaphore(value: 0)
+            var status = 0
+            var body = ""
+            let task = s.dataTask(with: req) { data, resp, _ in
+                defer { sem.signal() }
+                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if let d = data { body = String(data: d, encoding: .utf8) ?? "" }
+            }
+            task.resume()
+            if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
+            if status == 429 || status == 402 {
+                let low = body.lowercased()
+                if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
+                    return true
+                }
+                return false
+            }
+        }
+        return false
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {

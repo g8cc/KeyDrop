@@ -14,6 +14,7 @@ final class MockHTTPServer {
         case balanceZero  // /models 200 + /auth/key usage>=limit(无余额)
         case balanceNoInfo // /models 200,余额接口 404
         case html200     // /models → 200 HTML 兜底页(假阳性);/v1/models → 401
+        case quota429    // /models → 200;POST chat → 429 quota exhausted
     }
     let mode: Mode
 
@@ -89,11 +90,19 @@ final class MockHTTPServer {
             } else if target.hasSuffix("/v1/models") {
                 body = "{\"error\":{\"message\":\"Invalid token\"}}"
             }
+        } else if mode == .quota429 {
+            if target.hasSuffix("/models") {
+                body = "{\"data\":[{\"id\":\"mimo-v2.5-pro\",\"object\":\"model\"}]}"
+            } else if target.contains("/chat/completions") {
+                body = "{\"error\":{\"code\":\"429\",\"message\":\"quota exhausted\",\"type\":\"limitation\"}}"
+            }
         }
         let status: String
         if mode == .html200 && target.hasSuffix("/v1/models") {
             status = "401 Unauthorized"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo {
+        } else if mode == .quota429 && target.contains("/chat/completions") {
+            status = "429 Too Many Requests"
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 {
             status = "200 OK"
         } else {
             status = "404 Not Found"

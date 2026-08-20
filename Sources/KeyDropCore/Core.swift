@@ -398,6 +398,7 @@ public final class Core {
         if test.needsProxy {
             return ("proxy-ok", test.detail + " ⚠ 该网关直连不可用,需代理;无代理的工具(dsh 等)需自行配置 HTTPS_PROXY 才可用")
         }
+        if test.quotaExhausted { return ("quota", test.detail) }
         if test.ok { return ("ok", test.detail) }
         if test.authFailed { return ("dead", test.detail) }
         return ("err", test.detail)
@@ -651,6 +652,14 @@ public final class Core {
             }
             try? history.update(entry)
             throw ParseError.io("✗ 不可用: \(test.detail)" + (entry.status == "dead" ? "(key 已失效,条目已标记 dead)" : ""))
+        }
+        // chat 端点额度耗尽 → quota
+        if test.quotaExhausted {
+            entry.health = "quota"
+            entry.healthDetail = test.detail
+            entry.healthAt = Date().timeIntervalSince1970
+            try? history.update(entry)
+            return "✓ 端点可用但无额度(quota): \(test.detail) — 充值后刷新自动恢复"
         }
         // 余额探测:网关支持时无余额标 quota(仍保留在库,充值后刷新自动恢复)
         if APITester.checkBalance(url: url, key: key, proxy: proxyForHealth()) == .zero {

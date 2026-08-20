@@ -708,7 +708,7 @@ struct HistoryRow: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
-                                .help("点击复制，去 opencode /model 粘贴即可唯一定位")
+                                .help("点击复制，去 \(appLaunch?.cmd ?? "AI 客户端") /model 粘贴即可唯一定位")
                             }
                         }
                         .padding(.top, 1)
