@@ -639,6 +639,7 @@ struct HistoryRow: View {
         let dotTip: String = {
             switch entry.health {
             case "ok": return "可用 · 最近测试通过"
+            case "quota": return "无余额 · 充值后刷新恢复"
             case "dead": return "key 已失效 · 建议删除"
             case "err": return "测试异常 · 点 ↻ 重测"
             case "proxy-ok": return "需代理 · 直连不可用,经代理可用"
@@ -1158,6 +1159,7 @@ struct PanelView: View {
     @State private var showHistory = true
     @State private var showStatusDetail = false
     @State private var showDeadArea = false
+    @State private var showQuotaArea = false
     @State private var toastText: String?
     @State private var dropTargeted = false
     @FocusState private var inputFocused: Bool
@@ -1236,7 +1238,16 @@ struct PanelView: View {
     private var historyItems: [HistoryEntry] {
         _ = state.historyVersion
         return state.core.history.snapshot()
-            .filter { $0.status == "active" && $0.health != "dead" && $0.health != "err" }
+            .filter { $0.status == "active" && $0.health != "dead" && $0.health != "err" && $0.health != "quota" }
+            .sorted { $0.ts > $1.ts }
+            .prefix(60)
+            .map { $0 }
+    }
+
+    private var quotaItems: [HistoryEntry] {
+        _ = state.historyVersion
+        return state.core.history.snapshot()
+            .filter { $0.status == "active" && $0.health == "quota" }
             .sorted { $0.ts > $1.ts }
             .prefix(60)
             .map { $0 }
@@ -1488,6 +1499,7 @@ struct PanelView: View {
             Divider().opacity(0.3)
             let items = historyItems
             let deads = deadItems
+            let quotas = quotaItems
             HStack {
                 Text("最近添加")
                     .font(.system(size: 11, weight: .semibold))
@@ -1497,7 +1509,7 @@ struct PanelView: View {
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
-            if items.isEmpty && deads.isEmpty {
+            if items.isEmpty && deads.isEmpty && quotas.isEmpty {
                 VStack(spacing: 6) {
                     Image(systemName: "tray")
                         .font(.system(size: 22))
@@ -1552,6 +1564,72 @@ struct PanelView: View {
                                     onEdit: { state.showEdit(e) },
                                     highlighted: state.highlightID == e.id && state.highlightPulse > 0
                                 )
+                            }
+                            if !quotas.isEmpty {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) { showQuotaArea.toggle() }
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: showQuotaArea ? "chevron.down" : "chevron.right")
+                                            .font(.system(size: 10, weight: .semibold))
+                                        Text("无额度区")
+                                            .font(.system(size: 11, weight: .semibold))
+                                        Text("\(quotas.count)")
+                                            .font(.system(size: 10, design: .monospaced))
+                                        Spacer()
+                                        Text(showQuotaArea ? "收起" : "无余额/配额耗尽 · 充值后刷新恢复")
+                                            .font(.system(size: 10, weight: .medium))
+                                            .foregroundStyle(showQuotaArea ? Color.secondary : Color(red: 0.80, green: 0.62, blue: 0.20))
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 6)
+                                            .fill(Color(red: 0.80, green: 0.62, blue: 0.20).opacity(showQuotaArea ? 0.12 : 0.07))
+                                    )
+                                }
+                                .buttonStyle(.borderless)
+                                .padding(.top, 6)
+                                if showQuotaArea {
+                                    ForEach(quotas, id: \.id) { e in
+                                        HistoryRow(
+                                            entry: e,
+                                            refreshing: state.refreshingID == e.id,
+                                            busy: state.isBusy,
+                                            onDelete: { state.doDelete(e.id) },
+                                            onCopy: { m in
+                                                let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(copyText, forType: .string)
+                                                showToast("已复制: \(copyText)")
+                                            },
+                                            onCopyId: { id in
+                                                showToast("已复制 ID: \(id.prefix(8))…")
+                                            },
+                                            onRefresh: { id in state.doRefresh(id) },
+                                            onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
+                                            onCopyCurl: {
+                                                guard let url = e.url, let key = e.key, !key.isEmpty else {
+                                                    showToast("缺少 URL 或 key")
+                                                    return
+                                                }
+                                                let model = e.models?.first ?? e.model
+                                                let style: String? = {
+                                                    if e.targets.contains("ccswitch") { return "anthropic" }
+                                                    if let d = e.healthDetail, d.lowercased().contains("anthropic") { return "anthropic" }
+                                                    return nil
+                                                }()
+                                                let curl = APITester.curlCommand(url: url, key: key, model: model, styleHint: style)
+                                                NSPasteboard.general.clearContents()
+                                                NSPasteboard.general.setString(curl, forType: .string)
+                                                showToast("已复制 curl")
+                                            },
+                                            onReimport: { state.doReimport(e.id) },
+                                            onEdit: { state.showEdit(e) },
+                                            highlighted: false
+                                        )
+                                    }
+                                }
                             }
                             if !deads.isEmpty {
                                 Button {
@@ -1646,6 +1724,9 @@ struct PanelView: View {
                         guard let id = state.highlightID else { return }
                         if deadItems.contains(where: { $0.id == id }) {
                             showDeadArea = true
+                        }
+                        if quotaItems.contains(where: { $0.id == id }) {
+                            showQuotaArea = true
                         }
                         withAnimation(.easeOut(duration: 0.25)) {
                             proxy.scrollTo(id, anchor: .center)

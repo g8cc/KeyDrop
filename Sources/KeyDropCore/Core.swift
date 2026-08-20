@@ -652,6 +652,14 @@ public final class Core {
             try? history.update(entry)
             throw ParseError.io("✗ 不可用: \(test.detail)" + (entry.status == "dead" ? "(key 已失效,条目已标记 dead)" : ""))
         }
+        // 余额探测:网关支持时无余额标 quota(仍保留在库,充值后刷新自动恢复)
+        if APITester.checkBalance(url: url, key: key, proxy: proxyForHealth()) == .zero {
+            entry.health = "quota"
+            entry.healthDetail = "无余额/配额耗尽"
+            entry.healthAt = Date().timeIntervalSince1970
+            try? history.update(entry)
+            return "✓ 端点可用但无余额(quota): \(test.detail) — 充值后刷新自动恢复"
+        }
         entry.health = "ok"
         entry.healthDetail = test.detail
         entry.healthAt = Date().timeIntervalSince1970
