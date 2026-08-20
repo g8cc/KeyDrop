@@ -93,6 +93,42 @@ enum CoreTests {
             t.equal(noneEntry?.health, "ok", "无余额接口保持 ok")
         }
 
+        h.runSuite("Core.html200 假阳性") { t in
+            let env = try! TestEnv("core-html")
+            defer { env.cleanup() }
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """)
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """)
+            let core = Core()
+            guard let srv = try? MockHTTPServer(mode: .html200) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)"
+            // 直接探测:/models 200 HTML → 应跳过并命中 /v1/models 401 → 不可用
+            let res = APITester.test(url: base, key: "sk-html2001111111111", timeout: 5)
+            t.expect(!res.ok, "200 HTML 兜底页不判可用: \(res.detail)")
+            t.expect(res.authFailed, "命中 401 标 authFailed")
+            // 刷新路径:条目应标 dead
+            _ = try! core.add(raw: "\(base) sk-html2001111111111", ccOverride: true, cpaOverride: false, dshOverride: false, models: ["glm-5.2"], force: true, appType: "opencode", appTypeForced: true)
+            let e0 = core.history.snapshot().first { $0.key == "sk-html2001111111111" }
+            t.expect(e0 != nil, "条目入库")
+            let msg = try? core.refreshModels(entryIDPrefix: e0!.id)
+            t.expect(msg == nil || msg!.contains("失效") || msg!.contains("不可用"), "刷新后判失效: \(msg ?? "抛错")")
+            let e1 = core.history.snapshot().first { $0.key == "sk-html2001111111111" }
+            t.equal(e1?.health, "dead", "health=dead")
+        }
+
         h.runSuite("Core.add 幂等") { t in
             let env = try! TestEnv("core-add")
             defer { env.cleanup() }

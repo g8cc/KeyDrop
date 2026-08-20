@@ -175,11 +175,14 @@ public enum APITester {
             let sem = DispatchSemaphore(value: 0)
             var status = 0
             var models: [String] = []
+            var isJSON = false
             let task = s.dataTask(with: req) { data, resp, _ in
                 defer { sem.signal() }
                 status = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 guard let data else { return }
-                if status == 200,
+                let body = String(data: data, encoding: .utf8) ?? ""
+                isJSON = isJSONBody(body)
+                if status == 200, isJSON,
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let arr = obj["data"] as? [[String: Any]] {
                     for m in arr {
@@ -194,6 +197,11 @@ public enum APITester {
 
             if status == 401 || status == 403 { authFailed = true }
             if status == 200 {
+                // 200 但非 JSON(SPA/前端兜底页,任何 key 都 200)→ 不是 API 端点,继续下一候选
+                guard isJSON else {
+                    lastErr = "GET \(ep) → 200 但非 JSON(疑似前端兜底页)"
+                    continue
+                }
                 style = "openai"
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
