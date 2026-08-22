@@ -15,6 +15,7 @@ final class MockHTTPServer {
         case balanceNoInfo // /models 200,余额接口 404
         case html200     // /models → 200 HTML 兜底页(假阳性);/v1/models → 401
         case quota429    // /models → 200;POST chat → 429 quota exhausted
+        case chat524     // /models → 200;POST chat → 424 服务不可用
     }
     let mode: Mode
 
@@ -96,13 +97,21 @@ final class MockHTTPServer {
             } else if target.contains("/chat/completions") {
                 body = "{\"error\":{\"code\":\"429\",\"message\":\"quota exhausted\",\"type\":\"limitation\"}}"
             }
+        } else if mode == .chat524 {
+            if target.hasSuffix("/models") {
+                body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
+            } else if target.contains("/chat/completions") || target.contains("/responses") {
+                body = "{\"error\":{\"message\":\"Service temporarily unavailable\",\"type\":\"api_error\"}}"
+            }
         }
         let status: String
         if mode == .html200 && target.hasSuffix("/v1/models") {
             status = "401 Unauthorized"
         } else if mode == .quota429 && target.contains("/chat/completions") {
             status = "429 Too Many Requests"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 {
+        } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
+            status = "424 Failed Dependency"
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"

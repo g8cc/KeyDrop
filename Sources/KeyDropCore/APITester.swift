@@ -9,7 +9,9 @@ public struct APITestResult {
     public let needsProxy: Bool
     /// chat 端点返回 429/402 且明确 quota exhausted(额度耗尽,非临时限流)
     public let quotaExhausted: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false) {
+    /// chat 端点确认不可用(429 限流无 quota 词 / 402 / 424 / 5xx)→ 移出可用列表
+    public let chatDegraded: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -17,6 +19,7 @@ public struct APITestResult {
         self.authFailed = authFailed
         self.needsProxy = needsProxy
         self.quotaExhausted = quotaExhausted
+        self.chatDegraded = chatDegraded
     }
 }
 
@@ -206,12 +209,18 @@ public enum APITester {
                     continue
                 }
                 style = "openai"
-                // models 200 后补测 chat 端点:429/402 quota exhausted → 额度耗尽(不进可用列表)
-                // 用渠道真实模型探测(伪模型 test 会被网关先以 400 拒绝,测不出额度)
-                if chatQuotaExhausted(base: base, key: key, timeout: timeout, proxy: proxy, model: models.first ?? "test") {
+                // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
+                // 429/402 + quota 词 → 额度耗尽;429 限流/402/424/5xx → 端点异常;400/404 → 正常
+                let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: models.first ?? "test")
+                if let st = chat.quota {
                     return APITestResult(ok: true, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 429/402 quota exhausted(无额度)",
+                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st) quota exhausted(无额度)",
                                          authFailed: false, quotaExhausted: true)
+                }
+                if let st = chat.degraded {
+                    return APITestResult(ok: false, style: style, models: models,
+                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(服务不可用/限流)",
+                                         authFailed: false)
                 }
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
@@ -240,8 +249,11 @@ public enum APITester {
         return APITestResult(ok: false, style: style, models: [], detail: lastErr, authFailed: authFailed)
     }
 
-    /// POST chat 最小请求:仅当 429/402 且 body 明确 quota/exhausted/balance/insufficient 才判定额度耗尽
-    private static func chatQuotaExhausted(base: String, key: String, timeout: TimeInterval, proxy: String? = nil, model: String) -> Bool {
+    /// POST chat 健康检查结果
+    /// - quota: 429/402 且 body 明确额度耗尽关键词
+    /// - degraded: 429 限流(无 quota 词)/402/424/5xx → 服务不可用
+    /// - 都为 nil: 200/400/404 等 → 端点正常
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> (quota: Int?, degraded: Int?) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
@@ -270,12 +282,15 @@ public enum APITester {
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
-                    return true
+                    return (status, nil)
                 }
-                return false
+                return (nil, status)
+            }
+            if status == 424 || (500...599).contains(status) {
+                return (nil, status)
             }
         }
-        return false
+        return (nil, nil)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {
