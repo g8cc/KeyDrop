@@ -1160,6 +1160,7 @@ struct PanelView: View {
     @State private var showStatusDetail = false
     @State private var showDeadArea = false
     @State private var showQuotaArea = false
+    @State private var searchText = ""
     @State private var toastText: String?
     @State private var dropTargeted = false
     @FocusState private var inputFocused: Bool
@@ -1235,10 +1236,20 @@ struct PanelView: View {
         }
     }
 
+    /// 搜索过滤:模型名 / 条目名 / URL / key 掩码,大小写不敏感,多词 AND
+    private func matches(_ e: HistoryEntry) -> Bool {
+        let q = searchText.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return true }
+        let hay = ([e.name, e.url, e.keyMasked, e.model] + (e.models ?? []))
+            .compactMap { $0 }.joined(separator: " ").lowercased()
+        return q.lowercased().split(separator: " ").allSatisfy { hay.contains($0) }
+    }
+
     private var historyItems: [HistoryEntry] {
         _ = state.historyVersion
         return state.core.history.snapshot()
             .filter { $0.status == "active" && $0.health != "dead" && $0.health != "err" && $0.health != "quota" }
+            .filter(matches)
             .sorted { $0.ts > $1.ts }
             .prefix(60)
             .map { $0 }
@@ -1248,6 +1259,7 @@ struct PanelView: View {
         _ = state.historyVersion
         return state.core.history.snapshot()
             .filter { $0.status == "active" && $0.health == "quota" }
+            .filter(matches)
             .sorted { $0.ts > $1.ts }
             .prefix(60)
             .map { $0 }
@@ -1257,6 +1269,7 @@ struct PanelView: View {
         _ = state.historyVersion
         return state.core.history.snapshot()
             .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err" || $0.health == "proxy-ok") }
+            .filter(matches)
             .sorted { $0.ts > $1.ts }
             .prefix(60)
             .map { $0 }
@@ -1500,16 +1513,45 @@ struct PanelView: View {
             let items = historyItems
             let deads = deadItems
             let quotas = quotaItems
-            HStack {
+            HStack(spacing: 6) {
                 Text("最近添加")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
-                Spacer()
                 Text("\(items.count)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
+                Spacer()
+                HStack(spacing: 4) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                    TextField("搜模型/名称/URL,空格分隔多个词", text: $searchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 11))
+                        .disableAutocorrection(true)
+                    if !searchText.isEmpty {
+                        Button {
+                            searchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("清空搜索")
+                    }
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.primary.opacity(0.05))
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12), lineWidth: 0.8))
+                )
+                .frame(width: 230)
             }
-            if items.isEmpty && deads.isEmpty && quotas.isEmpty {
+            let searching = !searchText.trimmingCharacters(in: .whitespaces).isEmpty
+            if items.isEmpty && deads.isEmpty && quotas.isEmpty && !searching {
                 VStack(spacing: 6) {
                     Image(systemName: "tray")
                         .font(.system(size: 22))
@@ -1518,6 +1560,20 @@ struct PanelView: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                     Text("粘贴 key 后点「添加并激活」")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 22)
+            } else if items.isEmpty && deads.isEmpty && quotas.isEmpty && searching {
+                VStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 22))
+                        .foregroundStyle(.secondary)
+                    Text("无匹配「\(searchText)」的记录")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("试试更短的关键词,或点 ✕ 清空搜索")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
