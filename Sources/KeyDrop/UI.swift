@@ -1542,13 +1542,13 @@ struct PanelView: View {
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12), lineWidth: 0.8))
                 )
                 .frame(width: 230)
+                Spacer()
                 Text("最近添加")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Text("\(items.count)")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
-                Spacer()
             }
             let searching = !searchText.trimmingCharacters(in: .whitespaces).isEmpty
             if items.isEmpty && deads.isEmpty && quotas.isEmpty && !searching {
