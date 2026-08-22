@@ -169,6 +169,21 @@ enum CoreTests {
             // 普通 429(无 quota 关键词)不标 quota:mock 429 返回 quota 文本,此断言验证区分逻辑
         }
 
+        h.runSuite("Core.chat424 服务不可用") { t in
+            let env = try! TestEnv("core-424")
+            defer { env.cleanup() }
+            let core = Core()
+            guard let srv = try? MockHTTPServer(mode: .chat524) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)"
+            let res = APITester.test(url: base, key: "sk-chat52411111111111", timeout: 5)
+            t.expect(!res.ok, "chat 424 判不可用: \(res.detail)")
+            t.expect(!res.authFailed, "424 非认证失败")
+            t.contains(res.detail, "chat 端点 HTTP 424", "detail 标注 chat 状态")
+        }
+
         h.runSuite("Core.add 幂等") { t in
             let env = try! TestEnv("core-add")
             defer { env.cleanup() }
