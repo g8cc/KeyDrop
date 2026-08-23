@@ -74,7 +74,8 @@ enum CoreTests {
             let zeroEntry0 = core.history.snapshot().first { $0.key == "sk-test-bal2222222222" }
             t.expect(zeroEntry0 != nil, "条目已入库2")
             let zeroMsg = try! core.refreshModels(entryIDPrefix: zeroEntry0!.id)
-            t.contains(zeroMsg, "quota", "无余额刷新标 quota: \(zeroMsg)")
+            t.contains(zeroMsg, "无余额", "无余额刷新标 quota: \(zeroMsg)")
+            t.contains(zeroMsg, "充值后", "提示可恢复: \(zeroMsg)")
             let zeroEntry = core.history.snapshot().first { $0.key == "sk-test-bal2222222222" }
             t.equal(zeroEntry?.health, "quota", "无余额 health=quota")
             t.equal(zeroEntry?.healthColor.ok, false, "quota 非可用色")
@@ -163,7 +164,7 @@ enum CoreTests {
             let e0 = core.history.snapshot().first { $0.key == "sk-quota429111111111" }
             t.expect(e0 != nil, "条目入库")
             let msg = try! core.refreshModels(entryIDPrefix: e0!.id)
-            t.contains(msg, "quota", "刷新标 quota: \(msg)")
+            t.contains(msg, "无额度", "刷新标 quota: \(msg)")
             let e1 = core.history.snapshot().first { $0.key == "sk-quota429111111111" }
             t.equal(e1?.health, "quota", "health=quota")
             // 普通 429(无 quota 关键词)不标 quota:mock 429 返回 quota 文本,此断言验证区分逻辑

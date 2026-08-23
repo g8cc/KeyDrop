@@ -653,24 +653,15 @@ public final class Core {
             try? history.update(entry)
             throw ParseError.io("✗ 不可用: \(test.detail)" + (entry.status == "dead" ? "(key 已失效,条目已标记 dead)" : ""))
         }
-        // chat 端点额度耗尽 → quota
+        // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表
+        var quotaNote: String? = nil
         if test.quotaExhausted {
-            entry.health = "quota"
-            entry.healthDetail = test.detail
-            entry.healthAt = Date().timeIntervalSince1970
-            try? history.update(entry)
-            return "✓ 端点可用但无额度(quota): \(test.detail) — 充值后刷新自动恢复"
+            quotaNote = "无额度(chat 端点 429/402 quota exhausted)"
+        } else if APITester.checkBalance(url: url, key: key, proxy: proxyForHealth()) == .zero {
+            quotaNote = "无余额/配额耗尽(余额接口)"
         }
-        // 余额探测:网关支持时无余额标 quota(仍保留在库,充值后刷新自动恢复)
-        if APITester.checkBalance(url: url, key: key, proxy: proxyForHealth()) == .zero {
-            entry.health = "quota"
-            entry.healthDetail = "无余额/配额耗尽"
-            entry.healthAt = Date().timeIntervalSince1970
-            try? history.update(entry)
-            return "✓ 端点可用但无余额(quota): \(test.detail) — 充值后刷新自动恢复"
-        }
-        entry.health = "ok"
-        entry.healthDetail = test.detail
+        entry.health = quotaNote != nil ? "quota" : "ok"
+        entry.healthDetail = quotaNote ?? test.detail
         entry.healthAt = Date().timeIntervalSince1970
         let currentModels = Set(entry.models ?? (entry.model.map { [$0] } ?? []))
         let testModels = test.models.filter { Parser.looksLikeModel($0) }
@@ -688,7 +679,8 @@ public final class Core {
                 try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: currentModels.sorted(), proxy: proxyForHealth())
             }
             let keep = currentModels.isEmpty ? "无" : currentModels.joined(separator: ", ")
-            return "✓ 可用: \(test.detail) (端点无模型列表,保留已有模型: \(keep))"
+            let q = quotaNote.map { "(\($0) — 充值后刷新自动恢复)" } ?? ""
+            return "✓ \(quotaNote != nil ? "端点可用但无额度" : "可用"): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)"
         }
         let modelsChanged = currentModels != Set(testModels)
 
@@ -705,7 +697,8 @@ public final class Core {
                 p.model = entry.model
                 try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: currentModels.sorted(), proxy: proxyForHealth())
             }
-            return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,无变化)"
+            let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
+            return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,无变化)\(q)"
         }
 
         var filtered: [String] = []
@@ -738,7 +731,8 @@ public final class Core {
             _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: filtered)
         }
         try history.update(entry)
-        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)"
+        let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
+        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)"
     }
 
     /// 编辑条目:改模型列表/名称,重新验证模型并同步所有目标(cc-switch/dsh)
