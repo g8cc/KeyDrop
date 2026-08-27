@@ -906,7 +906,7 @@ public enum Parser {
         if l.hasPrefix("https://") || l.hasPrefix("http://") {
             return URL(string: l)?.host?.isEmpty == false
         }
-        // 裸域名(如 sub.gwy.example.org):无协议、形如 hostname 且至少一个点
+        // 裸域名(如 sub.relay-test.example.com):无协议、形如 hostname 且至少一个点
         guard l.range(of: #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#, options: .regularExpression) != nil,
               !l.contains(".."),
               l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])-"#, options: .regularExpression) == nil
