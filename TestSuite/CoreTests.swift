@@ -206,7 +206,7 @@ enum CoreTests {
 
             // 首次 add(--force 跳过网络测试)
             let first = try! core.add(
-                raw: "https://gwy.example.org/v1 SANITIZED-TEST-KEY-2",
+                raw: "https://t.example.org/v1 sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 ccOverride: true, cpaOverride: false, dshOverride: false,
                 models: ["gpt-5.6-sol"], force: true, appType: "codex", appTypeForced: true
             )
@@ -215,7 +215,7 @@ enum CoreTests {
 
             // 再次 add 同 key 同 URL → 幂等更新:不新增条目
             let second = try! core.add(
-                raw: "https://gwy.example.org/v1 SANITIZED-TEST-KEY-2",
+                raw: "https://t.example.org/v1 sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 ccOverride: true, cpaOverride: false, dshOverride: false,
                 models: ["gpt-5.6-sol"], force: true, appType: "codex", appTypeForced: true
             )
@@ -227,7 +227,7 @@ enum CoreTests {
             // 同 key 不同 URL → 拒绝
             do {
                 _ = try core.add(
-                    raw: "https://another.com/v1 SANITIZED-TEST-KEY-2",
+                    raw: "https://another.com/v1 sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     ccOverride: true, cpaOverride: false, dshOverride: false,
                     models: ["gpt-5.6-sol"], force: false, appType: "codex"
                 )

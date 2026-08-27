@@ -8,11 +8,11 @@ enum ParserTests {
             t.equal(try! Parser.parseWithFallback("sk-abc123def456ghi789jkl").key, "sk-abc123def456ghi789jkl", "纯 key 解析")
 
             // key + URL(两种顺序)
-            let a = try! Parser.parseWithFallback("https://relay-test.example.com/v1 SANITIZED-TEST-KEY-1")
-            t.equal(a.key!, "SANITIZED-TEST-KEY-1", "key+URL 解析")
-            t.equal(a.url!, "https://relay-test.example.com/v1", "key+URL 提取 url")
+            let a = try! Parser.parseWithFallback("https://api-relay-test.example.com/v1 sk-OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLrZ3aWZkSBvrjn")
+            t.equal(a.key!, "sk-OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLrZ3aWZkSBvrjn", "key+URL 解析")
+            t.equal(a.url!, "https://api-relay-test.example.com/v1", "key+URL 提取 url")
 
-            let b = try! Parser.parseWithFallback("SANITIZED-TEST-KEY-1 https://x.com/v1")
+            let b = try! Parser.parseWithFallback("sk-OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLrZ3aWZkSBvrjn https://x.com/v1")
             t.equal(b.url!, "https://x.com/v1", "URL 在 key 后")
 
             // 多行多 provider
@@ -38,10 +38,10 @@ enum ParserTests {
 
             // base16/hex 编码 key + 裸域名(无协议)→ 补 https://,hex 解码,域名不当模型
             let hex = try! Parser.parseWithFallback(
-                "sub.gwy.example.org\n53414e4954495a45442d544553542d4b45592d33"
+                "sub.relay-test.example.com\n736b2d30313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566"
             )
-            t.equal(hex.key, "SANITIZED-TEST-KEY-3", "hex 解码 key")
-            t.equal(hex.url, "https://sub.gwy.example.org", "裸域名补 https://")
+            t.equal(hex.key, "sk-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "hex 解码 key")
+            t.equal(hex.url, "https://sub.relay-test.example.com", "裸域名补 https://")
             t.expect((hex.models ?? []).isEmpty, "裸域名不进模型")
 
             // 带点模型名(glm-5.2)不被域名排除规则误杀
@@ -56,10 +56,10 @@ enum ParserTests {
 
             // curl 命令
             let curl = try! Parser.parseWithFallback(
-                "curl -sS 'https://relay-test.example.com/v1/chat/completions' -H 'Authorization: Bearer SANITIZED-TEST-KEY-1' -d '{\"model\":\"deepseek-v4-flash-free\"}'"
+                "curl -sS 'https://api-relay-test.example.com/v1/chat/completions' -H 'Authorization: Bearer sk-OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLrZ3aWZkSBvrjn' -d '{\"model\":\"deepseek-v4-flash-free\"}'"
             )
-            t.equal(curl.key, "SANITIZED-TEST-KEY-1", "curl 提取 key")
-            t.equal(curl.url, "https://relay-test.example.com/v1", "curl 提取 base URL")
+            t.equal(curl.key, "sk-OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLrZ3aWZkSBvrjn", "curl 提取 key")
+            t.equal(curl.url, "https://api-relay-test.example.com/v1", "curl 提取 base URL")
 
             // KEY= 环境变量格式
             let env = try! Parser.parseWithFallback("KEY=sk-abc123def456ghi789jkl")
