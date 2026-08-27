@@ -72,6 +72,23 @@ enum ParserTests {
             // CJK 修复:中文段不误入模型
             let cjk = try! Parser.parseWithFallback("sk-abc123def456ghi789jkl 500rmb 随便")
             t.expect((cjk.models ?? []).allSatisfy { !$0.contains("rmb") && !$0.contains("随便") }, "CJK/rmb 不进模型")
+
+            // 回归:全角冒号粘连(标签：URL 无空格)。scnet 事故——
+            // normalizeFullWidth 转半角后「工具:https://x」整块 token,
+            // 旧逻辑把剥冒号后的 URL 串误判为 key,真 URL 丢失
+            let glued = try! Parser.parseWithFallback(
+                "兼容 OpenAI 接口协议工具：https://api.scnet.cn/api/llm/v1\n\n兼容 Anthropic 接口协议工具：https://api.scnet.cn/api/llm/anthropic\n\nAPI Key：sk-tp-MzgxLTExNTc0NzY1NTIyLTE3ODcwMjk2NzkxNTg="
+            )
+            t.equal(glued.url, "https://api.scnet.cn/api/llm/v1", "粘连全角冒号:URL 正确提取")
+            t.equal(glued.key, "sk-tp-MzgxLTExNTc0NzY1NTIyLTE3ODcwMjk2NzkxNTg=", "粘连全角冒号:key 不被 URL 污染")
+
+            // 回归:多家协议混提不猜官方 URL(旧逻辑看到「OpenAI」字样就指向 api.openai.com)
+            let mixed = try! Parser.parse("兼容 OpenAI 与 Anthropic 接口 sk-abc123def456ghi789jkl")
+            t.expect(mixed.url == nil || !(mixed.url!.contains("api.openai.com")), "多 provider 混提不误指 openai 官方")
+
+            // 单一 provider 提及仍走官方 fallback(deepseek 场景不受影响)
+            let singleHit = try! Parser.parseWithFallback("sk-x1234567890abcdef deepseek 官方")
+            t.equal(singleHit.url, "https://api.deepseek.com", "单 provider 保留官方 fallback")
         }
     }
 }

@@ -32,7 +32,15 @@ public enum ImageChannelStore {
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true
         )
         let data = try JSONEncoder().encode(c)
-        try data.write(to: url, options: .atomic)
+        let tmp = url.appendingPathExtension("tmp")
+        try data.write(to: tmp, options: .atomic)
+        // 文件内容是明文 key,权限对齐 history.json(600)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+        if FileManager.default.fileExists(atPath: url.path) {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } else {
+            try FileManager.default.moveItem(at: tmp, to: url)
+        }
     }
 }
 
@@ -65,8 +73,12 @@ public enum ImageMCPWriter {
     public static func writeClaude() throws -> Bool {
         let path = claudeSettingsPath
         var obj: [String: Any]
-        if FileManager.default.fileExists(atPath: path), let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if FileManager.default.fileExists(atPath: path) {
+            // 文件存在但解析失败时拒绝写入,避免把用户既有配置清空
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw WriterError.file("\(path) 不是有效 JSON,为避免覆盖未修改")
+            }
             obj = parsed
         } else {
             obj = [:]
@@ -117,8 +129,11 @@ public enum ImageMCPWriter {
         let path = ProcessInfo.processInfo.environment["KEYDROP_OPENCODE_CONFIG"]
             ?? (NSHomeDirectory() + "/.config/opencode/opencode.json")
         var root: [String: Any]
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+        if FileManager.default.fileExists(atPath: path) {
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw WriterError.file("\(path) 不是有效 JSON,为避免覆盖未修改")
+            }
             root = obj
         } else {
             root = [:]

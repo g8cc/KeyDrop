@@ -22,7 +22,10 @@ enum MCPImageServer {
             }
             let header = String(data: buffer[..<headerEnd.lowerBound], encoding: .utf8) ?? ""
             guard let lenLine = header.split(separator: "\n").first(where: { $0.lowercased().hasPrefix("content-length:") }),
-                  let len = Int(lenLine.split(separator: ":")[1].trimmingCharacters(in: .whitespaces)) else {
+                  let len = Int(lenLine.split(separator: ":")[1].trimmingCharacters(in: .whitespacesAndNewlines)),
+                  len >= 0, len <= 8 * 1024 * 1024 else {
+                // 多行 header 中间行带 \r,只 trim .whitespaces 会解析失败;
+                // 负数/超大的 len 会构造非法 Range 崩溃,一律丢弃该 header 继续
                 buffer.removeSubrange(..<(headerEnd.upperBound))
                 continue
             }
@@ -38,7 +41,9 @@ enum MCPImageServer {
 
             guard let msg = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
                   let method = msg["method"] as? String else { continue }
+            // notification(无 id)不需要也不能回包,回包会被部分客户端当成协议错误
             let id = msg["id"]
+            guard id != nil else { continue }
 
             var response: [String: Any] = [
                 "jsonrpc": "2.0",
