@@ -96,23 +96,16 @@ public enum LLMParser {
         ]
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        var result: LLMResult?
-        let sem = DispatchSemaphore(value: 0)
-        let task = session.dataTask(with: request) { data, _, error in
-            defer { sem.signal() }
-            guard let data, error == nil,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let choices = obj["choices"] as? [[String: Any]],
-                  let first = choices.first,
-                  let msg = first["message"] as? [String: Any],
-                  let content = msg["content"] as? String
-            else { return }
-            result = validate(content: content)
-        }
-        task.resume()
-        _ = sem.wait(timeout: .now() + timeout)
-        task.cancel()
-        return result
+        let o = NetSync.run(session: session, request: request, timeout: timeout)
+        guard o.error == nil,
+              let data = o.data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = obj["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let msg = first["message"] as? [String: Any],
+              let content = msg["content"] as? String
+        else { return nil }
+        return validate(content: content)
     }
 
     private static func validate(content: String) -> LLMResult? {

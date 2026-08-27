@@ -14,12 +14,23 @@ public enum ImageAPI {
         }
     }
 
+    /// session 缓存:调用方每个请求都设了 URLRequest.timeoutInterval,
+    /// session 级默认值不参与判定,可安全按代理复用,避免反复创建泄漏
+    private static let sessionLock = NSLock()
+    private static var sessionCache: [String: URLSession] = [:]
+
     private static func session(timeout: TimeInterval, proxy: String?) -> URLSession {
+        let p = proxy?.trimmingCharacters(in: .whitespaces) ?? ""
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if let cached = sessionCache[p] { return cached }
+        // 上限保护:同 APITester.session(for:)
+        if sessionCache.count >= 8 { sessionCache.removeAll() }
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = timeout
         c.timeoutIntervalForResource = timeout + 10
         c.httpMaximumConnectionsPerHost = 2
-        if let proxy, !proxy.isEmpty, let url = URL(string: proxy) {
+        if !p.isEmpty, let url = URL(string: p) {
             c.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPEnable: true,
                 kCFNetworkProxiesHTTPProxy: url.host ?? "",
@@ -31,7 +42,9 @@ public enum ImageAPI {
         } else {
             c.connectionProxyDictionary = [:]
         }
-        return URLSession(configuration: c)
+        let s = URLSession(configuration: c)
+        sessionCache[p] = s
+        return s
     }
 
     private static func base(_ url: String) -> String {
@@ -43,7 +56,11 @@ public enum ImageAPI {
     /// 400/422/200/403(权限类) = 端点在;404/405 = 无生图能力
     public static func probe(baseURL: String, key: String, timeout: TimeInterval = 10, proxy: String? = nil) -> Probe {
         let b = base(baseURL)
-        var req = URLRequest(url: URL(string: b + "/images/generations")!)
+        // URL 含空格等非法字符时 URL(string:) 为 nil,不能强解
+        guard let probeURL = URL(string: b + "/images/generations") else {
+            return Probe(supported: false, models: [], detail: "URL 非法: \(b)")
+        }
+        var req = URLRequest(url: probeURL)
         req.httpMethod = "POST"
         req.timeoutInterval = timeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -51,31 +68,19 @@ public enum ImageAPI {
         req.httpBody = Data("{}".utf8)
 
         var supported = false
-        var status = 0
-        let sem = DispatchSemaphore(value: 0)
-        session(timeout: timeout, proxy: proxy).dataTask(with: req) { _, resp, err in
-            if let err {
-                status = -1
-            } else if let http = resp as? HTTPURLResponse {
-                status = http.statusCode
-                switch http.statusCode {
-                case 400, 422:
-                    supported = true
-                case 200:
-                    supported = true
-                case 401:
-                    supported = false
-                case 403:
-                    supported = true
-                case 404, 405:
-                    supported = false
-                default:
-                    supported = false
-                }
-            }
-            sem.signal()
-        }.resume()
-        _ = sem.wait(timeout: .now() + timeout + 5)
+        let o = NetSync.run(session: session(timeout: timeout, proxy: proxy), request: req, timeout: timeout + 5)
+        // 与旧实现一致:有 error 视作网络不可达(-1),否则取 HTTP 状态码
+        let status = o.error != nil ? -1 : NetSync.statusCode(o)
+        switch NetSync.statusCode(o) {
+        case 400, 422:
+            supported = true
+        case 200:
+            supported = true
+        case 403:
+            supported = true
+        default:
+            supported = false
+        }
 
         var models: [String] = []
         if supported || status == 403 {
@@ -95,20 +100,16 @@ public enum ImageAPI {
     }
 
     private static func fetchModels(baseURL: String, key: String, timeout: TimeInterval, proxy: String?) -> [String] {
-        var req = URLRequest(url: URL(string: baseURL + "/models")!)
+        guard let u = URL(string: baseURL + "/models") else { return [] }
+        var req = URLRequest(url: u)
         req.timeoutInterval = timeout
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        var out: [String] = []
-        let sem = DispatchSemaphore(value: 0)
-        session(timeout: timeout, proxy: proxy).dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            guard let data, let http = resp as? HTTPURLResponse, http.statusCode == 200,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let arr = obj["data"] as? [[String: Any]] else { return }
-            out = arr.compactMap { $0["id"] as? String }
-        }.resume()
-        _ = sem.wait(timeout: .now() + timeout + 5)
-        return out
+        let o = NetSync.run(session: session(timeout: timeout, proxy: proxy), request: req, timeout: timeout + 5)
+        guard let data = o.data,
+              let http = o.response as? HTTPURLResponse, http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let arr = obj["data"] as? [[String: Any]] else { return [] }
+        return arr.compactMap { $0["id"] as? String }
     }
 
     /// 生成图片:返回保存到本地的文件路径;失败抛错
@@ -123,46 +124,55 @@ public enum ImageAPI {
             "n": 1,
             "size": size,
         ]
-        var req = URLRequest(url: URL(string: b + "/images/generations")!)
+        guard let reqURL = URL(string: b + "/images/generations") else {
+            throw NSError(domain: "ImageAPI", code: -4, userInfo: [NSLocalizedDescriptionKey: "URL 非法: \(b)"])
+        }
+        var req = URLRequest(url: reqURL)
         req.httpMethod = "POST"
         req.timeoutInterval = timeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        var result: Result<Data, Error> = .failure(NSError(domain: "ImageAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "无响应"]))
-        let sem = DispatchSemaphore(value: 0)
-        session(timeout: timeout, proxy: proxy).dataTask(with: req) { data, resp, err in
-            defer { sem.signal() }
-            if let err { result = .failure(err); return }
-            guard let data, let http = resp as? HTTPURLResponse else { return }
-            guard http.statusCode == 200, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let items = obj["data"] as? [[String: Any]], let first = items.first else {
-                let msg = (try? JSONSerialization.jsonObject(with: data ?? Data()) as? [String: Any])?["error"] as? [String: Any]
-                let m = (msg?["message"] as? String) ?? "HTTP \(http.statusCode)"
-                result = .failure(NSError(domain: "ImageAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: m]))
-                return
-            }
-            if let b64 = first["b64_json"] as? String, let img = Data(base64Encoded: b64) {
-                result = .success(img)
-            } else if let urlStr = first["url"] as? String, let url = URL(string: urlStr) {
-                let d = try? Data(contentsOf: url)
-                if let d { result = .success(d) } else {
-                    result = .failure(NSError(domain: "ImageAPI", code: -2, userInfo: [NSLocalizedDescriptionKey: "图片 URL 下载失败"]))
-                }
-            } else {
-                result = .failure(NSError(domain: "ImageAPI", code: -3, userInfo: [NSLocalizedDescriptionKey: "响应无图片数据"]))
-            }
-        }.resume()
-        _ = sem.wait(timeout: .now() + timeout + 10)
+        let o = NetSync.run(session: session(timeout: timeout, proxy: proxy), request: req, timeout: timeout + 10)
+        // 结果处理与旧回调体一致,只是从闭包改为同步执行(竞态已由 NetSync 内部消除)
+        let img: Data = try awaitDecode(o, timeout: timeout)
 
-        let data = try result.get()
         let dir = (ProcessInfo.processInfo.environment["KEYDROP_IMAGES_DIR"]
             ?? (NSHomeDirectory() + "/.keydrop/images"))
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let name = "img-\(Int(Date().timeIntervalSince1970)).png"
         let path = dir + "/" + name
-        try data.write(to: URL(fileURLWithPath: path))
+        try img.write(to: URL(fileURLWithPath: path))
         return path
+    }
+
+    /// 把生图接口响应解码成图片数据;错误码/文案保持旧行为
+    private static func awaitDecode(_ o: NetSync.Outcome, timeout: TimeInterval) throws -> Data {
+        if let err = o.error {
+            // 超时强制取消的回调在这里到达:给用户可读的超时文案,而非生硬的 "cancelled"
+            if (err as? URLError)?.code == .cancelled {
+                throw NSError(domain: "ImageAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "生成请求超时"])
+            }
+            throw err
+        }
+        guard let respData = o.data, let http = o.response as? HTTPURLResponse else {
+            throw NSError(domain: "ImageAPI", code: -1, userInfo: [NSLocalizedDescriptionKey: "无响应"])
+        }
+        guard http.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: respData) as? [String: Any],
+              let items = obj["data"] as? [[String: Any]], let first = items.first else {
+            let msg = (try? JSONSerialization.jsonObject(with: respData) as? [String: Any])?["error"] as? [String: Any]
+            let m = (msg?["message"] as? String) ?? "HTTP \(http.statusCode)"
+            throw NSError(domain: "ImageAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: m])
+        }
+        if let b64 = first["b64_json"] as? String, let d = Data(base64Encoded: b64) {
+            return d
+        }
+        if let urlStr = first["url"] as? String, let url = URL(string: urlStr) {
+            if let d = try? Data(contentsOf: url) { return d }
+            throw NSError(domain: "ImageAPI", code: -2, userInfo: [NSLocalizedDescriptionKey: "图片 URL 下载失败"])
+        }
+        throw NSError(domain: "ImageAPI", code: -3, userInfo: [NSLocalizedDescriptionKey: "响应无图片数据"])
     }
 }

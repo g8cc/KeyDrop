@@ -4,6 +4,12 @@ import SwiftUI
 import UserNotifications
 
 final class AppState: ObservableObject {
+    deinit {
+        // 卫生清理:timer 不 invalidate 会留在 runloop 空转;task 不 cancel 会延迟触发 weak no-op
+        healthTimer?.invalidate()
+        statusClearTask?.cancel()
+    }
+
     @Published var input = ""
     @Published var statusText = ""
     @Published var statusOK = true
@@ -70,27 +76,27 @@ final class AppState: ObservableObject {
             busyLabel = "拉取订阅…"
             setStatus("正在拉取订阅…", ok: true)
             Task { @MainActor in
-                defer {
-                    isBusy = false
-                    busyLabel = ""
-                }
+                // 拉 sub 是探测:失败/空结果都不是最终结论,必须回落到普通 key 导入。
+                // 注意交接:continueAddKey 有 guard !isBusy,必须先把外层的 busy 标志交还给
+                // 它(否则回退路径会被静默吞掉,用户粘贴普通链接点导入毫无反应)
+                var proxies: [ClashProxy]? = nil
                 do {
-                    let proxies = try await Task.detached(priority: .userInitiated) {
+                    proxies = try await Task.detached(priority: .userInitiated) {
                         try Core.fetchSubscriptionProxies(url: trimmed)
                     }.value
-                    if proxies.isEmpty {
-                        // 不是订阅,继续当普通 API 内容处理
-                        await self.continueAddKey(raw: raw)
-                        return
-                    }
+                } catch {
+                    proxies = []
+                }
+                if let list = proxies, !list.isEmpty {
+                    isBusy = false
+                    busyLabel = ""
                     input = ""
-                    clashPreviewProxies = proxies
+                    clashPreviewProxies = list
                     clashPreviewShown = true
                     setStatus("检测到订阅,请确认导入", ok: true)
-                } catch {
-                    // 拉取失败则回退到 key 解析
-                    await self.continueAddKey(raw: raw)
+                    return
                 }
+                await self.continueAddKey(raw: raw)
             }
             return
         }
@@ -105,7 +111,8 @@ final class AppState: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         guard !lines.isEmpty else { return false }
-        let proxyCount = lines.filter { Parser.isProxyURL($0) }.count
+        // 与 Core.add 一致:只统计能真正解析的代理行,socks5 等不支持的协议不算
+        let proxyCount = lines.filter { Parser.parseProxyURL($0) != nil }.count
         return proxyCount > 0 && proxyCount * 2 >= lines.count
     }
 
@@ -431,6 +438,12 @@ final class AppState: ObservableObject {
     }
 
     static func openTerminal(_ cmd: String) {
+        // 白名单校验:命令经 osascript 拼接写入终端 shell,一旦未来把用户数据
+        // (条目名/URL 等)拼进 cmd 就是注入漏洞。此处只允许三种启动目标。
+        guard ["opencode", "codex", "claude"].contains(cmd) else {
+            AppLog.error("openTerminal 拒绝非白名单命令: \(cmd)")
+            return
+        }
         let escaped = cmd
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")

@@ -11,6 +11,14 @@ public enum AppLog {
     private static let lock = NSLock()
     private static let tokenRegex = try! NSRegularExpression(pattern: #"[A-Za-z0-9+/_\-.]{6,}"#)
 
+    /// 热路径复用:每次写日志新建一个 DateFormatter 开销很大。
+    /// 本 formatter 只会在 write() 的锁内被触达,序列化访问是安全的。
+    private static let tsFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
+
     public static func info(_ msg: String) { write("INFO", msg) }
     public static func warn(_ msg: String) { write("WARN", msg) }
     public static func error(_ msg: String) { write("ERROR", msg) }
@@ -18,9 +26,10 @@ public enum AppLog {
     static func write(_ level: String, _ msg: String) {
         let safe = maskSecrets(msg)
             .replacingOccurrences(of: "\n", with: " ⏎ ")
-        let line = "\(timestamp()) [\(level)] \(safe)\n"
         lock.lock()
         defer { lock.unlock() }
+        // timestamp 在锁内生成(共用锁内串行访问的 formatter)
+        let line = "\(tsFormatter.string(from: Date())) [\(level)] \(safe)\n"
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             if !FileManager.default.fileExists(atPath: file.path) {
@@ -28,8 +37,13 @@ public enum AppLog {
             }
             if let fh = FileHandle(forWritingAtPath: file.path) {
                 defer { try? fh.close() }
-                try fh.seekToEnd()
-                fh.write(Data(line.utf8))
+                do {
+                    try fh.seekToEnd()
+                    // 用 throwing 全量写:旧 write(_:) 是部分写语义,磁盘异常时静默丢行
+                    try fh.write(contentsOf: Data(line.utf8))
+                } catch {
+                    NSLog("AppLog write body failed: \(error)")
+                }
             }
             rotateIfNeeded()
         } catch {
@@ -105,9 +119,5 @@ public enum AppLog {
         return out
     }
 
-    private static func timestamp() -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f.string(from: Date())
-    }
+    /// (timestamp 已并入 write 锁内,见 tsFormatter)
 }

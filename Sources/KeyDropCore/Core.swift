@@ -46,7 +46,9 @@ public final class Core {
         let rawLines = raw.split(whereSeparator: { $0.isNewline })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        let proxyCount = rawLines.filter { Parser.isProxyURL($0) }.count
+        // 只统计能真正解析的代理行(如 socks5:// 会被 isProxyURL 认可但解析不了),
+        // 否则混入不支持的协议会把正常 key 粘贴误判为 Clash 导入并报错
+        let proxyCount = rawLines.filter { Parser.parseProxyURL($0) != nil }.count
         let clashOnly = proxyCount > 0 && proxyCount * 2 >= rawLines.count
 
         if clashOnly {
@@ -178,6 +180,7 @@ public final class Core {
             if let m = models, !m.isEmpty {
                 selectedModels = m
             } else if test.models.isEmpty {
+                // 端点无模型列表:依次尝试贴入模型 / picker 手输
                 let pastedModels = parsed.models ?? (parsed.model.map { [$0] } ?? [])
                 if !pastedModels.isEmpty {
                     var tried: [String] = []
@@ -195,27 +198,27 @@ public final class Core {
                     if selectedModels.isEmpty {
                         throw ParseError.io("贴入的 \(tried.count) 个模型均验证失败: \(tried.joined(separator: ", "))。最后失败: \(lastFail)")
                     }
-            } else if let picker = pickModels {
-                let picked = picker([])
-                if picked.isEmpty {
-                    throw ParseError.io("已取消选择模型")
-                }
-                var tried: [String] = []
-                var lastFail = ""
-                for m in picked {
-                    tried.append(m)
-                    let check = APITester.testModelChat(base: url, key: key, model: m, proxy: proxyURL)
-                    if check.ok {
-                        selectedModels = [m]
-                        notes.append("模型验证通过: \(m)(输入 \(tried.count) 个,逐一验证)")
-                        break
+                } else if let picker = pickModels {
+                    let picked = picker([])
+                    if picked.isEmpty {
+                        throw ParseError.io("已取消选择模型")
                     }
-                    lastFail = "\(m) → \(check.detail)"
+                    var tried: [String] = []
+                    var lastFail = ""
+                    for m in picked {
+                        tried.append(m)
+                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: proxyURL)
+                        if check.ok {
+                            selectedModels = [m]
+                            notes.append("模型验证通过: \(m)(输入 \(tried.count) 个,逐一验证)")
+                            break
+                        }
+                        lastFail = "\(m) → \(check.detail)"
+                    }
+                    if selectedModels.isEmpty {
+                        throw ParseError.io("输入的 \(tried.count) 个模型均验证失败: \(tried.joined(separator: ", "))。最后失败: \(lastFail)")
+                    }
                 }
-                if selectedModels.isEmpty {
-                    throw ParseError.io("输入的 \(tried.count) 个模型均验证失败: \(tried.joined(separator: ", "))。最后失败: \(lastFail)")
-                }
-            }
             } else if test.models.count <= 5 {
                 selectedModels = test.models
                 notes.append("可用模型仅 \(test.models.count) 个,已全部导入")
@@ -265,7 +268,9 @@ public final class Core {
             models: selectedModels.isEmpty ? nil : selectedModels,
             key: parsed.key,
             keyMasked: parsed.keyMasked,
-            targets: [],
+            // 幂等更新保留旧条目的非 cc 目标(cpa/dsh/clash):即使本次对应开关关闭,
+            // 这些目标在外部配置中仍然存在,删除时必须继续负责清理
+            targets: dup?.targets.filter { !$0.hasPrefix("ccswitch") } ?? [],
             ccProviderID: dup?.ccProviderID,
             ccRenamedFrom: nil,
             ccRenamedTo: nil,
@@ -333,7 +338,7 @@ public final class Core {
                 prefs.cpaConfigPath = cfg
                 do {
                     let msg = try CPAWriter(configPath: cfg).add(parsed, proxy: proxyURL)
-                    entry.targets.append("cpa")
+                    if !entry.targets.contains("cpa") { entry.targets.append("cpa") }
                     entry.cpaConfigPath = cfg
                     anyOK = true
                     lines.append("✓ CPA: \(msg)")
@@ -355,7 +360,7 @@ public final class Core {
                         let route = try DSHWriter.add(
                             providerID: entry.id, key: key, url: url, models: selectedModels
                         )
-                        entry.targets.append("dsh")
+                        if !entry.targets.contains("dsh") { entry.targets.append("dsh") }
                         anyOK = true
                         lines.append("✓ DeepSeek Harness: 已添加 provider「\(route)」")
                     } catch {
@@ -425,6 +430,7 @@ public final class Core {
             return
         }
         var out: [String] = []
+        var updatedEntries: [HistoryEntry] = []
         let outLock = NSLock()
         let sem = DispatchSemaphore(value: 4)
         let group = DispatchGroup()
@@ -440,15 +446,20 @@ public final class Core {
                 updated.health = h
                 updated.healthDetail = d
                 updated.healthAt = now
-                try? self.history.update(updated)
+                // 只收集不落盘;结束后 updateAll 一次性保存。
+                // 每条各 save 一次会把整份历史反复序列化写盘(O(N²) IO 放大)
+                outLock.lock()
+                updatedEntries.append(updated)
                 if h != "ok" {
-                    outLock.lock()
                     out.append("\(e.id.prefix(8)) \(h == "dead" ? "key 失效" : "异常"): \(d.prefix(80))")
-                    outLock.unlock()
                 }
+                outLock.unlock()
             }
         }
-        group.notify(queue: .main) {
+        // 不能固定回调到 main queue:无 runloop 的进程(纯 CLI)里 main queue 永不执行,
+        // completion 会静默丢失;需要主线程的调用方自行 hop
+        group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
+            try? self.history.updateAll(updatedEntries)
             completion?(out)
         }
     }
@@ -573,29 +584,31 @@ public final class Core {
         return "opencode"
     }
 
+    /// 订阅拉取专用 session:进程级单例。
+    /// 旧实现每次调用 new 一个 URLSession 且从不 invalidate,session 内部队列/线程常驻;
+    /// menu bar app 长驻,每次贴订阅链接泄一个,累积泄漏。
+    private static let subscriptionSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 20
+        config.httpMaximumConnectionsPerHost = 1
+        return URLSession(configuration: config)
+    }()
+
     public static func fetchSubscriptionProxies(url: String) throws -> [ClashProxy] {
         guard let u = URL(string: url),
               let scheme = u.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               u.host?.isEmpty == false
         else { throw ParseError.io("无效的订阅 URL") }
-        let sem = DispatchSemaphore(value: 0)
-        var data: Data?
-        var respError: Error?
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 20
-        config.httpMaximumConnectionsPerHost = 1
-        let session = URLSession(configuration: config)
-        let task = session.dataTask(with: u) { d, _, e in
-            data = d
-            respError = e
-            sem.signal()
+        let o = NetSync.run(session: subscriptionSession, url: u, timeout: 20)
+        if let e = o.error {
+            if (e as? URLError)?.code == .cancelled {
+                throw ParseError.io("订阅请求超时(20s)")
+            }
+            throw ParseError.io("订阅请求失败: \(e.localizedDescription)")
         }
-        task.resume()
-        _ = sem.wait(timeout: .now() + 20)
-        if let e = respError { throw ParseError.io("订阅请求失败: \(e.localizedDescription)") }
-        guard let d = data, !d.isEmpty else { throw ParseError.io("订阅链接无响应(超时或不可达)") }
+        guard let d = o.data, !d.isEmpty else { throw ParseError.io("订阅链接无响应(超时或不可达)") }
         guard d.count <= 5_000_000 else { throw ParseError.io("订阅内容过大(>5MB),已拒绝") }
 
         let text: String
@@ -873,9 +886,10 @@ public final class Core {
         var remaining = entry.targets
 
         if entry.targets.contains("cpa") {
-            if let cfg = entry.cpaConfigPath, let key = extractKey(entry) {
+            if let cfg = entry.cpaConfigPath,
+               let keys = extractAllKeys(for: entry), !keys.isEmpty {
                 do {
-                    let msg = try CPAWriter(configPath: cfg).remove(apiKey: key)
+                    let msg = try CPAWriter(configPath: cfg).remove(apiKeys: keys)
                     lines.append("✓ CPA: \(msg)")
                     remaining.removeAll { $0 == "cpa" }
                 } catch {
@@ -955,6 +969,17 @@ public final class Core {
         if let key = e.key, !key.isEmpty { return key }
         if let parsed = try? Parser.parse(e.raw) { return parsed.key }
         return nil
+    }
+
+    /// 取条目对应的所有 key:单 key 条目走 extractKey;多 key 条目(cpa-multikey)用 extractAllKeys 从 raw 提全。
+    /// 返回 nil 表示无法恢复任何 key,调用方应跳过删除并报告失败。
+    private func extractAllKeys(for e: HistoryEntry) -> [String]? {
+        if let key = e.key, !key.isEmpty { return [key] }
+        let fromRaw = Parser.extractAllKeys(e.raw)
+        if fromRaw.isEmpty {
+            return (try? Parser.parse(e.raw)).flatMap { $0.key.map { [$0] } }
+        }
+        return fromRaw
     }
 
     public func list(limit: Int = 20) -> String {

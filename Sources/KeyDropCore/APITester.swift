@@ -47,9 +47,22 @@ public enum APITester {
         return URLSession(configuration: c)
     }()
 
-    /// 代理非空时创建带 connectionProxyDictionary 的独立 session;否则复用默认
+    /// 代理 session 缓存:每次新建 URLSession 会常驻内部线程/队列且从不 invalidate,
+    /// 健康扫描每小时跑一次会持续泄漏;按代理地址缓存后整个进程只保留有限几个
+    private static let proxySessionLock = NSLock()
+    private static var proxySessions: [String: URLSession] = [:]
+
+    /// 代理非空时创建带 connectionProxyDictionary 的 session;否则复用默认。
+    /// 创建也在锁内:URLSession(configuration:) 构造很轻(不动网络),锁外 check-then-create
+    /// 会让两个线程同时 miss 各建一个,被弃用的那个永不 invalidate → 常驻泄漏。
     private static func session(for proxy: String?) -> URLSession {
-        guard let proxy, !proxy.isEmpty, let url = URL(string: proxy) else { return session }
+        let p = proxy?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !p.isEmpty, let url = URL(string: p) else { return session }
+        proxySessionLock.lock()
+        defer { proxySessionLock.unlock() }
+        if let cached = proxySessions[p] { return cached }
+        // 缓存上限:用户反复修改代理输入框会产生多个不同地址;超上限清空重来
+        if proxySessions.count >= 8 { proxySessions.removeAll() }
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 12
         c.timeoutIntervalForResource = 20
@@ -62,7 +75,9 @@ public enum APITester {
             kCFNetworkProxiesHTTPSProxy: url.host ?? "",
             kCFNetworkProxiesHTTPSPort: url.port ?? (url.scheme == "https" ? 443 : 80),
         ]
-        return URLSession(configuration: c)
+        let s = URLSession(configuration: c)
+        proxySessions[p] = s
+        return s
     }
 
     /// 余额探测:优先 OpenRouter /auth/key(limit/usage),其次 new-api 系 billing 组合
@@ -77,21 +92,13 @@ public enum APITester {
     /// GET /auth/key (OpenRouter 兼容): {"data":{"limit":N,"usage":M}}
     private static func authKeyBalance(base: String, key: String, timeout: TimeInterval, proxy: String?) -> BalanceStatus? {
         guard let u = URL(string: base + "/auth/key") else { return nil }
-        let s = session(for: proxy)
         var req = URLRequest(url: u)
         req.httpMethod = "GET"
         req.timeoutInterval = timeout
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        let sem = DispatchSemaphore(value: 0)
-        var status = 0
-        var obj: [String: Any]?
-        let task = s.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if let data, let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { obj = o }
-        }
-        task.resume()
-        if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
+        let o = NetSync.run(session: session(for: proxy), request: req, timeout: timeout)
+        let status = NetSync.statusCode(o)
+        let obj = (try? JSONSerialization.jsonObject(with: o.data ?? Data()) as? [String: Any])
         guard status == 200, let data = obj?["data"] as? [String: Any],
               let limit = data["limit"] as? Double, limit > 0,
               let usage = data["usage"] as? Double else { return nil }
@@ -107,19 +114,9 @@ public enum APITester {
             req.httpMethod = "GET"
             req.timeoutInterval = timeout
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            let sem = DispatchSemaphore(value: 0)
-            var status = 0
-            var val: Double?
-            let task = s.dataTask(with: req) { data, resp, _ in
-                defer { sem.signal() }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if let data, let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    val = o["total_usage"] as? Double ?? o["hard_limit_usd"] as? Double
-                }
-            }
-            task.resume()
-            if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
-            return status == 200 ? val : nil
+            let o = NetSync.run(session: s, url: u, timeout: timeout)
+            let obj = try? JSONSerialization.jsonObject(with: o.data ?? Data()) as? [String: Any]
+            return NetSync.statusCode(o) == 200 ? (obj?["total_usage"] as? Double ?? obj?["hard_limit_usd"] as? Double) : nil
         }
         // subscription 返回 hard_limit_usd;usage 返回 total_usage;两个都拿到才算数
         guard let u = URL(string: base + "/dashboard/billing/subscription") else { return nil }
@@ -127,19 +124,9 @@ public enum APITester {
         req.httpMethod = "GET"
         req.timeoutInterval = timeout
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        let sem = DispatchSemaphore(value: 0)
-        var status = 0
-        var hardLimit: Double?
-        let task = s.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if let data, let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                hardLimit = o["hard_limit_usd"] as? Double
-            }
-        }
-        task.resume()
-        if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
-        guard status == 200, let limit = hardLimit else { return nil }
+        let o = NetSync.run(session: s, request: req, timeout: timeout)
+        let hardLimit = (try? JSONSerialization.jsonObject(with: o.data ?? Data()) as? [String: Any])?["hard_limit_usd"] as? Double
+        guard NetSync.statusCode(o) == 200, let limit = hardLimit else { return nil }
         guard let usage = fetch("/dashboard/billing/usage") else { return nil }
         return usage >= limit ? .zero : .ok
     }
@@ -178,30 +165,27 @@ public enum APITester {
             req.timeoutInterval = timeout
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
 
-            let sem = DispatchSemaphore(value: 0)
-            var status = 0
+            let o = NetSync.run(session: s, request: req, timeout: timeout)
+            let status = NetSync.statusCode(o)
+            let data = o.data
+            let body = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            let isJSON = isJSONBody(body)
+            let bodyHead = String(body.prefix(200))
             var models: [String] = []
-            var isJSON = false
-            let task = s.dataTask(with: req) { data, resp, _ in
-                defer { sem.signal() }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                guard let data else { return }
-                let body = String(data: data, encoding: .utf8) ?? ""
-                isJSON = isJSONBody(body)
-                if status == 200, isJSON,
-                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let arr = obj["data"] as? [[String: Any]] {
-                    for m in arr {
-                        if let id = m["id"] as? String, !id.isEmpty { models.append(id) }
-                    }
+            if status == 200, isJSON,
+               let obj = try? JSONSerialization.jsonObject(with: data ?? Data()) as? [String: Any],
+               let arr = obj["data"] as? [[String: Any]] {
+                for m in arr {
+                    if let id = m["id"] as? String, !id.isEmpty { models.append(id) }
                 }
             }
-            task.resume()
-            if sem.wait(timeout: .now() + timeout) == .timedOut {
-                task.cancel()
-            }
 
-            if status == 401 || status == 403 { authFailed = true }
+            // 401/403 需区分「认证失败」与「CF 盾拦截」:盾页是 HTML(如 Cloudflare 挑战页),
+            // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(relay-a.example.com 事故)
+            if status == 401 || status == 403 {
+                let looksHTML = bodyHead.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
+                if !looksHTML { authFailed = true }
+            }
             if status == 200 {
                 // 200 但非 JSON(SPA/前端兜底页,任何 key 都 200)→ 不是 API 端点,继续下一候选
                 guard isJSON else {
@@ -269,16 +253,9 @@ public enum APITester {
                 "max_tokens": 1,
                 "messages": [["role": "user", "content": "ping"]]
             ])
-            let sem = DispatchSemaphore(value: 0)
-            var status = 0
-            var body = ""
-            let task = s.dataTask(with: req) { data, resp, _ in
-                defer { sem.signal() }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if let d = data { body = String(data: d, encoding: .utf8) ?? "" }
-            }
-            task.resume()
-            if sem.wait(timeout: .now() + timeout) == .timedOut { task.cancel() }
+            let o = NetSync.run(session: s, request: req, timeout: timeout)
+            let status = NetSync.statusCode(o)
+            let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
@@ -298,6 +275,7 @@ public enum APITester {
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
         var lastDesc = ""
+        var authFailed = false
         for path in chatPaths {
             guard let u = URL(string: base + path) else { continue }
             var req = URLRequest(url: u)
@@ -310,27 +288,24 @@ public enum APITester {
                 "max_tokens": 1,
                 "messages": [["role": "user", "content": "ping"]]
             ])
-            let sem = DispatchSemaphore(value: 0)
-            var status = 0
-            var body = ""
-            let task = s.dataTask(with: req) { data, resp, _ in
-                defer { sem.signal() }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if let d = data { body = String(data: d, encoding: .utf8) ?? "" }
-            }
-            task.resume()
-            if sem.wait(timeout: .now() + timeout) == .timedOut {
-                task.cancel()
-            }
+            let o = NetSync.run(session: s, request: req, timeout: timeout)
+            let status = NetSync.statusCode(o)
+            let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             let ok = status == 400
                 || (status == 200 && isJSONBody(body))
                 || (status == 404 && isGatewayErrorBody(body))
             if ok {
                 return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)")
             }
+            // HTML 盾页(CF 挑战)≠ 认证失败,不计入 authFailed
+            if status == 401 || (status == 403 && !isHTMLBody(body)) { authFailed = true }
             lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }
-        return (false, lastDesc.contains("401") || lastDesc.contains("403"), lastDesc)
+        return (false, authFailed, lastDesc)
+    }
+
+    private static func isHTMLBody(_ s: String) -> Bool {
+        s.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
     }
 
     private static func isJSONBody(_ s: String) -> Bool {
@@ -372,20 +347,13 @@ public enum APITester {
             "messages": [["role": "user", "content": "ping"]]
         ])
 
-        let sem = DispatchSemaphore(value: 0)
-        var status = 0
-        var body = ""
-        let task = s.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-            if let d = data { body = String(data: d, encoding: .utf8) ?? "" }
-        }
-        task.resume()
-        if sem.wait(timeout: .now() + timeout) == .timedOut {
-            task.cancel()
-        }
+        let o = NetSync.run(session: s, request: req, timeout: timeout)
+        let status = NetSync.statusCode(o)
+        let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
         let ok = status == 400 || (status == 200 && isJSONBody(body))
-        return (ok, status == 401 || status == 403,
+        // HTML 盾页(CF 挑战)≠ 认证失败
+        let authFail = status == 401 || (status == 403 && !isHTMLBody(body))
+        return (ok, authFail,
                 "POST \(messagesPath) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))"))
     }
 
@@ -452,18 +420,9 @@ public enum APITester {
                 "max_tokens": 1,
                 "messages": [["role": "user", "content": "ping"]]
             ])
-            let sem = DispatchSemaphore(value: 0)
-            var status = 0
-            var body = ""
-            let task = s.dataTask(with: req) { data, resp, _ in
-                defer { sem.signal() }
-                status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if let d = data { body = String(data: d, encoding: .utf8) ?? "" }
-            }
-            task.resume()
-            if sem.wait(timeout: .now() + timeout) == .timedOut {
-                task.cancel()
-            }
+            let o = NetSync.run(session: s, request: req, timeout: timeout)
+            let status = NetSync.statusCode(o)
+            let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             if status == 200 {
                 return (true, "POST \(base)\(path) → 200")
             }
@@ -494,17 +453,9 @@ public enum APITester {
             "max_output_tokens": 1
         ])
         let s = session(for: proxy)
-        let sem = DispatchSemaphore(value: 0)
-        var status = 0
-        let task = s.dataTask(with: req) { data, resp, _ in
-            defer { sem.signal() }
-            status = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        }
-        task.resume()
-        if sem.wait(timeout: .now() + timeout) == .timedOut {
-            task.cancel()
-            return true
-        }
+        let o = NetSync.run(session: s, request: req, timeout: timeout)
+        if o.error != nil && NetSync.statusCode(o) == 0 { return true }
+        let status = NetSync.statusCode(o)
         if status == 0 { return true }
         return status != 404 && status != 405 && status != 501
     }

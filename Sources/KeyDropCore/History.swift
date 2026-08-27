@@ -135,10 +135,14 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(ccMissing, forKey: .ccMissing)
     }
 
-    public var timeStr: String {
+    private static let timeFormatter: DateFormatter = {
         let df = DateFormatter()
         df.dateFormat = "MM-dd HH:mm"
-        return df.string(from: Date(timeIntervalSince1970: ts))
+        return df
+    }()
+
+    public var timeStr: String {
+        Self.timeFormatter.string(from: Date(timeIntervalSince1970: ts))
     }
 
     public var summary: String {
@@ -168,6 +172,13 @@ public final class HistoryStore {
 
     private let lock = NSLock()
     private var _items: [HistoryEntry] = []
+    /// 启动 load 时磁盘上已有的条目 id 快照。
+    /// 防复活规则:内存条目若既不在当前文件、也不在 loadedIDs(=本会话新增),视为其他进程已删除,丢弃。
+    /// 旧实现用 `ts > fileMaxTS` 判断,被删条目恰好是最新时 ts 最大 → 复活,bug。
+    private var loadedIDs: Set<String> = []
+    /// 上次读文件时的 mtime:snapshot 检测到外部(CLI)改过文件就重载,
+    /// 否则常驻 app 看不到 CLI 新增的条目,直到重启
+    private var lastMtime: Date? = nil
 
     /// 非线程安全快照入口;UI/CLI 请用 snapshot()
     var items: [HistoryEntry] { snapshot() }
@@ -176,44 +187,74 @@ public final class HistoryStore {
 
     public func snapshot() -> [HistoryEntry] {
         lock.lock(); defer { lock.unlock() }
+        refreshIfExternalChangeLocked()
         return _items
+    }
+
+    /// 锁内调用:文件被其他进程改过(mtime 变化)→ 重读进内存
+    private func refreshIfExternalChangeLocked() {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let mtime = attrs[.modificationDate] as? Date else { return }
+        if lastMtime == nil { lastMtime = mtime; return }
+        if mtime != lastMtime {
+            loadLocked()
+        }
     }
 
     func load() {
         lock.lock(); defer { lock.unlock() }
-        guard let data = try? Data(contentsOf: fileURL) else { _items = []; return }
+        loadLocked()
+    }
+
+    private func loadLocked() {
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let mtime = attrs[.modificationDate] as? Date {
+            lastMtime = mtime
+        }
+        guard let data = try? Data(contentsOf: fileURL) else { _items = []; loadedIDs = []; return }
         struct Wrapper: Codable { var items: [HistoryEntry] }
         if let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
             _items = w.items
+            loadedIDs = Set(w.items.map { $0.id })
         } else {
-            Logger.warn("history 文件格式无效,已忽略: \(fileURL.path)")
-            _items = []
+            // 解析失败:很可能是 CLI 写到一半被并发读到(partial JSON)。保留上一份内存,不要清空,
+            // 否则 mtime 刷新路径下 UI 会出现短暂的「历史清空」闪动
+            Logger.warn("history 文件解析失败,保留内存快照(可能是并发写入): \(fileURL.path)")
         }
     }
 
     public func save() throws {
         lock.lock()
-        let copy = _items
-        lock.unlock()
+        defer { lock.unlock() }
+        try saveLocked()
+    }
+
+    /// 全部保存逻辑,调用方必须已持有 lock。
+    /// append/update 必须在同一临界区内完成「内存变更 + 落盘」:
+    /// 若拆开(锁内插入、锁外落盘),其他线程的 snapshot→loadLocked 会用文件
+    /// 内容覆盖内存,丢弃尚未落盘的新条目 —— 丢记录竞态。
+    private func saveLocked() throws {
         struct Wrapper: Codable { var items: [HistoryEntry] }
-        var merged = copy
-        // 竞态保护(跨进程,如 CLI 删除 vs app 内存):
-        //   - 文件存在而内存缺失(文件独有)= CLI 新增 → 保留
+        var merged = _items
+        // 跨进程合并规则(如 CLI 删除 vs app 内存):
+        //   - 文件存在而内存缺失(文件独有)= 其他进程新增 → 保留,并登记为已知 id
         //   - 内存存在而文件缺失:
-        //       条目的 ts 晚于文件全部条目 → 本次会话新增 → 保留
-        //       否则 → 其他进程已删除 → 丢弃(防复活)
+        //       id 在 loadedIDs 外(本会话 append 新增)→ 保留
+        //       id 在 loadedIDs 内(启动时就有,现在文件没了)→ 其他进程已删除 → 丢弃(防复活)
         //   - 同 id 以内存版为准(健康更新等)
         if let data = try? Data(contentsOf: fileURL),
            let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
-            let fileMaxTS = w.items.map { $0.ts }.max() ?? 0
-            let fileByID = Dictionary(uniqueKeysWithValues: w.items.map { ($0.id, $0) })
-            let memIDs = Set(copy.map { $0.id })
-            merged = copy.filter { e in
-                if fileByID[e.id] != nil { return true }
-                return e.ts > fileMaxTS
+            let fileIDs = Set(w.items.map { $0.id })
+            let memIDs = Set(merged.map { $0.id })
+            merged = merged.filter { e in
+                fileIDs.contains(e.id) || !loadedIDs.contains(e.id)
             } + w.items.filter { !memIDs.contains($0.id) }
+            // 文件独有的 id 登记进 loadedIDs:后续 save 时若它再从文件消失,同样按「其他进程删除」处理
+            for e in w.items where !loadedIDs.contains(e.id) { loadedIDs.insert(e.id) }
             merged.sort { $0.ts > $1.ts }
         }
+        // 合并可能带回文件独有的旧条目,重新执行 500 条上限(丢最旧)
+        if merged.count > 500 { merged = Array(merged.prefix(500)) }
         try FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storeDir.path)
         let data = try JSONEncoder().encode(Wrapper(items: merged))
@@ -225,28 +266,38 @@ public final class HistoryStore {
         } else {
             try FileManager.default.moveItem(at: tmp, to: fileURL)
         }
-        lock.lock()
         _items = merged
-        lock.unlock()
+        // 已落盘的 id 全部登记:此后任何一次 save 发现它从文件消失 → 其他进程删除 → 不复活
+        loadedIDs = Set(merged.map { $0.id })
     }
 
     public func append(_ e: HistoryEntry) throws {
         lock.lock()
+        defer { lock.unlock() }
         _items.insert(e, at: 0)
         if _items.count > 500 { _items = Array(_items.prefix(500)) }
-        lock.unlock()
-        try save()
+        try saveLocked()
     }
 
     public func update(_ e: HistoryEntry) throws {
         lock.lock()
-        if let i = _items.firstIndex(where: { $0.id == e.id }) {
-            _items[i] = e
-            lock.unlock()
-            try save()
-        } else {
-            lock.unlock()
+        defer { lock.unlock() }
+        guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
+        _items[i] = e
+        try saveLocked()
+    }
+
+    /// 批量更新后只落盘一次。健康扫描等高频小更新的场景用这个,
+    /// 逐条 update 会把整份历史反复序列化写盘(O(N²) IO 放大)。
+    public func updateAll(_ entries: [HistoryEntry]) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        for e in entries {
+            if let i = _items.firstIndex(where: { $0.id == e.id }) {
+                _items[i] = e
+            }
         }
+        try saveLocked()
     }
 
     public func find(idPrefix: String) -> HistoryEntry? {
@@ -324,8 +375,6 @@ public final class Prefs {
         set { lock.lock(); _proxy = newValue; lock.unlock() }
     }
 
-    private(set) var loaded = false
-
     init() { load() }
 
     func load() {
@@ -338,7 +387,6 @@ public final class Prefs {
             _cpaConfigPath = obj["cpaConfigPath"] as? String
             if let v = obj["proxy"] as? String { _proxy = v }
         }
-        loaded = true
     }
 
     public func resolvedCPAConfig() -> String? {
@@ -368,6 +416,10 @@ public final class Prefs {
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
+        )
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: fileURL.deletingLastPathComponent().path
         )
         let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
         let tmp = fileURL.appendingPathExtension("tmp")

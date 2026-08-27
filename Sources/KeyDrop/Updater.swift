@@ -150,7 +150,8 @@ final class Updater {
             let zipPath = tmp + "/KeyDrop-\(version).zip"
             try fm.copyItem(atPath: archive.path, toPath: zipPath)
 
-            state = .installing
+            // 本函数运行在 URLSession 回调线程,state 更新必须走 main(setState)
+            setState(.installing)
             let extractDir = tmp + "/extract"
             try fm.createDirectory(atPath: extractDir, withIntermediateDirectories: true)
             let ditto = Process()
@@ -173,15 +174,37 @@ final class Updater {
             guard !runningPath.isEmpty else {
                 throw UpdateError.installFailed("无法定位当前应用路径")
             }
+            // 仅允许 .app 形态自更新:裸二进制(如 .build/release/KeyDrop)的 bundlePath
+            // 是普通目录,rm -rf 会连带删掉目录里的其他文件,且无法自替换
+            guard runningPath.hasSuffix(".app") else {
+                throw UpdateError.installFailed("当前不是 .app 运行形态,请手动更新")
+            }
 
-            // 运行中的 app 无法自我替换:分离进程延迟执行 kill → 替换 → 重启
+            // 杀自己用精确 PID,pkill -f 全串匹配是 ERE 正则,路径含 + 等元字符时
+            // 会杀不掉或误杀其他进程。
+            // 替换采用「先改名利旧 → 挪入新包 → 失败即回滚」:先 rm -rf 的话,
+            // 后续 mv 一旦失败(磁盘满/占用),应用就彻底没了。
+            let myPID = ProcessInfo.processInfo.processIdentifier
+            let backupPath = runningPath + ".keydrop-old"
+            func shellEscape(_ s: String) -> String {
+                "'" + s.replacingOccurrences(of: "'", with: "'\\''" ) + "'"
+            }
             let script = """
             sleep 2
-            pkill -f "\(runningPath)/Contents/MacOS/KeyDrop" 2>/dev/null || true
+            kill -9 \(myPID) 2>/dev/null || true
             sleep 1
-            rm -rf "\(runningPath)"
-            mv "\(newBundle)" "\(runningPath)"
-            open "\(runningPath)"
+            if mv \(shellEscape(runningPath)) \(shellEscape(backupPath)); then
+              if mv \(shellEscape(newBundle)) \(shellEscape(runningPath)); then
+                open \(shellEscape(runningPath))
+                (sleep 5 && rm -rf \(shellEscape(backupPath))) &
+              else
+                # 新包挪入失败,立即回滚,保证本机始终有一份可用的 KeyDrop
+                mv \(shellEscape(backupPath)) \(shellEscape(runningPath))
+                exit 1
+              fi
+            else
+              exit 1
+            fi
             """
             let sh = Process()
             sh.executableURL = URL(fileURLWithPath: "/bin/sh")

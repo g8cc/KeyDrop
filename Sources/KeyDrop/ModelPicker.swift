@@ -125,6 +125,13 @@ enum ModelPicker {
 
     private static var pending: [UInt8] = []
 
+    /// 等待 stdin 有可读字节(非阻塞轮询);返回 false 表示 us 内没有新输入
+    private static func hasInputWithin(ms: Int32) -> Bool {
+        var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        let n = poll(&pfd, 1, ms)
+        return n > 0 && (pfd.revents & Int16(POLLIN)) != 0
+    }
+
     private static func readKey() -> String? {
         if pending.isEmpty {
             var buf = [UInt8](repeating: 0, count: 64)
@@ -134,18 +141,26 @@ enum ModelPicker {
         }
         let byte = pending.removeFirst()
         if byte == 0x1B {
+            // 旧行为是死等后续两个字节,单独按 Esc 会卡住直到下一次按键。
+            // 改为短轮询(~30ms):方向键等转义序列会在同一次终端写入中一起到达,
+            // 没有后续字节的纯 Esc 立即生效。
             while pending.count < 2 {
+                guard hasInputWithin(ms: 30) else { break }
                 var buf = [UInt8](repeating: 0, count: 2)
                 let n = read(STDIN_FILENO, &buf, 2)
-                guard n > 0 else { return nil }
+                guard n > 0 else { break }
                 pending += buf.prefix(n)
             }
+            if pending.isEmpty { return "\u{1B}" }
             let a = pending.removeFirst()
-            let b = pending.removeFirst()
             if a == 0x5B {
+                // ESC [ + 一字节构成 CSI 序列(↑↓ 等)
+                guard !pending.isEmpty else { return "\u{1B}" }
+                let b = pending.removeFirst()
                 return "\u{1B}[" + String(UnicodeScalar(b))
             }
             if a == 0x1B {
+                // 连按两次 Esc:本次先生效,第二个留给下一轮
                 pending.insert(a, at: 0)
                 return "\u{1B}"
             }

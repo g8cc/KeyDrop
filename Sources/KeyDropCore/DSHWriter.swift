@@ -35,11 +35,22 @@ public enum DSHWriter {
         return u + "/v1"
     }
 
+    /// 写入前对现有文件做 .keydrop-bak 备份,手写 YAML 行解析一旦写坏可手动恢复
+    /// (与 CPAWriter/config.yaml.keydrop-bak、CCSwitchWriter *.bak 的习惯一致)
+    private static func backupFile(_ path: String) {
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        let bak = path + ".keydrop-bak"
+        try? FileManager.default.removeItem(atPath: bak)
+        try? FileManager.default.copyItem(atPath: path, toPath: bak)
+    }
+
     /// Appends (or updates) a provider route and its credential.
     public static func add(providerID: String, key: String, url: String, models: [String]) throws -> String {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
+        backupFile(settingsPath)
+        backupFile(credentialsPath)
         var settings = (try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? ""
         var creds = (try? String(contentsOfFile: credentialsPath, encoding: .utf8)) ?? ""
 
@@ -52,9 +63,12 @@ public enum DSHWriter {
             atPath: URL(fileURLWithPath: settingsPath).deletingLastPathComponent().path,
             withIntermediateDirectories: true
         )
-        try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
+        // 写入顺序:creds(被引用方)先写,settings(引用方)后写。
+        // 反过来时 settings 写成功而 creds 失败会留下引用不存在 env 的半成品,DSH 启动报错;
+        // creds 先写失败则 settings 未动,多一个未被引用的 env 无害。
         try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
+        try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
         return route
     }
 
@@ -63,6 +77,8 @@ public enum DSHWriter {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
+        backupFile(settingsPath)
+        backupFile(credentialsPath)
         if FileManager.default.fileExists(atPath: settingsPath),
            var settings = try? String(contentsOfFile: settingsPath, encoding: .utf8) {
             removeRoute(&settings, route: route)
@@ -73,6 +89,22 @@ public enum DSHWriter {
             removeCredential(&creds, env: env)
             try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
         }
+    }
+
+    /// YAML 标量:普通 URL/模型名/key 保持裸写(兼容既有格式与消费方),
+    /// 含空格、引号、#、冒号结尾等会破坏 YAML 解析的形态时转双引号
+    public static func yamlScalar(_ s: String) -> String {
+        if !s.isEmpty,
+           s.range(of: #"^[A-Za-z0-9_\-./:%#=]+$"#, options: .regularExpression) != nil,
+           !s.hasPrefix("-"), !s.hasPrefix("?"),
+           !s.contains(": "), !s.hasSuffix(":") {
+            return s
+        }
+        let e = s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        return "\"\(e)\""
     }
 
     // MARK: - settings.yaml
@@ -119,11 +151,11 @@ public enum DSHWriter {
         var b = "    \(route):\n"
         b += "      apiKeyEnv: \(env)\n"
         b += "      api: openai-completions\n"
-        b += "      baseURL: \(normalizeBaseURL(url))\n"
+        b += "      baseURL: \(yamlScalar(normalizeBaseURL(url)))\n"
         b += "      models:\n"
         for m in models {
-            b += "        - id: \(m)\n"
-            b += "          name: \(m)\n"
+            b += "        - id: \(yamlScalar(m))\n"
+            b += "          name: \(yamlScalar(m))\n"
         }
         return b
     }
@@ -151,7 +183,7 @@ public enum DSHWriter {
     // MARK: - credentials
 
     private static func upsertCredential(_ text: inout String, env: String, value: String) throws {
-        let line = "\(env): \(value)"
+        let line = "\(env): \(yamlScalar(value))"
         let lines = text.components(separatedBy: "\n")
         var replaced = false
         var out: [String] = []

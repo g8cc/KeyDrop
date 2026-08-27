@@ -35,15 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusItem: NSStatusItem!
     var panel: KeyDropPanel?
     let state = AppState()
-    private var panelObservers: [NSObjectProtocol] = []
     private var eventMonitor: Any?
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
 
     deinit {
-        for token in panelObservers {
-            NotificationCenter.default.removeObserver(token)
-        }
         if let eventMonitor {
             NSEvent.removeMonitor(eventMonitor)
         }
@@ -81,10 +77,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.setupUpdater()
         }
 
-        let healed = Core.shared.selfHeal()
-        if !healed.isEmpty {
-            AppLog.info("self-heal: " + healed.joined(separator: "; "))
-            Logger.info(healed.joined(separator: "; "))
+        // selfHeal 的对账可能逐条做网络测试(单条最长 10s),放后台避免阻塞主线程卡启动
+        DispatchQueue.global(qos: .utility).async {
+            let healed = Core.shared.selfHeal()
+            if !healed.isEmpty {
+                AppLog.info("self-heal: " + healed.joined(separator: "; "))
+                Logger.info(healed.joined(separator: "; "))
+            }
         }
 
         let nc = NotificationCenter.default

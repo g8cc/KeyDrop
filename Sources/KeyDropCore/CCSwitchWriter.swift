@@ -8,7 +8,7 @@ public struct CCAddResult {
     var renamedTo: String? = nil
     var directMode = false
     var proxyMode = false
-    var warnings: [String] = []
+    public var warnings: [String] = []
 }
 
 enum WriterError: LocalizedError {
@@ -70,9 +70,14 @@ public final class CCSwitchWriter {
             ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
             : "{}"
 
+        // opencode 双写(DB settings_config + opencode.json)必须共用同一份 modelDict,
+        // 否则两路随机后缀会 drift。firstModel 保留用户传入顺序优先级。
+        let opencodeModels = models.isEmpty ? (p.model.map { [$0] } ?? []) : models
+        let opencodeDict = opencodeModelDict(providerID: id, baseURL: url, models: opencodeModels)
+
         let settingsConfig: String
         if appType == "opencode" {
-            settingsConfig = try opencodeSettingsConfig(p, models: models)
+            settingsConfig = try opencodeSettingsConfig(p, modelDict: opencodeDict)
         } else if appType == "codex" {
             settingsConfig = try codexSettingsConfig(p, models: models, wireApi: wireApi)
         } else {
@@ -84,6 +89,7 @@ public final class CCSwitchWriter {
 
         let db = try DB(path: Self.dbPath)
         try db.exec("BEGIN IMMEDIATE")
+        var dedupReplacedID: String? = nil
         do {
             if appType == "opencode" || appType == "codex" {
                 let normURL = appType == "opencode" ? opencodeBaseURL(url) : normalizeEndpointURL(url)
@@ -99,6 +105,7 @@ public final class CCSwitchWriter {
                 if let id = existing?[0] {
                     try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [id])
                     try db.run("DELETE FROM providers WHERE id=?", [id])
+                    dedupReplacedID = id
                 }
             }
             try db.run(
@@ -116,16 +123,20 @@ public final class CCSwitchWriter {
                 [id, appType, appType == "opencode" ? opencodeBaseURL(url) : url, now]
             )
 
-            var renamedFrom: String? = nil
-            var renamedTo: String? = nil
-            if appRunning, let cur = diskCurrent, cur != id {
-                let retired = UUID().uuidString.lowercased()
-                try db.run("UPDATE providers SET id = ? WHERE id = ? AND app_type = ?", [retired, cur, appType])
-                try db.run("UPDATE provider_endpoints SET provider_id = ? WHERE provider_id = ? AND app_type = ?", [retired, cur, appType])
-                renamedFrom = cur
-                renamedTo = retired
-            }
+            // 历史 bug 修复:不再 mutate 旧 provider 的 id 主键。
+            // 旧实现把上一个 current 的 id 改成随机 UUID,意图是「retired 暂存 + 删除新 provider 时还原」,
+            // 但 cc-switch 是独立进程、内存里缓存旧 id,看到 id 突变会认知错位(写回 DB 时或外键错乱)。
+            // 新方案:仅靠 is_current=0 表达「非激活」,删除新 provider 时用「最近创建的同 app_type provider」兜底恢复。
+            // CCAddResult.renamedFrom / renamedTo 保留字段(二进制兼容),值永远为 nil。
+            let renamedFrom: String? = nil
+            let renamedTo: String? = nil
             try db.exec("COMMIT")
+
+            // opencode.json 是共享文件:被去重替换的旧 provider 条目要同步移除,避免孤儿
+            if appType == "opencode", let old = dedupReplacedID {
+                do { try clearOpencodeProvider(id: old) }
+                catch { AppLog.warn("opencode.json 旧 provider 清理失败: \(error.localizedDescription)") }
+            }
 
             var result = CCAddResult(providerID: id, providerName: name)
             if appType == "codex" && !supportsResponses {
@@ -142,7 +153,7 @@ public final class CCSwitchWriter {
 
             if appType == "opencode" {
                 do {
-                    try mergeOpencodeProvider(p, providerID: id, models: models)
+                    try mergeOpencodeProvider(p, providerID: id, modelDict: opencodeDict, firstModel: opencodeModels.first)
                     result.directMode = true
                 } catch {
                     result.warnings.append("opencode.json 更新失败: \(error.localizedDescription)")
@@ -235,17 +246,56 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         try jsonString(["env": claudeEnv(for: p, models: models, proxy: proxy)])
     }
 
-    private func opencodeSettingsConfig(_ p: ParsedKey, models: [String]) throws -> String {
+    /// 计算 opencode 模型显示名的权威映射(modelKey -> {"name": displayName})。
+    /// cc-switch DB settings_config 与 opencode.json 两个写入路径必须共用同一份映射,
+    /// 否则各自随机后缀必然 drift(https://... 例:DB 里 3BEFE594 / opencode.json 里 FA4FEB90)。
+    /// 优先级:opencode.json 现有同名条目(保留用户已复制的名字)> 新随机后缀。
+    /// 匹配顺序:同 providerID > 同 baseURL(去重重建换 ID 时旧条目仍在 opencode.json)> 旧版聚合键 KeyDrop。
+    /// 调用方:add() / repairMissingProvider() / syncModelsAfterRefresh() 必须只算一次,把结果传给两个 writer。
+    func opencodeModelDict(providerID: String, baseURL: String?, models: [String]) -> [String: Any] {
+        var existing: [String: String] = [:]
+        let normalizedTarget = baseURL.map { opencodeBaseURL($0) }
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: Self.opencodeConfigPath)),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let providers = obj["provider"] as? [String: Any] {
+            // 三路命中:精确 providerID(3)> 同 baseURL(2)> 旧版 KeyDrop 聚合键(1);高 level 先填
+            let levelOf: (String, Any) -> Int = { key, raw in
+                if key == providerID { return 3 }
+                if let target = normalizedTarget,
+                   let pd = raw as? [String: Any],
+                   let opts = pd["options"] as? [String: Any],
+                   let base = opts["baseURL"] as? String,
+                   base == target { return 2 }
+                if key == "KeyDrop" { return 1 }
+                return 0
+            }
+            let sorted = providers.sorted { levelOf($0.key, $0.value) > levelOf($1.key, $1.value) }
+            for (key, raw) in sorted {
+                guard levelOf(key, raw) > 0,
+                      let pd = raw as? [String: Any],
+                      let ms = pd["models"] as? [String: Any] else { continue }
+                for (mk, mv) in ms {
+                    if let name = (mv as? [String: Any])?["name"] as? String, !name.isEmpty,
+                       existing[mk] == nil {
+                        existing[mk] = name
+                    }
+                }
+            }
+        }
+        var out: [String: Any] = [:]
+        for m in models {
+            let name = existing[m] ?? Self.suffixedModelID(m)
+            out[m] = ["name": name]
+        }
+        return out
+    }
+
+    private func opencodeSettingsConfig(_ p: ParsedKey, modelDict: [String: Any]) throws -> String {
         let options: [String: Any] = [
             "baseURL": opencodeBaseURL(p.url ?? ""),
             "apiKey": p.key ?? "",
             "setCacheKey": true
         ]
-        var modelDict: [String: Any] = [:]
-        let all = models.isEmpty ? (p.model.map { [$0] } ?? []) : models
-        for m in all {
-            modelDict[m] = ["name": Self.suffixedModelID(m)]
-        }
         return try jsonString([
             "npm": "@ai-sdk/openai-compatible",
             "options": options,
@@ -258,6 +308,13 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             "auth": ["OPENAI_API_KEY": p.key ?? ""],
             "config": codexConfigToml(p, models: models, wireApi: wireApi)
         ])
+    }
+
+    /// TOML 双引号字符串转义(模型名/key 可能含引号或反斜杠)
+    static func tomlQuote(_ s: String) -> String {
+        let e = s.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(e)\""
     }
 
     private func codexConfigToml(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws -> String {
@@ -296,12 +353,12 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                     let key = trimmed.split(separator: "=", maxSplits: 1).first.map(String.init)?
                         .trimmingCharacters(in: .whitespaces) ?? ""
                     switch key {
-                    case "base_url": customLines?.append("base_url = \"\(url)\"")
-                    case "wire_api": customLines?.append("wire_api = \"\(wireApi)\"")
+                    case "base_url": customLines?.append("base_url = \(Self.tomlQuote(url))")
+                    case "wire_api": customLines?.append("wire_api = \(Self.tomlQuote(wireApi))")
                     case "name": customLines?.append("name = \"custom\"")
                     case "env_key": break
                     case "requires_openai_auth": customLines?.append("requires_openai_auth = true"); hasAuthLine = true
-                    case "experimental_bearer_token": customLines?.append("experimental_bearer_token = \"\(p.key ?? "")\"")
+                    case "experimental_bearer_token": customLines?.append("experimental_bearer_token = \(Self.tomlQuote(p.key ?? ""))")
                     default: customLines?.append(ln)
                     }
                     continue
@@ -313,7 +370,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                         continue
                     }
                     if trimmed.hasPrefix("model = ") {
-                        out.append("model = \"\(model)\"")
+                        out.append("model = \(Self.tomlQuote(model))")
                         modelSet = true
                         continue
                     }
@@ -331,30 +388,30 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 out.insert("model_provider = \"custom\"", at: 0)
             }
             if !modelSet {
-                out.insert("model = \"\(model)\"", at: providerSet ? 1 : 0)
+                out.insert("model = \(Self.tomlQuote(model))", at: providerSet ? 1 : 0)
             }
             if !hadCustom {
                 out.append("")
                 out.append("[model_providers.custom]")
                 out.append("name = \"custom\"")
-                out.append("wire_api = \"\(wireApi)\"")
+                out.append("wire_api = \(Self.tomlQuote(wireApi))")
                 out.append("requires_openai_auth = true")
-                out.append("base_url = \"\(url)\"")
-                out.append("experimental_bearer_token = \"\(p.key ?? "")\"")
+                out.append("base_url = \(Self.tomlQuote(url))")
+                out.append("experimental_bearer_token = \(Self.tomlQuote(p.key ?? ""))")
             }
             return out.joined(separator: "\n")
         }
         return [
             "model_provider = \"custom\"",
-            "model = \"\(model)\"",
+            "model = \(Self.tomlQuote(model))",
             "model_reasoning_effort = \"high\"",
             "",
             "[model_providers.custom]",
             "name = \"custom\"",
-            "wire_api = \"\(wireApi)\"",
+            "wire_api = \(Self.tomlQuote(wireApi))",
             "requires_openai_auth = true",
-            "base_url = \"\(url)\"",
-            "experimental_bearer_token = \"\(p.key ?? "")\""
+            "base_url = \(Self.tomlQuote(url))",
+            "experimental_bearer_token = \(Self.tomlQuote(p.key ?? ""))"
         ].joined(separator: "\n")
     }
 
@@ -367,16 +424,20 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         let written = try codexConfigToml(p, models: models, wireApi: wireApi)
         try writeText(written, to: cfgPath)
         if let back = try? String(contentsOfFile: cfgPath, encoding: .utf8) {
+            // 回读比对必须用与写入一致的规范化值(codexBaseURL 补 /v1、tomlQuote 转义),
+            // 否则 URL 不带 /v1 时必然误报「回读不一致」
             let key = p.key ?? ""
-            let url = p.url ?? ""
+            let url = codexBaseURL(p.url ?? "")
             var issues: [String] = []
-            if !back.contains("base_url = \"\(url)\"") { issues.append("base_url 回读不一致") }
-            if !back.contains("experimental_bearer_token = \"\(key)\"") { issues.append("token 回读不一致") }
+            if !back.contains("base_url = \(Self.tomlQuote(url))") { issues.append("base_url 回读不一致") }
+            if !back.contains("experimental_bearer_token = \(Self.tomlQuote(key))") { issues.append("token 回读不一致") }
             let model = models.first(where: { !$0.isEmpty }) ?? (p.model?.isEmpty == false ? p.model : nil)
-            if let m = model, !back.contains("model = \"\(m)\"") { issues.append("model 回读不一致") }
+            if let m = model, !back.contains("model = \(Self.tomlQuote(m))") { issues.append("model 回读不一致") }
             if !issues.isEmpty {
+                // 不再 throw:调用方(add)此刻 DB 事务已 COMMIT,throw 会制造
+                // 「DB 说成功、外层报失败」的分裂状态。重写一次 + warn,让结果收敛。
                 try writeText(written, to: cfgPath)
-                throw ParseError.io("codex config 写入校验失败(\(issues.joined(separator: ", "))),已重写")
+                AppLog.warn("codex config 回读校验失败(\(issues.joined(separator: ", "))),已重写;请检查 \(cfgPath)")
             }
         }
         let authPath = Self.codexAuthPath
@@ -501,7 +562,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         return u + "/v1"
     }
 
-    func mergeOpencodeProvider(_ p: ParsedKey, providerID: String, models: [String]) throws {
+    func mergeOpencodeProvider(_ p: ParsedKey, providerID: String, modelDict: [String: Any], firstModel: String?) throws {
         let path = Self.opencodeConfigPath
         if FileManager.default.fileExists(atPath: path) {
             _ = try? FileManager.default.removeItem(atPath: path + ".bak")
@@ -509,18 +570,6 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         }
         var obj = try loadJSONForWrite(path)
         var providers = (obj["provider"] as? [String: Any]) ?? [:]
-        // 尽量保留旧显示名,避免刷新后已复制的模型名失效
-        let previousModels: [String: Any] = {
-            if let existing = providers[providerID] as? [String: Any],
-               let m = existing["models"] as? [String: Any] {
-                return m
-            }
-            if let legacy = providers["KeyDrop"] as? [String: Any],
-               let m = legacy["models"] as? [String: Any] {
-                return m
-            }
-            return [:]
-        }()
         var pd: [String: Any] = [
             "npm": "@ai-sdk/openai-compatible",
             "options": [
@@ -529,23 +578,13 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 "setCacheKey": true
             ]
         ]
-        let all = models.isEmpty ? (p.model.map { [$0] } ?? []) : models
-        if !all.isEmpty {
-            var modelDict: [String: Any] = [:]
-            for m in all {
-                if let old = previousModels[m] as? [String: Any],
-                   let oldName = old["name"] as? String, !oldName.isEmpty {
-                    modelDict[m] = ["name": oldName]
-                } else {
-                    modelDict[m] = ["name": Self.suffixedModelID(m)]
-                }
-            }
+        if !modelDict.isEmpty {
             pd["models"] = modelDict
         }
         providers[providerID] = pd
         providers.removeValue(forKey: "KeyDrop")
         obj["provider"] = providers
-        if let first = all.first {
+        if let first = firstModel {
             obj["model"] = "\(providerID)/\(first)"
         }
         try writeJSON(obj, to: path)
@@ -575,9 +614,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         let name = (entry.name?.isEmpty == false ? entry.name! : defaultName(for: url))
         let wireApi = "responses"
 
+        let opencodeDict = opencodeModelDict(providerID: pid, baseURL: url, models: models)
+
         let settingsConfig: String
         if appType == "opencode" {
-            settingsConfig = try opencodeSettingsConfig(p, models: models)
+            settingsConfig = try opencodeSettingsConfig(p, modelDict: opencodeDict)
         } else if appType == "codex" {
             settingsConfig = try codexSettingsConfig(p, models: models, wireApi: wireApi)
         } else {
@@ -598,6 +639,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             "INSERT INTO providers (id, app_type, name, settings_config, created_at, meta, is_current) VALUES (?,?,?,?,?,?,?)",
             [pid, appType, name, settingsConfig, now, meta, promote ? 1 : 0]
         )
+        // endpoint 行与 add() 对齐:cc-switch 界面展示 URL、后续按 URL 去重都依赖它
+        try db.run(
+            "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at) VALUES (?, ?, ?, ?)",
+            [pid, appType, appType == "opencode" ? opencodeBaseURL(url) : url, now]
+        )
         if promote {
             try updateSwitchSettings(pid, for: appType)
         }
@@ -609,6 +655,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     func remove(providerID: String, renamedFrom: String?, renamedTo: String?, appType: String = "claude") throws -> String {
         try Self.ensureDB()
         let db = try DB(path: Self.dbPath)
+        // COMMIT 之后任何附属文件(settings/opencode.json/codex备份)写入失败都只降级为
+        // 警告附在返回消息里,不再 throw:此刻事务已提交、DB 已删干净,
+        // 抛错会让调用方(Core.delete)误判"删除失败",制造历史↔DB 账目不一致。
+        var warnings: [String] = []
+        func warn(_ e: Error) { warnings.append(e.localizedDescription) }
         try db.exec("BEGIN IMMEDIATE")
         do {
             if appType == "opencode" || appType == "codex" {
@@ -624,44 +675,29 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                         [appType]
                     ) else {
                         try db.exec("COMMIT")
-                        try updateSwitchSettings(nil, for: appType)
-                        try clearOpencodeProvider(id: providerID)
+                        do { try updateSwitchSettings(nil, for: appType) } catch { warn(error) }
+                        do { try clearOpencodeProvider(id: providerID) } catch { warn(error) }
                         if appType == "codex" { try? restoreCodexConfig() }
-                        return "已删除,并清除当前设置"
+                        return joinDeleteMsg("已删除,并清除当前设置", warnings)
                     }
                     try db.run("UPDATE providers SET is_current = 0 WHERE app_type = ?", [appType])
                     try db.run("UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = ?", [fb, appType])
-try db.exec("COMMIT")
-                try updateSwitchSettings(fb, for: appType)
-                try? clearOpencodeProvider(id: providerID)
-                if appType == "codex" { try? restoreCodexConfig() }
-                return "已删除,回退到最近 provider(\(fb.prefix(8))…)"
-            }
-            try db.exec("COMMIT")
-            try? clearOpencodeProvider(id: providerID)
-            if appType == "codex" { try? restoreCodexConfig() }
-            return "已删除"
-        }
-
-            if let rf = renamedFrom, let rt = renamedTo {
-                try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [rf])
-                try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [providerID])
-                try db.run("UPDATE providers SET id = ? WHERE id = ? AND app_type = ?", [rf, rt, appType])
-                try db.run("UPDATE provider_endpoints SET provider_id = ? WHERE provider_id = ? AND app_type = ?", [rf, rt, appType])
-                try db.run("DELETE FROM providers WHERE id = ? AND app_type = 'claude'", [providerID])
-                try db.run("UPDATE providers SET is_current = 0 WHERE app_type = 'claude'")
-                try db.run("UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = 'claude'", [rf])
-                try db.exec("COMMIT")
-                var warning: String? = nil
-                do {
-                    try updateSwitchSettings(rf, for: "claude")
-                } catch {
-                    warning = "switch settings 更新失败: \(error.localizedDescription)"
+                    try db.exec("COMMIT")
+                    do { try updateSwitchSettings(fb, for: appType) } catch { warn(error) }
+                    do { try clearOpencodeProvider(id: providerID) } catch { warn(error) }
+                    if appType == "codex" { try? restoreCodexConfig() }
+                    return joinDeleteMsg("已删除,回退到最近 provider(\(fb.prefix(8))…)", warnings)
                 }
-                restoreLiveEnv(providerID: rf, db: db)
-                return warning.map { "已删除,并恢复原 provider(\(rf.prefix(8))…)\n⚠ \($0)" }
-                    ?? "已删除,并恢复原 provider(\(rf.prefix(8))…)"
+                try db.exec("COMMIT")
+                do { try clearOpencodeProvider(id: providerID) } catch { warn(error) }
+                if appType == "codex" { try? restoreCodexConfig() }
+                return joinDeleteMsg("已删除", warnings)
             }
+
+            // Claude 分支:历史 renamedFrom/renamedTo 机制已废弃(参见 add() 注释),
+            // 即便调用方传了值也忽略,统一走「最近创建的同 app_type provider 兜底恢复」。
+            _ = renamedFrom
+            _ = renamedTo
 
             let wasCurrent = (try db.scalar(
                 "SELECT is_current FROM providers WHERE id = ? AND app_type = 'claude'",
@@ -679,33 +715,32 @@ try db.exec("COMMIT")
                     try db.run("UPDATE providers SET is_current = 0 WHERE app_type = 'claude'")
                     try db.run("UPDATE providers SET is_current = 1 WHERE id = ? AND app_type = 'claude'", [fb])
                     try db.exec("COMMIT")
-                    var warning: String? = nil
-                    do {
-                        try updateSwitchSettings(fb, for: "claude")
-                    } catch {
-                        warning = "switch settings 更新失败: \(error.localizedDescription)"
-                    }
+                    do { try updateSwitchSettings(fb, for: "claude") } catch { warn(error) }
                     restoreLiveEnv(providerID: fb, db: db)
-                    return warning.map { "已删除,回退到最近 provider(\(fb.prefix(8))…)\n⚠ \($0)" }
-                        ?? "已删除,回退到最近 provider(\(fb.prefix(8))…)"
+                    return joinDeleteMsg("已删除,回退到最近 provider(\(fb.prefix(8))…)", warnings)
                 }
             }
             try db.exec("COMMIT")
             if wasCurrent {
-                var warning: String? = nil
                 do {
                     try updateSwitchSettings(nil, for: "claude")
                     try clearLiveEnv()
                 } catch {
-                    warning = "清理当前设置失败: \(error.localizedDescription)"
+                    warn(error)
                 }
-                return warning.map { "已删除\n⚠ \($0)" } ?? "已删除"
+                return joinDeleteMsg("已删除", warnings)
             }
-            return "已删除"
+            return joinDeleteMsg("已删除", warnings)
         } catch {
             try? db.exec("ROLLBACK")
             throw error
         }
+    }
+
+    /// 拼接删除结果消息与 COMMIT 后产生的降级警告
+    private func joinDeleteMsg(_ base: String, _ warnings: [String]) -> String {
+        guard !warnings.isEmpty else { return base }
+        return base + "\n⚠ " + warnings.joined(separator: "; ")
     }
 
     /// 兜底删除:仅凭 provider ID 删除(不依赖历史 targets 标记)
@@ -781,7 +816,7 @@ try db.exec("COMMIT")
 
     /// 检查 cc-switch 中是否仍存在该 provider(ID + app_type)。
     /// DB 不可用时返回 true(保守:不误标孤儿)。
-    func providerExists(id: String, appType: String) -> Bool {
+    public func providerExists(id: String, appType: String) -> Bool {
         guard FileManager.default.fileExists(atPath: Self.dbPath),
               let db = try? DB(path: Self.dbPath)
         else { return true }
@@ -794,7 +829,7 @@ try db.exec("COMMIT")
 
     /// 刷新模型后同步 cc-switch:总是更新 DB settings_config(切换回该 provider 时用新列表),
     /// 仅当该 provider 是当前激活时同步真实配置文件,避免覆盖其他 provider 的环境。
-    func syncModelsAfterRefresh(
+    public func syncModelsAfterRefresh(
         _ p: ParsedKey, providerID: String, appType: String, models: [String], proxy: String? = nil
     ) throws {
         guard FileManager.default.fileExists(atPath: Self.dbPath) else { return }
@@ -805,9 +840,11 @@ try db.exec("COMMIT")
         )) == "1"
         let wireApi = "responses"
 
+        let opencodeDict = opencodeModelDict(providerID: providerID, baseURL: p.url, models: models)
+
         let settingsConfig: String
         if appType == "opencode" {
-            settingsConfig = try opencodeSettingsConfig(p, models: models)
+            settingsConfig = try opencodeSettingsConfig(p, modelDict: opencodeDict)
         } else if appType == "codex" {
             settingsConfig = try codexSettingsConfig(p, models: models, wireApi: wireApi)
         } else {
@@ -821,7 +858,7 @@ try db.exec("COMMIT")
         // opencode.json 是共享文件(多 provider 共存),更新非当前 provider 的条目也安全;
         // codex/claude 是单文件单 provider,只有当前激活时才同步,避免覆盖其他 provider 的环境
         if appType == "opencode" {
-            try mergeOpencodeProvider(p, providerID: providerID, models: models)
+            try mergeOpencodeProvider(p, providerID: providerID, modelDict: opencodeDict, firstModel: models.first)
             return
         }
         guard isCurrent else { return }
@@ -840,10 +877,8 @@ try db.exec("COMMIT")
         }
     }
 
-    func providerExists(_ id: String, appType: String) -> Bool {
-        guard FileManager.default.fileExists(atPath: Self.dbPath) else { return false }
-        let db = try? DB(path: Self.dbPath)
-        return (try? db?.scalar("SELECT count(*) FROM providers WHERE id=? AND app_type=?", [id, appType])) == "1"
+    public func providerExists(_ id: String, appType: String) -> Bool {
+        providerExists(id: id, appType: appType)
     }
 
     static public func ccSwitchRunning() -> Bool {

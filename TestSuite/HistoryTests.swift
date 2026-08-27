@@ -40,6 +40,17 @@ enum HistoryTests {
             try! hist.update(inact)
             t.expect(hist.findActiveByKey("sk-bbbbbbbb-1111-2222-3333-444444444444") == nil, "非 active 不命中")
 
+            // ---- 批量更新 updateAll(健康扫描路径):多条一次落盘,未命中 id 静默跳过 ----
+            var a1 = hist.find(idPrefix: "aaaa")!
+            a1.health = "ok"
+            let missing = entry("ffffffff-1111-2222-3333-444444444444", ts: 999)  // 不在库内
+            try! hist.updateAll([a1, missing])
+            t.equal(hist.find(idPrefix: "aaaa")?.health, "ok", "updateAll 命中更新")
+            t.expect(hist.find(idPrefix: "ffff") == nil, "updateAll 未命中静默跳过")
+            // 落盘后跨实例可见(证明确实持久化了一次)
+            let histForUpdate = HistoryStore()
+            t.equal(histForUpdate.find(idPrefix: "aaaa")?.health, "ok", "updateAll 已落盘")
+
             // ---- 竞态场景:CLI(另一进程)删除后 app 内存过期 ----
             // 模拟:app 内存里仍有 aaaa;文件已被 CLI 删除 aaaa 并新增 cccc
             var appMem = hist.find(idPrefix: "aaaa")!
@@ -60,6 +71,16 @@ enum HistoryTests {
             t.expect(after.contains { $0.id.hasPrefix("dddd") }, "app 新增保留")
             t.expect(after.contains { $0.id.hasPrefix("bbbb") }, "共存的旧条目保留")
             t.expect(after.first?.id.hasPrefix("dddd") == true, "按 ts 降序")
+
+            // ---- 回归:常驻 app 感知 CLI 外部写入(mtime 变化触发重载) ----
+            // 旧逻辑 snapshot 只读内存,CLI 新增条目要等 app 自己 save 才出现
+            let live = HistoryStore()  // 新实例=模拟运行中的 app,加载当前文件(不含 eeee)
+            t.expect(!live.snapshot().contains { $0.id.hasPrefix("eeee") }, "初始无 eeee")
+            struct W2: Codable { var items: [HistoryEntry] }
+            let cur = try! JSONDecoder().decode(W2.self, from: Data(contentsOf: URL(fileURLWithPath: env.dir + "/home/history.json")))
+            let extData = try! JSONEncoder().encode(W2(items: cur.items + [entry("eeeeeeee-1111-2222-3333-444444444444", ts: 500)]))
+            try! extData.write(to: URL(fileURLWithPath: env.dir + "/home/history.json"))
+            t.expect(live.snapshot().contains { $0.id.hasPrefix("eeee") }, "外部写入后 snapshot 立即可见(mtime 重载)")
         }
     }
 }
