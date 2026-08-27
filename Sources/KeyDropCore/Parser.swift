@@ -173,10 +173,11 @@ public enum Parser {
     public static func applyOfficialURLFallback(_ p: inout ParsedKey, raw: String) {
         guard p.url == nil else { return }
         let haystack = ((p.name ?? "") + " " + raw).lowercased()
-        for item in officialBaseURLs where haystack.range(of: item.pattern, options: .regularExpression) != nil {
-            p.url = item.url
-            return
-        }
+        let hits = officialBaseURLs.filter { haystack.range(of: $0.pattern, options: .regularExpression) != nil }
+        // 多家协议混提(如「兼容 OpenAI/Anthropic 接口」的中转站说明)不猜官方 URL,
+        // 留空让上层报「缺 URL」,避免把中转站静默指向 api.openai.com
+        guard hits.count == 1, let only = hits.first else { return }
+        p.url = only.url
     }
 
     static func normalizeQuotes(_ s: String) -> String {
@@ -186,6 +187,23 @@ public enum Parser {
             .replacingOccurrences(of: "’", with: "'")
             .replacingOccurrences(of: "：", with: ":")
             .replacingOccurrences(of: "，", with: ",")
+    }
+
+    /// 拆分粘连 token:「标签:URL」形态。
+    /// 场景:全角冒号「工具：https://x」经 normalizeFullWidth 转半角后无空格,
+    /// 按空白切分得到「工具:https://x」整块;looksLikeURL 因 CJK 前缀判否,
+    /// extractKey 兜底会把剥冒号后的字符串误判为 key(真实事故:scnet 导入失败)。
+    private static func splitGluedToken(_ t: String) -> Cand {
+        let cleaned = stripCJK(t)
+        if looksLikeURL(cleaned) { return Cand(value: cleaned, lhs: nil) }
+        // 懒惰前缀 ≤40 字符 + [:=] + 完整 scheme URL → 只留 URL 捕获组
+        if cleaned.range(of: #"^.{0,40}?[:=]\s*((?:https?|socks5)://\S+)$"#, options: .regularExpression) != nil {
+            let urlPart = cleaned.replacingOccurrences(
+                of: #"^.{0,40}?[:=]\s*((?:https?|socks5)://\S+)$"#,
+                with: "$1", options: .regularExpression)
+            return Cand(value: urlPart, lhs: nil)
+        }
+        return Cand(value: stripQuotes(t), lhs: nil)
     }
 
     static func parseMultiline(_ text: String) throws -> ParsedKey {
@@ -227,7 +245,7 @@ public enum Parser {
                 }
                 if !inline.isEmpty { return try classify(inline, separator: separator) }
             } else if tokens.count > 1 && !hasLabeledColon {
-                for t in tokens { cands.append(Cand(value: t, lhs: nil)) }
+                for t in tokens { cands.append(splitGluedToken(t)) }
                 return try classify(cands, separator: separator)
             }
         }
@@ -244,6 +262,9 @@ public enum Parser {
                     eq = e
                 }
             }
+            if ProcessInfo.processInfo.environment["KEYDROP_DEBUG_PARSE"] == "1" {
+                FileHandle.standardError.write(Data("[dbg] line=\(line)\n".utf8))
+            }
             if let eq {
                 lhs = String(line[line.startIndex..<eq]).trimmingCharacters(in: .whitespaces)
                 line = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
@@ -259,7 +280,7 @@ public enum Parser {
                     for t in tokens {
                         let cleaned = stripCJK(t)
                         if looksLikeURL(cleaned) { cands.append(Cand(value: cleaned, lhs: nil)) }
-                        else { cands.append(Cand(value: stripQuotes(t), lhs: nil)) }
+                        else { cands.append(splitGluedToken(t)) }
                     }
                     continue
                 }
@@ -267,6 +288,11 @@ public enum Parser {
             line = stripQuotes(line.trimmingCharacters(in: CharacterSet(charactersIn: ",;")))
             if line.isEmpty { continue }
             cands.append(Cand(value: line, lhs: lhs?.lowercased()))
+        }
+        if ProcessInfo.processInfo.environment["KEYDROP_DEBUG_PARSE"] == "1" {
+            for c in cands {
+                FileHandle.standardError.write(Data("[dbg] cand lhs=\(c.lhs ?? "nil") val=\(c.value.prefix(60))\n".utf8))
+            }
         }
         return try classify(cands, separator: separator)
     }
@@ -775,6 +801,8 @@ public enum Parser {
         }
 
         var files: [(URL, Int)] = []
+        var totalSize = 0
+        let maxTotalSize = 50_000_000  // 50MB:zip bomb 防护
         if let en = FileManager.default.enumerator(at: outDir, includingPropertiesForKeys: [.fileSizeKey]) {
             for case let url as URL in en {
                 let p = url.path
@@ -785,8 +813,15 @@ public enum Parser {
                 guard FileManager.default.fileExists(atPath: p, isDirectory: &isDir), !isDir.boolValue else { continue }
                 let size = ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
                 if size > 1_500_000 { continue }
+                totalSize += size
+                if totalSize > maxTotalSize {
+                    throw ParseError.io("zip 解压总量超过 \(maxTotalSize / 1_000_000)MB(疑似 zip bomb),已中止")
+                }
                 files.append((url, priority(ext: url.pathExtension.lowercased())))
             }
+        }
+        if files.count > 200 {
+            throw ParseError.io("zip 内文件数超过 200(\(files.count)),已中止")
         }
         files.sort { $0.1 < $1.1 }
 
@@ -1033,7 +1068,7 @@ public enum Parser {
             || l.hasPrefix("hy2://") || l.hasPrefix("socks5://")
     }
 
-    static func parseProxyURL(_ url: String) -> ClashProxy? {
+    public static func parseProxyURL(_ url: String) -> ClashProxy? {
         let l = url.lowercased()
         if l.hasPrefix("anytls://") { return parseAnyTLS(url) }
         if l.hasPrefix("vless://") || l.hasPrefix("vmess://")
