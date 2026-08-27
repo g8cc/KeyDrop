@@ -181,7 +181,7 @@ public enum APITester {
             }
 
             // 401/403 需区分「认证失败」与「CF 盾拦截」:盾页是 HTML(如 Cloudflare 挑战页),
-            // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(relay-a.example.com 事故)
+            // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(真实事故:某中转站多代理链)
             if status == 401 || status == 403 {
                 let looksHTML = bodyHead.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
                 if !looksHTML { authFailed = true }
