@@ -110,7 +110,13 @@ public enum AppLog {
                 out += ns.substring(with: NSRange(location: pos, length: r.location - pos))
             }
             let tok = ns.substring(with: r)
-            out += String(tok.prefix(12)) + "…"
+            // 只截断疑似密钥的长 token。原先一律截 12 字符,会把路径、模型名
+            // (claude-sonnet-4-5)、文件名等全部破坏,日志失去排障价值
+            if tok.count >= 24 {
+                out += String(tok.prefix(12)) + "…(\(tok.count)ch)"
+            } else {
+                out += tok
+            }
             pos = r.location + r.length
         }
         if pos < ns.length {

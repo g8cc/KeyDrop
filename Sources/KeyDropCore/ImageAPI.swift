@@ -25,7 +25,14 @@ public enum ImageAPI {
         defer { sessionLock.unlock() }
         if let cached = sessionCache[p] { return cached }
         // 上限保护:同 APITester.session(for:)
-        if sessionCache.count >= 8 { sessionCache.removeAll() }
+        if sessionCache.count >= 8 {
+            let evicted = sessionCache
+            sessionCache.removeAll()
+            // 同 APITester:逐出延迟 invalidate,给刚拿到 session 的调用方留窗口
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) {
+                evicted.values.forEach { $0.finishTasksAndInvalidate() }
+            }
+        }
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = timeout
         c.timeoutIntervalForResource = timeout + 10
@@ -71,7 +78,9 @@ public enum ImageAPI {
         let o = NetSync.run(session: session(timeout: timeout, proxy: proxy), request: req, timeout: timeout + 5)
         // 与旧实现一致:有 error 视作网络不可达(-1),否则取 HTTP 状态码
         let status = o.error != nil ? -1 : NetSync.statusCode(o)
-        switch NetSync.statusCode(o) {
+        // 必须用上面合成的 status:直接用 statusCode(o) 在有 error 但残留响应头时
+        // 会拿到非零码,把网络故障误判为「渠道支持生图」
+        switch status {
         case 400, 422:
             supported = true
         case 200:
@@ -166,12 +175,22 @@ public enum ImageAPI {
             let m = (msg?["message"] as? String) ?? "HTTP \(http.statusCode)"
             throw NSError(domain: "ImageAPI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: m])
         }
-        if let b64 = first["b64_json"] as? String, let d = Data(base64Encoded: b64) {
+        if let b64 = first["b64_json"] as? String {
+            // base64 解码内存峰值 ≈ 2× 数据量,超 30MB 的响应直接拒绝,防恶意响应撑爆内存
+            guard b64.count <= 30_000_000, let d = Data(base64Encoded: b64) else {
+                throw NSError(domain: "ImageAPI", code: -4,
+                              userInfo: [NSLocalizedDescriptionKey: "图片 base64 数据无效或过大"])
+            }
             return d
         }
         if let urlStr = first["url"] as? String, let url = URL(string: urlStr) {
-            if let d = try? Data(contentsOf: url) { return d }
-            throw NSError(domain: "ImageAPI", code: -2, userInfo: [NSLocalizedDescriptionKey: "图片 URL 下载失败"])
+            // Data(contentsOf:) 对 http 请求不可取消且无大小上限,挂起的服务端会
+            // 卡住远超预期时长 —— 改走 NetSync 复用带超时的会话
+            let o = NetSync.run(session: session(timeout: 30, proxy: nil), url: url, timeout: 40)
+            guard o.error == nil, let d = o.data, !d.isEmpty else {
+                throw NSError(domain: "ImageAPI", code: -2, userInfo: [NSLocalizedDescriptionKey: "图片 URL 下载失败"])
+            }
+            return d
         }
         throw NSError(domain: "ImageAPI", code: -3, userInfo: [NSLocalizedDescriptionKey: "响应无图片数据"])
     }

@@ -97,7 +97,11 @@ final class CPAWriter {
     // MARK: - add
 
     func add(_ p: ParsedKey, proxy: String? = nil) throws -> String {
-        try addSingle(key: p.key, url: p.url, model: p.model, proxy: proxy)
+        // flock 包住整个「读→改→写」临界区:CLI 与菜单栏进程并发写同一 config.yaml
+        // 时,读出的旧内容会把对方刚写的条目覆盖掉,原地写甚至可能交错损坏文件
+        _ = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try addSingle(key: p.key, url: p.url, model: p.model, proxy: proxy)
+        }
         return "已写入 CPA 配置(\(configPath));CPA 运行时会自动热重载"
     }
 
@@ -108,17 +112,26 @@ final class CPAWriter {
         guard !keys.isEmpty else {
             throw WriterError.file("addMulti 收到空 keys 列表")
         }
+        // 探测模型列表(失败不阻断,写入空 models 段供后续刷新);必须在加锁前完成
+        var probedModels: [String] = []
+        if let firstKey = keys.first {
+            let test = APITester.test(url: baseURL, key: firstKey, proxy: proxy)
+            if test.ok { probedModels = test.models.filter { Parser.looksLikeModel($0) } }
+        }
+        try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try addMultiLocked(baseURL: baseURL, keys: keys, models: probedModels, proxy: proxy)
+        }
+        return "已写入 CPA 配置(\(configPath));CPA 运行时会自动热重载"
+    }
+
+    /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,
+    /// 不能在 flock 临界区内做 —— 否则 CLI 与菜单栏并发写时互相串行排队到对方超时
+    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy: String? = nil) throws -> String {
         try Self.validateYAML(path: configPath)
         let content = try String(contentsOfFile: configPath, encoding: .utf8)
         var lines = content.components(separatedBy: "\n")
         let providerName = aggregatedName(for: baseURL)
-
-        // 探测模型列表(失败不阻断,写入空 models 段供后续刷新)
-        var models: [String] = []
-        if let firstKey = keys.first {
-            let test = APITester.test(url: baseURL, key: firstKey, proxy: proxy)
-            if test.ok { models = test.models.filter { Parser.looksLikeModel($0) } }
-        }
+        let models = probedModels
 
         // 定位 openai-compatibility 段下同 name 的现有条目
         if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
@@ -189,7 +202,8 @@ final class CPAWriter {
         return t
     }
 
-    private func addSingle(key: String?, url: String?, model: String?, proxy: String? = nil) throws {        guard let key, !key.isEmpty, let url, !url.isEmpty else { throw WriterError.missingURL }
+    private func addSingle(key: String?, url: String?, model: String?, proxy: String? = nil) throws {        guard let key, !key.isEmpty else { throw WriterError.missingKey }
+        guard let url, !url.isEmpty else { throw WriterError.missingURL }
         guard FileManager.default.fileExists(atPath: configPath) else {
             throw WriterError.file("CPA config 不存在: \(configPath)")
         }
@@ -389,6 +403,13 @@ final class CPAWriter {
         guard FileManager.default.fileExists(atPath: configPath) else {
             return "CPA config 不存在,跳过"
         }
+        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            return try removeLocked(apiKeys: apiKeys)
+        }
+    }
+
+    /// 调用方必须已持有 configPath 的 flock
+    private func removeLocked(apiKeys: [String]) throws -> String {
         try Self.validateYAML(path: configPath)
         let content = try String(contentsOfFile: configPath, encoding: .utf8)
         var lines = content.components(separatedBy: "\n")
@@ -531,6 +552,10 @@ final class CPAWriter {
         for i in (s + 1)..<lines.count {
             let l = lines[i]
             guard !l.isEmpty else { continue }
+            let t = l.trimmingCharacters(in: .whitespaces)
+            // 顶格注释行不是新段开头,跳过:否则段范围在这里被截断,
+            // 后续条目找不到导致重复建段、插入位置错乱
+            if t.hasPrefix("#") { continue }
             let first = l.first!
             if first != " " && first != "\t" {
                 end = i
@@ -561,6 +586,8 @@ final class CPAWriter {
         for i in (s + 1)..<lines.count {
             let l = lines[i]
             guard !l.isEmpty else { continue }
+            // 同 findNamedSection:顶格注释不算段边界
+            if l.trimmingCharacters(in: .whitespaces).hasPrefix("#") { continue }
             let first = l.first!
             if first != " " && first != "\t" {
                 end = i

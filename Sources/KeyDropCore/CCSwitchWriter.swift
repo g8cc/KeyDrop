@@ -564,6 +564,14 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
 
     func mergeOpencodeProvider(_ p: ParsedKey, providerID: String, modelDict: [String: Any], firstModel: String?) throws {
         let path = Self.opencodeConfigPath
+        // flock 包住「读→改→写」:CLI 与菜单栏并发写 opencode.json 时,
+        // 后写者会用旧读出的全文覆盖掉先写者刚写入的 provider 条目
+        try FileLock.withLock(FileLock.lockPath(for: path)) {
+            try mergeOpencodeProviderLocked(p, providerID: providerID, path: path, modelDict: modelDict, firstModel: firstModel)
+        }
+    }
+
+    private func mergeOpencodeProviderLocked(_ p: ParsedKey, providerID: String, path: String, modelDict: [String: Any], firstModel: String?) throws {
         if FileManager.default.fileExists(atPath: path) {
             _ = try? FileManager.default.removeItem(atPath: path + ".bak")
             try? FileManager.default.copyItem(atPath: path, toPath: path + ".bak")
@@ -631,7 +639,12 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             promote = (alive == nil)
         }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let apiFormat = APITester.supportsResponsesAPI(base: url, key: key, proxy: nil) ? "openai_responses" : "openai_chat"
+        // 网络探测只对 codex 有意义(apiFormat 只写入 codex 的 meta);
+        // 不加守卫时 self-heal 批量修复 claude/opencode 条目会逐个发网络请求,
+        // 离线场景下每个都要等超时,整个修复流程卡死数分钟
+        let apiFormat = appType == "codex"
+            ? (APITester.supportsResponsesAPI(base: url, key: key, proxy: nil) ? "openai_responses" : "openai_chat")
+            : "openai_responses"
         let meta = appType == "codex"
             ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
             : "{}"
@@ -914,13 +927,21 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     }
 
     private func updateSwitchSettings(_ id: String?, for appType: String) throws {
-        var obj = try loadJSONForWrite(Self.switchSettingsPath)
-        let key = currentKey(appType)
-        if let id { obj[key] = id } else { obj.removeValue(forKey: key) }
-        try writeJSON(obj, to: Self.switchSettingsPath)
+        try FileLock.withLock(FileLock.lockPath(for: Self.switchSettingsPath)) {
+            var obj = try loadJSONForWrite(Self.switchSettingsPath)
+            let key = currentKey(appType)
+            if let id { obj[key] = id } else { obj.removeValue(forKey: key) }
+            try writeJSON(obj, to: Self.switchSettingsPath)
+        }
     }
 
     private func mergeEnvIntoClaudeSettings(_ env: [String: String]) throws {
+        try FileLock.withLock(FileLock.lockPath(for: Self.claudeSettingsPath)) {
+            try mergeEnvIntoClaudeSettingsLocked(env)
+        }
+    }
+
+    private func mergeEnvIntoClaudeSettingsLocked(_ env: [String: String]) throws {
         var obj = try loadJSONForWrite(Self.claudeSettingsPath)
         var existing = (obj["env"] as? [String: Any]) ?? [:]
         let anthropicKeys = env.keys
@@ -951,6 +972,12 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     private func clearOpencodeProvider(id: String) throws {
         let path = Self.opencodeConfigPath
         guard FileManager.default.fileExists(atPath: path) else { return }
+        try FileLock.withLock(FileLock.lockPath(for: path)) {
+            try clearOpencodeProviderLocked(id: id, path: path)
+        }
+    }
+
+    private func clearOpencodeProviderLocked(id: String, path: String) throws {
         var obj = try loadJSONForWrite(path)
         var providers = (obj["provider"] as? [String: Any]) ?? [:]
         providers.removeValue(forKey: id)
@@ -965,6 +992,12 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
 
     private func clearLiveEnv() throws {
         guard FileManager.default.fileExists(atPath: Self.claudeSettingsPath) else { return }
+        try FileLock.withLock(FileLock.lockPath(for: Self.claudeSettingsPath)) {
+            try clearLiveEnvLocked()
+        }
+    }
+
+    private func clearLiveEnvLocked() throws {
         var obj = try loadJSONForWrite(Self.claudeSettingsPath)
         let token = ((obj["env"] as? [String: Any])?["ANTHROPIC_AUTH_TOKEN"] as? String) ?? ""
         guard token != "PROXY_MANAGED" else { return }

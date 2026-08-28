@@ -59,7 +59,7 @@ public final class Core {
                 }
             }
             guard !proxies.isEmpty else { throw ParseError.io("未识别到有效的代理节点") }
-            let msg = try ClashWriter.add(proxies: proxies)
+            let (msg, clashFile) = try ClashWriter.add(proxies: proxies)
             let entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
                 ts: Date().timeIntervalSince1970,
@@ -75,7 +75,8 @@ public final class Core {
                 ccRenamedFrom: nil,
                 ccRenamedTo: nil,
                 cpaConfigPath: nil,
-                status: "active"
+                status: "active",
+                clashFile: clashFile
             )
             try history.append(entry)
             try prefs.save()
@@ -83,26 +84,46 @@ public final class Core {
         }
 
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
-            if !trimmed.contains("\n") {
-                if let proxies = try? Self.fetchSubscriptionProxies(url: trimmed), !proxies.isEmpty {
-                    let msg = try ClashWriter.add(proxies: proxies)
-                    let entry = HistoryEntry(
-                        id: UUID().uuidString.lowercased(),
-                        ts: Date().timeIntervalSince1970, raw: raw, format: "clash-sub",
-                        name: nil, url: nil, model: nil, key: nil,
-                        keyMasked: "\(proxies.count) 个节点",
-                        targets: ["clash"], ccProviderID: nil,
-                        ccRenamedFrom: nil, ccRenamedTo: nil, cpaConfigPath: nil, status: "active"
-                    )
-                    try history.append(entry)
-                    try prefs.save()
-                    return AddOutcome(entry: entry, lines: [msg], ok: true)
-                }
+        var subFetchError: Error? = nil
+        var subProxies: [ClashProxy]? = nil
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://"), !trimmed.contains("\n") {
+            do {
+                subProxies = try Self.fetchSubscriptionProxies(url: trimmed)
+            } catch {
+                // 拉取本身失败(超时/DNS/5MB 超限)不能被 try? 吞掉:
+                // 否则后续解析失败的报错会是误导性的「解析未得到 key」。
+                // 先记下,解析也失败时一并抛出
+                subFetchError = error
             }
         }
+        // ClashWriter.add 的错误(目录不可写等)必须直接抛给用户,
+        // 不能被误归因为「订阅拉取失败」
+        if let proxies = subProxies, !proxies.isEmpty {
+            let (msg, clashFile) = try ClashWriter.add(proxies: proxies)
+            let entry = HistoryEntry(
+                id: UUID().uuidString.lowercased(),
+                ts: Date().timeIntervalSince1970, raw: raw, format: "clash-sub",
+                name: nil, url: nil, model: nil, key: nil,
+                keyMasked: "\(proxies.count) 个节点",
+                targets: ["clash"], ccProviderID: nil,
+                ccRenamedFrom: nil, ccRenamedTo: nil, cpaConfigPath: nil, status: "active",
+                clashFile: clashFile
+            )
+            try history.append(entry)
+            try prefs.save()
+            return AddOutcome(entry: entry, lines: [msg], ok: true)
+        }
 
-        var parsed = try Parser.parseWithFallback(raw)
+        var parsed: ParsedKey
+        do {
+            parsed = try Parser.parseWithFallback(raw)
+        } catch {
+            // 内容不是合法 key 且订阅拉取也失败过:把两个失败原因都告诉用户
+            if let sub = subFetchError {
+                throw ParseError.io("订阅拉取失败: \(sub.localizedDescription);内容解析失败: \(error.localizedDescription)")
+            }
+            throw error
+        }
 
         var notes: [String] = []
         if parsed.url == nil {
@@ -269,8 +290,10 @@ public final class Core {
             key: parsed.key,
             keyMasked: parsed.keyMasked,
             // 幂等更新保留旧条目的非 cc 目标(cpa/dsh/clash):即使本次对应开关关闭,
-            // 这些目标在外部配置中仍然存在,删除时必须继续负责清理
-            targets: dup?.targets.filter { !$0.hasPrefix("ccswitch") } ?? [],
+            // 这些目标在外部配置中仍然存在,删除时必须继续负责清理。
+            // ccswitch 目标只在本次重新写入 cc 时才重建;本次开关关闭时必须保留,
+            // 否则 cc-switch 里的旧 provider 变孤儿 —— delete/reconcile 都不再认领它
+            targets: dup?.targets.filter { $0.hasPrefix("ccswitch") ? !useCC : true } ?? [],
             ccProviderID: dup?.ccProviderID,
             ccRenamedFrom: nil,
             ccRenamedTo: nil,
@@ -386,8 +409,33 @@ public final class Core {
             do {
                 if dup != nil {
                     try history.update(entry)
-                } else {
-                    try history.append(entry)
+                } else if let survivor = try history.appendDedupByKey(entry) {
+                    // 网络测试期间另一进程(CLI/app)刚导入了同一 key。
+                    // 本进程也已经写了外部配置(cc-switch provider / DSH route),
+                    // 直接丢掉本进程 entry 会把这些产物变孤儿(无人认领、删不掉):
+                    // ① 回滚本进程刚写的重复外部配置(best-effort)
+                    // ② 把本进程的其余目标记录(cpa/dsh/clash)并入 survivor 再落盘
+                    var merged = survivor
+                    let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                        .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                    if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }), let pid = entry.ccProviderID {
+                        do {
+                            _ = try cc.remove(providerID: pid, renamedFrom: entry.ccRenamedFrom,
+                                              renamedTo: entry.ccRenamedTo, appType: appType)
+                        } catch {
+                            lines.append("⚠ 并发合并: 本进程刚写的 cc-switch provider(\(pid.prefix(8)))回滚失败,请手动清理: \(error.localizedDescription)")
+                        }
+                    }
+                    if entry.targets.contains("dsh") {
+                        do { try DSHWriter.remove(providerID: entry.id) }
+                        catch { lines.append("⚠ 并发合并: 本进程刚写的 DSH route 回滚失败: \(error.localizedDescription)") }
+                    }
+                    // CPA 是聚合写入、Clash 是独立文件,无需回滚;把目标记录并入 survivor
+                    for t in entry.targets where !merged.targets.contains(t) { merged.targets.append(t) }
+                    if merged.cpaConfigPath == nil { merged.cpaConfigPath = entry.cpaConfigPath }
+                    try history.update(merged)
+                    entry = merged
+                    lines.append("↻ 检测到同 key 已被其他端导入,已合并到既有记录(\(survivor.id.prefix(8)))")
                 }
                 try prefs.save()
             } catch {
@@ -412,6 +460,14 @@ public final class Core {
     private func proxyForHealth() -> String? {
         let p = prefs.proxy
         return p.isEmpty ? nil : p
+    }
+
+    /// history.update 的统一入口:落盘失败(磁盘满/权限)必须留痕,
+    /// 否则「已标记/已更新」的返回值与磁盘事实不一致且无迹可查
+    private func historyUpdateLogged(_ e: HistoryEntry) {
+        do { try history.update(e) } catch {
+            AppLog.error("history.update 保存失败: \(error.localizedDescription)")
+        }
     }
 
     public func scanHealth(staleAfter: TimeInterval = 1800, completion: (([String]) -> Void)? = nil) {
@@ -446,7 +502,7 @@ public final class Core {
                 updated.health = h
                 updated.healthDetail = d
                 updated.healthAt = now
-                // 只收集不落盘;结束后 updateAll 一次性保存。
+                // 只收集不落盘;结束后 mergeHealth 一次性按字段合并保存(见 scanHealth 尾部)
                 // 每条各 save 一次会把整份历史反复序列化写盘(O(N²) IO 放大)
                 outLock.lock()
                 updatedEntries.append(updated)
@@ -459,7 +515,13 @@ public final class Core {
         // 不能固定回调到 main queue:无 runloop 的进程(纯 CLI)里 main queue 永不执行,
         // completion 会静默丢失;需要主线程的调用方自行 hop
         group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
-            try? self.history.updateAll(updatedEntries)
+            // mergeHealth 只写 health/healthDetail/healthAt 三个字段:
+            // 测试期间条目可能被 CLI 或用户改过,整条覆盖会回滚那些并发修改
+            do {
+                try self.history.mergeHealth(updatedEntries, at: now)
+            } catch {
+                AppLog.error("scanHealth 保存失败: \(error.localizedDescription)")
+            }
             completion?(out)
         }
     }
@@ -470,34 +532,59 @@ public final class Core {
     /// - key 可用 → 标记 ccMissing,保留记录,由用户手动重新导入(避免自动复活循环)
     func reconcileWithCCSwitch() -> [String] {
         var out: [String] = []
-        for e in history.snapshot()
-        where e.status == "active"
-            && e.targets.contains(where: { $0.hasPrefix("ccswitch") })
-            && e.ccProviderID != nil {
-            let appType = e.targets.first(where: { $0.hasPrefix("ccswitch-") })
-                .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
-            guard let pid = e.ccProviderID, !cc.providerExists(id: pid, appType: appType)
-            else { continue }
-            guard let url = e.url, let key = e.key, !key.isEmpty else { continue }
-            let test = APITester.test(url: url, key: key, timeout: 10, proxy: proxyForHealth())
-            var updated = e
-            if test.authFailed {
-                updated.targets.removeAll { $0.hasPrefix("ccswitch") }
-                if updated.targets.isEmpty { updated.status = "deleted" }
-                updated.note = ([updated.note].compactMap { $0 }
-                    + ["cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记"]).joined(separator: "; ")
-                out.append("同步: 标记「\(e.name ?? String(e.id.prefix(8)))」为已删除(cc-switch 中 provider 不存在,key 失效)")
-            } else {
-                updated.ccMissing = true
-                updated.note = ([updated.note].compactMap { $0 }
-                    + ["cc-switch provider 缺失,key 仍可用,可手动重新导入"]).joined(separator: "; ")
-                out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」provider 缺失但可用,已标记可重新导入")
+        let outLock = NSLock()
+        let candidates = history.snapshot()
+            .filter {
+                $0.status == "active"
+                    && $0.targets.contains(where: { $0.hasPrefix("ccswitch") })
+                    && $0.ccProviderID != nil
             }
-            updated.health = test.authFailed ? "dead" : (test.ok ? "ok" : "err")
-            updated.healthDetail = test.detail
-            updated.healthAt = Date().timeIntervalSince1970
-            try? history.update(updated)
+            .filter { e in
+                guard let pid = e.ccProviderID else { return false }
+                let appType = e.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                return !cc.providerExists(id: pid, appType: appType)
+            }
+            .filter { ($0.url ?? "").isEmpty == false && ($0.key ?? "").isEmpty == false }
+        // 并发测试(上限 4):原先串行,每条超时 10s,离线时 N 条失联 key 要等 10N 秒
+        let sem = DispatchSemaphore(value: 4)
+        let group = DispatchGroup()
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        for e in candidates {
+            sem.wait()
+            group.enter()
+            queue.async {
+                defer { sem.signal(); group.leave() }
+                guard let url = e.url, let key = e.key, !key.isEmpty else { return }
+                let test = APITester.test(url: url, key: key, timeout: 10, proxy: self.proxyForHealth())
+                var updated = e
+                if test.authFailed {
+                    updated.targets.removeAll { $0.hasPrefix("ccswitch") }
+                    if updated.targets.isEmpty { updated.status = "deleted" }
+                    updated.note = ([updated.note].compactMap { $0 }
+                        + ["cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记"]).joined(separator: "; ")
+                } else {
+                    updated.ccMissing = true
+                    updated.note = ([updated.note].compactMap { $0 }
+                        + ["cc-switch provider 缺失,key 仍可用,可手动重新导入"]).joined(separator: "; ")
+                }
+                updated.health = test.authFailed ? "dead" : (test.ok ? "ok" : "err")
+                updated.healthDetail = test.detail
+                updated.healthAt = Date().timeIntervalSince1970
+                outLock.lock()
+                if test.authFailed {
+                    out.append("同步: 标记「\(e.name ?? String(e.id.prefix(8)))」为已删除(cc-switch 中 provider 不存在,key 失效)")
+                } else {
+                    out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」provider 缺失但可用,已标记可重新导入")
+                }
+                outLock.unlock()
+                // 测完立刻落盘:不攒到最后批量写。批量写会把竞态窗口拉长到整轮扫描的时长,
+                // 期间 CLI 删除的条目会被旧内存快照复活;立即写窗口只有毫秒级
+                self.historyUpdateLogged(updated)
+            }
         }
+        // 等全部对账完成,保持「返回时对账已生效」的既有语义(逐条已在并发任务内即时落盘)
+        group.wait()
         return out
     }
 
@@ -545,7 +632,7 @@ public final class Core {
                 found.health = h.health
                 found.healthDetail = h.detail
                 found.healthAt = Date().timeIntervalSince1970
-                try? history.update(found)
+                historyUpdateLogged(found)
             }
             return "✓ 可用: \(h.detail) (\(test.models.count) 个模型)"
         }
@@ -553,7 +640,7 @@ public final class Core {
             found.health = h.health
             found.healthDetail = h.detail
             found.healthAt = Date().timeIntervalSince1970
-            try? history.update(found)
+            historyUpdateLogged(found)
         }
         return "✗ 不可用: \(test.detail)"
     }
@@ -640,7 +727,7 @@ public final class Core {
         return proxies
     }
 
-    public static func addClashProxies(_ proxies: [ClashProxy]) throws -> String {
+    public static func addClashProxies(_ proxies: [ClashProxy]) throws -> (message: String, fileName: String?) {
         try ClashWriter.add(proxies: proxies)
     }
 
@@ -663,7 +750,7 @@ public final class Core {
             if test.authFailed || test.detail.contains("401") || test.detail.contains("403") {
                 entry.status = "dead"
             }
-            try? history.update(entry)
+            historyUpdateLogged(entry)
             throw ParseError.io("✗ 不可用: \(test.detail)" + (entry.status == "dead" ? "(key 已失效,条目已标记 dead)" : ""))
         }
         // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表
@@ -679,7 +766,7 @@ public final class Core {
         let currentModels = Set(entry.models ?? (entry.model.map { [$0] } ?? []))
         let testModels = test.models.filter { Parser.looksLikeModel($0) }
         if testModels.isEmpty {
-            try? history.update(entry)
+            historyUpdateLogged(entry)
             // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
             if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
                let pid = entry.ccProviderID {
@@ -698,7 +785,7 @@ public final class Core {
         let modelsChanged = currentModels != Set(testModels)
 
         if !modelsChanged {
-            try? history.update(entry)
+            historyUpdateLogged(entry)
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
             if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
                let pid = entry.ccProviderID {
@@ -904,7 +991,35 @@ public final class Core {
 
         if entry.targets.contains("clash") {
             remaining.removeAll { $0 == "clash" }
-            lines.append("✓ Clash: 已从列表移除")
+            // 清理生成的订阅文件:只认 basename 且拼回 profiles 目录内,
+            // 防止历史里的 clashFile 被篡改成任意路径
+            var removedFile: String? = nil
+            if let cf = entry.clashFile, !cf.isEmpty {
+                let base = (cf as NSString).lastPathComponent
+                // 防历史被篡改后误删任意文件:只允许安全文件名。
+                // lastPathComponent 挡不住 "."/"..":配合目录递归删除,
+                // ".." 能穿透到 profiles 的父目录(mihomo-party 整个目录)
+                let safeName = base.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*\.yaml$"#, options: .regularExpression) != nil
+                    && base != "." && base != ".."
+                var isRegular = false
+                if safeName {
+                    let full = (ClashWriter.profilesDir as NSString).appendingPathComponent(base)
+                    if full.hasPrefix(ClashWriter.profilesDir + "/"),
+                       let attrs = try? FileManager.default.attributesOfItem(atPath: full),
+                       let type = attrs[.type] as? FileAttributeType {
+                        isRegular = (type == .typeRegular)
+                    }
+                    if isRegular, (try? FileManager.default.removeItem(atPath: full)) != nil {
+                        removedFile = base
+                    }
+                }
+            }
+            if let f = removedFile {
+                lines.append("✓ Clash: 已删除订阅文件 \(f)")
+            } else {
+                // 旧条目没有 clashFile、文件已不在、或删除失败:如实告知
+                lines.append("✓ Clash: 已从 KeyDrop 目标列表移除(订阅 yaml 仍保留在 profiles 目录,可手动删除)")
+            }
         }
 
         if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }) {

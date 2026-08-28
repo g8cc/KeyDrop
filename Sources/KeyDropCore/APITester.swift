@@ -62,7 +62,16 @@ public enum APITester {
         defer { proxySessionLock.unlock() }
         if let cached = proxySessions[p] { return cached }
         // 缓存上限:用户反复修改代理输入框会产生多个不同地址;超上限清空重来
-        if proxySessions.count >= 8 { proxySessions.removeAll() }
+        if proxySessions.count >= 8 {
+            let evicted = proxySessions
+            proxySessions.removeAll()
+            // 逐出的 session 必须最终 invalidate,否则内部队列/连接池常驻(泄漏);
+            // 但不能立即 invalidate:同一线程可能刚从缓存拿到 session 还没发请求。
+            // 延迟 60s 再失效,给在途调用留出窗口,泄漏上限仍是 8 个 session 的存活期
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) {
+                evicted.values.forEach { $0.finishTasksAndInvalidate() }
+            }
+        }
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 12
         c.timeoutIntervalForResource = 20
@@ -114,7 +123,9 @@ public enum APITester {
             req.httpMethod = "GET"
             req.timeoutInterval = timeout
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-            let o = NetSync.run(session: s, url: u, timeout: timeout)
+            // 必须传 request 而不是 url:传 url 会丢掉刚设置的 Authorization 头,
+            // 请求以无认证发出 → 401 → 余额查询永远失败
+            let o = NetSync.run(session: s, request: req, timeout: timeout)
             let obj = try? JSONSerialization.jsonObject(with: o.data ?? Data()) as? [String: Any]
             return NetSync.statusCode(o) == 200 ? (obj?["total_usage"] as? Double ?? obj?["hard_limit_usd"] as? Double) : nil
         }

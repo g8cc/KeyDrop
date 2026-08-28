@@ -6,6 +6,7 @@ public struct HistoryEntry: Codable {
         case ccProviderID, ccRenamedFrom, ccRenamedTo, cpaConfigPath, status, note
         case health, healthDetail, healthAt
         case ccMissing
+        case clashFile
     }
 
     public var id: String
@@ -30,6 +31,9 @@ public struct HistoryEntry: Codable {
     public var healthAt: TimeInterval?
     /// cc-switch 中 provider 已缺失,但 key 仍可用(可手动重新导入)
     public var ccMissing: Bool?
+    /// Clash 订阅生成的 yaml 文件名(仅 basename,存于 profiles 目录);
+    /// 没有它 delete 无法清理生成的订阅文件
+    public var clashFile: String?
 
     public var healthColor: (ok: Bool, dead: Bool) {
         switch health {
@@ -60,7 +64,8 @@ public struct HistoryEntry: Codable {
         health: String? = nil,
         healthDetail: String? = nil,
         healthAt: TimeInterval? = nil,
-        ccMissing: Bool? = nil
+        ccMissing: Bool? = nil,
+        clashFile: String? = nil
     ) {
         self.id = id
         self.ts = ts
@@ -83,6 +88,7 @@ public struct HistoryEntry: Codable {
         self.healthDetail = healthDetail
         self.healthAt = healthAt
         self.ccMissing = ccMissing
+        self.clashFile = clashFile
     }
 
     public init(from decoder: Decoder) throws {
@@ -108,6 +114,7 @@ public struct HistoryEntry: Codable {
         healthDetail = try c.decodeIfPresent(String.self, forKey: .healthDetail)
         healthAt = try c.decodeIfPresent(TimeInterval.self, forKey: .healthAt)
         ccMissing = try c.decodeIfPresent(Bool.self, forKey: .ccMissing)
+        clashFile = try c.decodeIfPresent(String.self, forKey: .clashFile)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -133,6 +140,7 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(healthDetail, forKey: .healthDetail)
         try c.encodeIfPresent(healthAt, forKey: .healthAt)
         try c.encodeIfPresent(ccMissing, forKey: .ccMissing)
+        try c.encodeIfPresent(clashFile, forKey: .clashFile)
     }
 
     private static let timeFormatter: DateFormatter = {
@@ -207,15 +215,27 @@ public final class HistoryStore {
     }
 
     private func loadLocked() {
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-           let mtime = attrs[.modificationDate] as? Date {
-            lastMtime = mtime
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+              let mtime = attrs[.modificationDate] as? Date else { return }
+        // 记录进入时的 mtime:仅当本轮真正消费了文件内容才更新 lastMtime,
+        // 否则解析失败后外部把文件修好,也会因 mtime 未变而被跳过、永远读不进来
+        let currentMtime = mtime
+        guard let data = try? Data(contentsOf: fileURL) else {
+            // 读失败 ≠ 文件为空,可能是磁盘满/权限瞬时故障;保留内存快照,
+            // 且不更新 lastMtime,下轮 snapshot 时 mtime 未变会自动重试
+            Logger.warn("history 文件读取失败,保留内存快照: \(fileURL.path)")
+            return
         }
-        guard let data = try? Data(contentsOf: fileURL) else { _items = []; loadedIDs = []; return }
         struct Wrapper: Codable { var items: [HistoryEntry] }
-        if let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
+        if data.isEmpty {
+            // 只有确认是空文件才清空内存(首次初始化场景);同样视为已消费,更新 mtime,
+            // 否则 snapshot 每轮都会因 mtime 未变未更新而反复重读空文件
+            _items = []; loadedIDs = []
+            lastMtime = currentMtime
+        } else if let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
             _items = w.items
             loadedIDs = Set(w.items.map { $0.id })
+            lastMtime = currentMtime
         } else {
             // 解析失败:很可能是 CLI 写到一半被并发读到(partial JSON)。保留上一份内存,不要清空,
             // 否则 mtime 刷新路径下 UI 会出现短暂的「历史清空」闪动
@@ -226,29 +246,49 @@ public final class HistoryStore {
     public func save() throws {
         lock.lock()
         defer { lock.unlock() }
-        try saveLocked()
+        // 语义:内存是权威快照,全部条目视为脏(覆盖外部同名条目)
+        try saveLocked(dirtyIDs: Set(_items.map { $0.id }))
     }
 
-    /// 全部保存逻辑,调用方必须已持有 lock。
-    /// append/update 必须在同一临界区内完成「内存变更 + 落盘」:
-    /// 若拆开(锁内插入、锁外落盘),其他线程的 snapshot→loadLocked 会用文件
-    /// 内容覆盖内存,丢弃尚未落盘的新条目 —— 丢记录竞态。
-    private func saveLocked() throws {
+    /// 全部保存逻辑,调用方必须已持有 NSLock。
+    /// flock 锁住整个「读文件→合并→写文件」临界区:CLI 与 app 并发时,
+    /// 没有它,两个进程各自的读-改-写会互相覆盖、静默丢条目。
+    /// dirtyIDs = 本次调用真正修改过的条目 id:合并冲突时以内存为准;
+    /// 非脏条目若文件已被其他进程更新,则以文件为准,避免旧内存回滚并发修改。
+    private func saveLocked(dirtyIDs: Set<String> = []) throws {
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            try saveLockedNoFlock(dirtyIDs: dirtyIDs)
+        }
+    }
+
+    private func saveLockedNoFlock(dirtyIDs: Set<String>) throws {
         struct Wrapper: Codable { var items: [HistoryEntry] }
         var merged = _items
-        // 跨进程合并规则(如 CLI 删除 vs app 内存):
-        //   - 文件存在而内存缺失(文件独有)= 其他进程新增 → 保留,并登记为已知 id
-        //   - 内存存在而文件缺失:
-        //       id 在 loadedIDs 外(本会话 append 新增)→ 保留
-        //       id 在 loadedIDs 内(启动时就有,现在文件没了)→ 其他进程已删除 → 丢弃(防复活)
-        //   - 同 id 以内存版为准(健康更新等)
-        if let data = try? Data(contentsOf: fileURL),
+        // 文件从存在变为缺失 = 其他进程/用户清空了历史。防复活规则同样适用:
+        // 本会话已落盘过的条目不复活,只保留本次调用新增(非 loadedIDs)的脏条目。
+        // 仅在文件确实不存在时触发;文件存在但读失败(瞬时 IO 错误)不动内存。
+        if !FileManager.default.fileExists(atPath: fileURL.path), lastMtime != nil {
+            merged = merged.filter { dirtyIDs.contains($0.id) || !loadedIDs.contains($0.id) }
+        } else if let data = try? Data(contentsOf: fileURL),
            let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
             let fileIDs = Set(w.items.map { $0.id })
             let memIDs = Set(merged.map { $0.id })
+            // 文件 mtime 晚于我们上次消费的时间 = 其他进程改过:非脏同 id 条目以文件版为准,
+            // 否则内存里的旧版本会把 CLI 刚改的 status/health 静默回滚
+            var externalChanged = false
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let mtime = attrs[.modificationDate] as? Date, let last = lastMtime, mtime != last {
+                externalChanged = true
+            }
             merged = merged.filter { e in
-                fileIDs.contains(e.id) || !loadedIDs.contains(e.id)
-            } + w.items.filter { !memIDs.contains($0.id) }
+                guard fileIDs.contains(e.id) else { return !loadedIDs.contains(e.id) }
+                if dirtyIDs.contains(e.id) { return true }
+                return !externalChanged
+            } + w.items.filter { wItem in
+                // 外部变更时,被丢弃的非脏同 id 内存条目必须用文件版补回,
+                // 否则条目凭空消失;脏条目(本次刚改)保持内存版,不回填文件旧版
+                !memIDs.contains(wItem.id) || (externalChanged && !dirtyIDs.contains(wItem.id))
+            }
             // 文件独有的 id 登记进 loadedIDs:后续 save 时若它再从文件消失,同样按「其他进程删除」处理
             for e in w.items where !loadedIDs.contains(e.id) { loadedIDs.insert(e.id) }
             merged.sort { $0.ts > $1.ts }
@@ -269,6 +309,12 @@ public final class HistoryStore {
         _items = merged
         // 已落盘的 id 全部登记:此后任何一次 save 发现它从文件消失 → 其他进程删除 → 不复活
         loadedIDs = Set(merged.map { $0.id })
+        // 落盘后同步 mtime:避免下一次 save 把「自己刚写的」误判为外部变更,
+        // 白白多做一轮文件版对账
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+           let mtime = attrs[.modificationDate] as? Date {
+            lastMtime = mtime
+        }
     }
 
     public func append(_ e: HistoryEntry) throws {
@@ -276,7 +322,7 @@ public final class HistoryStore {
         defer { lock.unlock() }
         _items.insert(e, at: 0)
         if _items.count > 500 { _items = Array(_items.prefix(500)) }
-        try saveLocked()
+        try saveLocked(dirtyIDs: [e.id])
     }
 
     public func update(_ e: HistoryEntry) throws {
@@ -284,7 +330,22 @@ public final class HistoryStore {
         defer { lock.unlock() }
         guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
         _items[i] = e
-        try saveLocked()
+        try saveLocked(dirtyIDs: [e.id])
+    }
+
+    /// 批量健康更新:只合并 health/healthDetail/healthAt 三个字段,其余字段以内存现状为准。
+    /// scanHealth 持有旧快照做网络测试,测试期间条目可能被本进程或 CLI 改过(note/targets/status),
+    /// 整条覆盖会把并发修改静默回滚 —— 所以这里按字段合并而不是整条替换。
+    public func mergeHealth(_ entries: [HistoryEntry], at: TimeInterval) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        for e in entries {
+            guard let i = _items.firstIndex(where: { $0.id == e.id }) else { continue }
+            _items[i].health = e.health
+            _items[i].healthDetail = e.healthDetail
+            _items[i].healthAt = at
+        }
+        try saveLocked(dirtyIDs: Set(entries.map { $0.id }))
     }
 
     /// 批量更新后只落盘一次。健康扫描等高频小更新的场景用这个,
@@ -297,7 +358,7 @@ public final class HistoryStore {
                 _items[i] = e
             }
         }
-        try saveLocked()
+        try saveLocked(dirtyIDs: Set(entries.map { $0.id }))
     }
 
     public func find(idPrefix: String) -> HistoryEntry? {
@@ -325,6 +386,35 @@ public final class HistoryStore {
         return snapshot().first {
             $0.status == "active" && ($0.key ?? "") == wantKey
         }
+    }
+
+    /// 原子「查重或插入」。Core.add 的 findActiveByKey 查重与最终 append 之间
+    /// 隔着数秒到数十秒的网络测试,CLI 与 app 同时导入同一 key 时双方都查不到
+    /// 对方,各建一条重复记录。这里在 flock 临界区内对文件做最终查重:
+    /// 命中文件中的 active 同 key 条目 → 返回它(不插入);未命中 → 插入并返回 nil
+    public func appendDedupByKey(_ e: HistoryEntry) throws -> HistoryEntry? {
+        func isDup(_ other: HistoryEntry) -> Bool {
+            guard let k = e.key?.trimmingCharacters(in: .whitespacesAndNewlines), !k.isEmpty else { return false }
+            return other.status == "active" && (other.key ?? "") == k && other.id != e.id
+        }
+        lock.lock(); defer { lock.unlock() }
+        refreshIfExternalChangeLocked()
+        if let dup = _items.first(where: isDup) { return dup }
+        var survivor: HistoryEntry? = nil
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            struct Wrapper: Codable { var items: [HistoryEntry] }
+            if let data = try? Data(contentsOf: fileURL),
+               let w = try? JSONDecoder().decode(Wrapper.self, from: data),
+               let dup = w.items.first(where: isDup) {
+                survivor = dup
+                return  // 已有同 key 条目:不插入
+            }
+            _items.insert(e, at: 0)
+            if _items.count > 500 { _items = Array(_items.prefix(500)) }
+            // 内部直接用 NoFlock 版:外层已持 flock,再走 saveLocked 会二次 flock 自锁
+            try saveLockedNoFlock(dirtyIDs: [e.id])
+        }
+        return survivor
     }
 
     /// 兼容旧调用:按 key 去重(忽略 url)
@@ -411,24 +501,28 @@ public final class Prefs {
         let path = _cpaConfigPath
         let proxy = _proxy
         lock.unlock()
-        var obj: [String: Any] = ["useCC": cc, "useCPA": cpa, "useDSH": dsh, "proxy": proxy]
-        if let path, !path.isEmpty { obj["cpaConfigPath"] = path }
-        try FileManager.default.createDirectory(
-            at: fileURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o700],
-            ofItemAtPath: fileURL.deletingLastPathComponent().path
-        )
-        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-        let tmp = fileURL.appendingPathExtension("tmp")
-        try data.write(to: tmp, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tmp)
-        } else {
-            try FileManager.default.moveItem(at: tmp, to: fileURL)
+        // flock 串行化跨进程写:app 与 CLI 并发 save 时,固定 tmp 路径会被对方
+        // replaceItemAt 拽走导致写失败,并发覆盖也会丢掉对方的设置变更
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            var obj: [String: Any] = ["useCC": cc, "useCPA": cpa, "useDSH": dsh, "proxy": proxy]
+            if let path, !path.isEmpty { obj["cpaConfigPath"] = path }
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: fileURL.deletingLastPathComponent().path
+            )
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+            let tmp = fileURL.appendingPathExtension("tmp-\(UUID().uuidString.prefix(8))")
+            try data.write(to: tmp, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: fileURL)
+            }
         }
     }
 }

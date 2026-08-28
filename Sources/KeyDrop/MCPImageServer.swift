@@ -10,6 +10,8 @@ enum MCPImageServer {
         var buffer = Data()
 
         while true {
+            // 防 O(n²) 扫描与内存膨胀:长期收不到完整 header 的垃圾数据直接断开
+            if buffer.count > 16 * 1024 * 1024 { return 1 }
             // 读一帧:Content-Length 头 + JSON body
             guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else {
                 let chunk = stdin.readData(ofLength: 4096)
@@ -21,8 +23,11 @@ enum MCPImageServer {
                 continue
             }
             let header = String(data: buffer[..<headerEnd.lowerBound], encoding: .utf8) ?? ""
+            // split(separator:) 默认丢弃空段,"content-length:" 后为空时只剩 1 段,
+            // 直接下标 [1] 会数组越界崩掉整个 MCP server —— 必须安全取段
             guard let lenLine = header.split(separator: "\n").first(where: { $0.lowercased().hasPrefix("content-length:") }),
-                  let len = Int(lenLine.split(separator: ":")[1].trimmingCharacters(in: .whitespacesAndNewlines)),
+                  let lenPart = lenLine.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).dropFirst().first,
+                  let len = Int(lenPart.trimmingCharacters(in: .whitespacesAndNewlines)),
                   len >= 0, len <= 8 * 1024 * 1024 else {
                 // 多行 header 中间行带 \r,只 trim .whitespaces 会解析失败;
                 // 负数/超大的 len 会构造非法 Range 崩溃,一律丢弃该 header 继续

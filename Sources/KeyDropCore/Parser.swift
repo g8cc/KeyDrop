@@ -787,11 +787,42 @@ public enum Parser {
         try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: outDir) }
 
+        // 解压前先用 unzip -l 预检总解压量:50MB 限制必须发生在任何落盘之前,
+        // 否则 10GB 解压量的 zip bomb 会先撑爆磁盘,检查来不及生效。
+        // 口径与解压后的检查对齐:跳过 __MACOSX 资源 fork 条目和 >1.5MB 的
+        // 解压后也会被跳过的大文件,只检查总量(条目数仍由解压后检查,
+        // 目录条目 size=0 不计入总量,避免误杀含大量目录的合法 zip)
+        let listProc = Process()
+        listProc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        listProc.arguments = ["-l", path]
+        let listPipe = Pipe()
+        listProc.standardOutput = listPipe
+        listProc.standardError = FileHandle.nullDevice
+        if (try? listProc.run()) != nil {
+            let listData = listPipe.fileHandleForReading.readDataToEndOfFile()
+            listProc.waitUntilExit()
+            if listProc.terminationStatus == 0 {
+                let text = String(data: listData, encoding: .utf8) ?? ""
+                var preTotal = 0
+                for line in text.split(separator: "\n") {
+                    // 行格式: "  12345  2024-01-01 12:00   name";表头/分隔线不含纯数字首列,自动跳过
+                    let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                    guard parts.count >= 4, let size = Int(parts[0]) else { continue }
+                    if line.contains("__MACOSX") || line.contains("node_modules") || size > 1_500_000 { continue }
+                    preTotal += size
+                }
+                if preTotal > 50_000_000 {
+                    throw ParseError.io("zip 解压总量超过 50MB(疑似 zip bomb),已中止")
+                }
+            }
+        }
+
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
         proc.arguments = ["-o", "-q", "-j", path, "-d", outDir.path]
         let errPipe = Pipe()
         proc.standardError = errPipe
+        proc.standardOutput = FileHandle.nullDevice  // 未读的 Pipe 在子进程输出超 64KB 时会双方互等死锁
         try proc.run()
         let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()

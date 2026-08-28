@@ -46,6 +46,8 @@ public final class DB {
     public func run(_ sql: String, _ binds: [Any?] = []) throws {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
+            // 官方文档不保证失败时 *ppStmt 为 NULL,必须 finalize 否则泄漏
+            _ = stmt.map { sqlite3_finalize($0) }
             throw SQLiteError.exec(String(cString: sqlite3_errmsg(handle)))
         }
         defer { sqlite3_finalize(s) }
@@ -59,6 +61,7 @@ public final class DB {
     public func query(_ sql: String, _ binds: [Any?] = []) throws -> [[String?]] {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK, let s = stmt else {
+            _ = stmt.map { sqlite3_finalize($0) }
             throw SQLiteError.query(String(cString: sqlite3_errmsg(handle)))
         }
         defer { sqlite3_finalize(s) }

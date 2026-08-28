@@ -128,5 +128,52 @@ enum RegressionTests {
             t.expect(Parser.parseProxyURL("vless://uuid@host:443#name") != nil, "vless 可解析")
             t.equal(Core.parseClashProxies(raw: "socks5://127.0.0.1:1080").count, 0, "socks5 不产出节点")
         }
+
+        h.runSuite("Regression.appendDedupByKey 跨进程查重") { t in
+            let env = try! TestEnv("reg-dedup")
+            defer { env.cleanup() }
+            // 注意:同 key 才构成重复。entry() 助手的 key 随 id 变化,
+            // 这里手动构造 id 不同但 key 相同的条目
+            func e(_ id: String, ts: TimeInterval, key: String) -> HistoryEntry {
+                var x = HistoryTests.entry(id, ts: ts)
+                x.key = key
+                return x
+            }
+            // 实例 A 插入条目并落盘;实例 B(模拟另一进程,内存不含它)
+            // 再用不同 id 插入同 key:必须命中文件里的已有条目而不是建双条
+            let a = HistoryStore()
+            _ = try! a.appendDedupByKey(e("dedup0001-1111-2222-3333-444444444444", ts: 100, key: "sk-same-key-0001"))
+            let b = HistoryStore()
+            let dup = try! b.appendDedupByKey(e("dedup0002-1111-2222-3333-444444444444", ts: 200, key: "sk-same-key-0001"))
+            t.expect(dup?.id.hasPrefix("dedup0001") == true, "同 key 命中另一进程的条目并返回它")
+            t.equal(HistoryStore().snapshot().count, 1, "历史中不产生双条")
+            // 不同 key 正常插入
+            let ok = try! b.appendDedupByKey(e("dedup0003-1111-2222-3333-444444444444", ts: 300, key: "sk-same-key-0002"))
+            t.expect(ok == nil, "不同 key 返回 nil 且插入")
+            t.equal(HistoryStore().snapshot().count, 2, "不同 key 各建一条")
+            // 非 active 条目不算重复
+            var dead = HistoryTests.entry("dedup0001-1111-2222-3333-444444444444", ts: 100)
+            dead.key = "sk-same-key-0001"
+            dead.status = "deleted"
+            try! b.update(dead)
+            let revived = try! b.appendDedupByKey(e("dedup0004-1111-2222-3333-444444444444", ts: 400, key: "sk-same-key-0001"))
+            t.expect(revived == nil, "同 key 但旧条目已删除:允许重建")
+        }
+
+        h.runSuite("Regression.clashFile 存取") { t in
+            let env = try! TestEnv("reg-clashfile")
+            defer { env.cleanup() }
+            let hist = HistoryStore()
+            var e = HistoryTests.entry("clash0aa1-1111-2222-3333-444444444444", ts: 100)
+            e.clashFile = "KeyDrop-20250101-000000-abcd.yaml"
+            try! hist.append(e)
+            // 重新实例化 = 模拟 app 重启后从磁盘读回
+            let again = HistoryStore().find(idPrefix: "clash0")
+            t.equal(again?.clashFile, "KeyDrop-20250101-000000-abcd.yaml", "clashFile 落盘并可读回")
+            // 旧格式历史(无 clashFile 字段)解码不报错
+            let old = HistoryTests.entry("clash0bb2-1111-2222-3333-444444444444", ts: 200)
+            try! hist.append(old)
+            t.expect(HistoryStore().find(idPrefix: "clash0b")?.clashFile == nil, "无 clashFile 字段的旧条目兼容")
+        }
     }
 }

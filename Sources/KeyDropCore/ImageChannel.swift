@@ -11,7 +11,8 @@ public struct ImageChannel: Codable {
         self.url = url
         self.key = key
         self.model = model
-        self.keyMasked = key.count > 8 ? String(key.prefix(6)) + "…" + String(key.suffix(4)) : key
+        // 短 key 也不能明文返回:masked 字段可能进展示/日志,≤8 位时用星号替代
+        self.keyMasked = key.count > 8 ? String(key.prefix(6)) + "…" + String(key.suffix(4)) : String(repeating: "*", count: max(key.count, 6))
     }
 }
 

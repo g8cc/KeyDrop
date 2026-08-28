@@ -79,7 +79,9 @@ enum ModelPicker {
                     let m = list[index]
                     if selected.contains(m) { selected.remove(m) } else { selected.insert(m) }
                 }
-            case "a", "A":
+            case "a", "A" where query.isEmpty:
+                // 仅在搜索框为空时才算全选/清空快捷键;
+                // 否则用户永远打不出含 a 的过滤词(如 "gpt-4o-audio")
                 if selected.count == filtered().count { selected = [] } else { selected = Set(filtered()) }
             case "\u{7F}", "\u{08}":
                 if !query.isEmpty { query.removeLast(); index = 0 }

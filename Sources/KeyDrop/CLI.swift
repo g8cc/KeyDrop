@@ -225,7 +225,8 @@ enum CLI {
             if let claude = cc.readClaudeSettings(),
                let env = claude["env"] as? [String: Any] {
                 let token = (env["ANTHROPIC_AUTH_TOKEN"] as? String) ?? ""
-                let masked = token.count > 10 ? String(token.prefix(6)) + "…" : token
+                // 无论长度一律不打完整 token:status 输出常被重定向/粘贴分享
+                let masked = token.isEmpty ? "-" : (token.count > 10 ? String(token.prefix(6)) + "…" : String(repeating: "*", count: max(token.count, 6)))
                 print("claude settings: \(env["ANTHROPIC_BASE_URL"] ?? "-") token=\(masked)")
             }
             return 0

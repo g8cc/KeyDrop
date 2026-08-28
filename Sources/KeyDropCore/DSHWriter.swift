@@ -46,6 +46,14 @@ public enum DSHWriter {
 
     /// Appends (or updates) a provider route and its credential.
     public static func add(providerID: String, key: String, url: String, models: [String]) throws -> String {
+        // flock 串行化两个文件的读改写:CLI 与 app 并发时后写者会抹掉前写者的 route,
+        // add/remove 交错还会留下「settings 有引用、creds 已删」的半成品
+        try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
+            try addLocked(providerID: providerID, key: key, url: url, models: models)
+        }
+    }
+
+    private static func addLocked(providerID: String, key: String, url: String, models: [String]) throws -> String {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
@@ -74,6 +82,12 @@ public enum DSHWriter {
 
     /// Removes the provider route and its credential.
     public static func remove(providerID: String) throws {
+        try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
+            try removeLocked(providerID: providerID)
+        }
+    }
+
+    private static func removeLocked(providerID: String) throws {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
@@ -88,6 +102,9 @@ public enum DSHWriter {
            var creds = try? String(contentsOfFile: credentialsPath, encoding: .utf8) {
             removeCredential(&creds, env: env)
             try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
+            // 原子写=临时文件+rename,新文件继承 umask(通常 0644),会把 add 时设置的
+            // 0600 重置成全员可读 —— 凭证文件里还有其他 provider 的明文 key,必须重设权限
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
         }
     }
 

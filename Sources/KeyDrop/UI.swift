@@ -96,6 +96,11 @@ final class AppState: ObservableObject {
                     setStatus("检测到订阅,请确认导入", ok: true)
                     return
                 }
+                // 回退到普通 key 导入前必须先归还 busy 标志:
+                // continueAddKey 有 guard !isBusy,不复位则回退被静默吞掉,
+                // isBusy 永久卡在 true,面板按钮全部禁用只能重启
+                isBusy = false
+                busyLabel = ""
                 await self.continueAddKey(raw: raw)
             }
             return
@@ -180,7 +185,9 @@ final class AppState: ObservableObject {
             }
             self.modelPickerShown = true
         }
-        if sem.wait(timeout: .now() + 300) == .timedOut {
+        if sem.wait(timeout: .now() + 120) == .timedOut {
+            // 120s:模型选择器没有用户响应时尽快放弃,
+            // 避免后台线程和信号量被长时间占用(原先 300s 太久)
             DispatchQueue.main.async {
                 guard !self.modelPickerResolved else { return }
                 self.modelPickerResolved = true
@@ -258,7 +265,7 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) {
+                let r = try await Task.detached(priority: .userInitiated) {
                     let r = try Core.addClashProxies(valid)
                     let entry = HistoryEntry(
                         id: UUID().uuidString.lowercased(),
@@ -272,13 +279,14 @@ final class AppState: ObservableObject {
                         keyMasked: "\(valid.count) 个节点",
                         targets: ["clash"],
                         ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
-                        cpaConfigPath: nil, status: "active"
+                        cpaConfigPath: nil, status: "active",
+                        clashFile: r.fileName
                     )
                     try Core.shared.history.append(entry)
                     try Core.shared.prefs.save()
                     return r
                 }.value
-                setStatus(msg, ok: true)
+                setStatus(r.message, ok: true)
                 historyVersion += 1
             } catch {
                 setStatus("Clash 导入失败: \(error.localizedDescription)", ok: false)
@@ -494,10 +502,21 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// 节流 + 互斥:面板每次重新显示 onAppear 都会调这里,
+    // 若不节流,用户每切一次面板就对全部 key 发一轮真实测试请求(白烧额度);
+    // 若不互斥,多份扫描并发执行会互相覆盖 status、反复刷新整表
+    private var lastHealthScanAt: Date?
+    private var healthScanRunning = false
     func scanHealth() {
-        Task.detached(priority: .userInitiated) {
+        if let last = lastHealthScanAt, Date().timeIntervalSince(last) < 600 { return }
+        guard !healthScanRunning else { return }
+        healthScanRunning = true
+        lastHealthScanAt = Date()
+        Task.detached(priority: .userInitiated) { [weak self] in
             Core.shared.scanHealth { msgs in
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.healthScanRunning = false
                     self.historyVersion += 1
                     if !msgs.isEmpty {
                         self.setStatus("健康扫描: \(msgs.joined(separator: "; "))", ok: false)
@@ -1812,16 +1831,50 @@ struct PanelView: View {
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard !state.isBusy else { return false }
         var handled = false
+        let urlsLock = NSLock()
+        var pendingURLs: [URL] = []
+        let group = DispatchGroup()
         for p in providers {
+            group.enter()
             _ = p.loadObject(ofClass: URL.self) { url, _ in
-                guard let url else { return }
-                DispatchQueue.main.async {
-                    guard !state.isBusy else { return }
-                    state.input = url.path
-                    state.doAdd()
+                if let url {
+                    urlsLock.lock()
+                    pendingURLs.append(url)
+                    urlsLock.unlock()
                 }
+                group.leave()
             }
             handled = true
+        }
+        guard handled else { return false }
+        group.notify(queue: .main) {
+            guard !state.isBusy, !pendingURLs.isEmpty else { return }
+            // 多文件拖入原先每个文件各触发一次 doAdd,第一个置 isBusy 后
+            // 其余全被 guard 静默吞掉。单文件仍走路径(Parser 支持 zip/base64);
+            // 多文件读文本内容拼接后一次性导入
+            if pendingURLs.count == 1 {
+                state.input = pendingURLs[0].path
+                state.doAdd()
+                return
+            }
+            var contents: [String] = []
+            var skipped = 0
+            for u in pendingURLs {
+                if let s = try? String(contentsOf: u, encoding: .utf8), !s.isEmpty {
+                    contents.append(s)
+                } else {
+                    skipped += 1  // 二进制 zip 等无法当文本拼,跳过并提示
+                }
+            }
+            if skipped > 0 {
+                state.setStatus("部分拖入文件无法按文本读取(\(skipped) 个),已导入其余文件", ok: false)
+            }
+            guard !contents.isEmpty else {
+                state.setStatus(skipped > 0 ? "拖入的 \(skipped) 个文件均无法按文本读取" : "拖入的文件均无法读取", ok: false)
+                return
+            }
+            state.input = contents.joined(separator: "\n")
+            state.doAdd()
         }
         return handled
     }

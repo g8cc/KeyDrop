@@ -131,6 +131,18 @@ final class Updater {
                 self.setState(.failed("下载失败: HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))
                 return
             }
+            // 大小防护:异常/恶意响应不应写满磁盘。两道拦截:
+            // ① 响应头声明的大小;② 落盘后实测(downloadTask 无法边下边限流,这里兜底)
+            let maxBytes = 150_000_000
+            if http.expectedContentLength > maxBytes {
+                self.setState(.failed("更新包过大(\(http.expectedContentLength / 1_000_000)MB),已取消"))
+                return
+            }
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+               let size = attrs[.size] as? Int, size > maxBytes {
+                self.setState(.failed("更新包过大(\(size / 1_000_000)MB),已取消"))
+                return
+            }
             self.install(archive: fileURL, version: version)
         }
         downloadTask = task
@@ -196,6 +208,9 @@ final class Updater {
             if mv \(shellEscape(runningPath)) \(shellEscape(backupPath)); then
               if mv \(shellEscape(newBundle)) \(shellEscape(runningPath)); then
                 open \(shellEscape(runningPath))
+                # 更新成功后清理临时目录(含下载的 zip 与 extract),
+                # 否则每次成功更新都在 /tmp 泄漏一份完整安装包
+                (sleep 6 && rm -rf \(shellEscape(tmp))) &
                 (sleep 5 && rm -rf \(shellEscape(backupPath))) &
               else
                 # 新包挪入失败,立即回滚,保证本机始终有一份可用的 KeyDrop
