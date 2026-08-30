@@ -28,6 +28,16 @@ enum WriterError: LocalizedError {
 }
 
 public final class CCSwitchWriter {
+    // ══════════════ 写入层不变量(改动任何写入路径前先读这里)══════════════
+    // ① 家族不变量:目标 app 与激活模型必须同家族。claude 配置只写 claude 系模型,
+    //    codex 只写 gpt 系。模型列表经常跨家族(网关 /models 全量返回、refresh 整体
+    //    替换),家族过滤必须收敛在写入层(claudeEnv / resolveCodexModel),
+    //    不能依赖调用方传对。无同家族模型时:claude 省略模型键(回退默认),
+    //    codex 保留原 model 行;全新 codex 模板不写 model 行。
+    // ② 账本不变量:HistoryEntry.targets 的每个 tag 必须对应一个真实存在的外部产物,
+    //    且 delete/reconcile 能凭 tag + ccProviderID 认领并清理它。
+    //    外部写入失败时不得丢 tag(旧产物还在);回滚/清理成功时不得并 tag(产物已删)。
+    // 场景测试:TestSuite/RegressionTests.swift(写入不变量矩阵 / 账本闭环 add→delete)。
     public init() {}
 
     public static var dbPath: String {
@@ -228,7 +238,14 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             env["HTTPS_PROXY"] = proxy
             env["HTTP_PROXY"] = proxy
         }
-        if let model = models.first(where: { !$0.isEmpty }) ?? (p.model?.isEmpty == false ? p.model : nil) {
+        // 模型键只接受 claude 系模型。模型列表在 add(网关 ≤5 个模型全量导入)和
+        // refresh(网关 /models 全量列表整体替换)两个场景都会混入 gpt 等异家族模型,
+        // 盲取 models.first 会把 gpt 写进 Claude Code(真实事故)。
+        // 找不到 claude 系模型时省略模型键:Claude Code 回退自身默认模型,
+        // 且 mergeEnvIntoClaudeSettings 会清掉不在新 env 里的旧 ANTHROPIC_* 键,不会留残值
+        let claudeModel = models.first(where: { !$0.isEmpty && Core.isClaudeModel($0) })
+            ?? p.model.flatMap { (!$0.isEmpty && Core.isClaudeModel($0)) ? $0 : nil }
+        if let claudeModel {
             let modelKeys = [
                 "ANTHROPIC_MODEL", "ANTHROPIC_REASONING_MODEL",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
@@ -237,7 +254,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
                 "CLAUDE_CODE_SUBAGENT_MODEL"
             ]
-            for k in modelKeys { env[k] = model }
+            for k in modelKeys { env[k] = claudeModel }
         }
         return env
     }
@@ -317,11 +334,16 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         return "\"\(e)\""
     }
 
+    /// codex 激活模型:gpt 系优先。与 claudeEnv 同理,混合家族列表不得把
+    /// claude 等异家族模型写成 codex 激活模型;nil 表示「不动模型行」
+    static func resolveCodexModel(models: [String], parsedModel: String?) -> String? {
+        models.first(where: { !$0.isEmpty && Core.isGptModel($0) })
+            ?? parsedModel.flatMap { (!$0.isEmpty && Core.isGptModel($0)) ? $0 : nil }
+    }
+
     private func codexConfigToml(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws -> String {
         let url = codexBaseURL(p.url ?? "")
-        let model = models.first(where: { !$0.isEmpty })
-            ?? (p.model?.isEmpty == false ? p.model : nil)
-            ?? "gpt-5.6-sol"
+        let model = Self.resolveCodexModel(models: models, parsedModel: p.model)
         let path = Self.codexConfigPath
         if FileManager.default.fileExists(atPath: path),
            let content = try? String(contentsOfFile: path, encoding: .utf8) {
@@ -370,7 +392,13 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                         continue
                     }
                     if trimmed.hasPrefix("model = ") {
-                        out.append("model = \(Self.tomlQuote(model))")
+                        if let m = model {
+                            out.append("model = \(Self.tomlQuote(m))")
+                        } else {
+                            // 新列表无 gpt 系模型:保留原 model 行(旧 gpt 模型大概率仍可用),
+                            // 绝不能把 claude 等异家族模型写进来
+                            out.append(ln)
+                        }
                         modelSet = true
                         continue
                     }
@@ -387,8 +415,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             if !providerSet {
                 out.insert("model_provider = \"custom\"", at: 0)
             }
-            if !modelSet {
-                out.insert("model = \(Self.tomlQuote(model))", at: providerSet ? 1 : 0)
+            if !modelSet, let m = model {
+                out.insert("model = \(Self.tomlQuote(m))", at: providerSet ? 1 : 0)
             }
             if !hadCustom {
                 out.append("")
@@ -401,9 +429,10 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             }
             return out.joined(separator: "\n")
         }
-        return [
-            "model_provider = \"custom\"",
-            "model = \(Self.tomlQuote(model))",
+        // 全新模板:model 行仅在有 gpt 系模型时写入,否则留给 codex 内置默认
+        var fresh = ["model_provider = \"custom\""]
+        if let m = model { fresh.append("model = \(Self.tomlQuote(m))") }
+        fresh.append(contentsOf: [
             "model_reasoning_effort = \"high\"",
             "",
             "[model_providers.custom]",
@@ -412,7 +441,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             "requires_openai_auth = true",
             "base_url = \(Self.tomlQuote(url))",
             "experimental_bearer_token = \(Self.tomlQuote(p.key ?? ""))"
-        ].joined(separator: "\n")
+        ])
+        return fresh.joined(separator: "\n")
     }
 
     func mergeCodexConfig(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws {
@@ -431,7 +461,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             var issues: [String] = []
             if !back.contains("base_url = \(Self.tomlQuote(url))") { issues.append("base_url 回读不一致") }
             if !back.contains("experimental_bearer_token = \(Self.tomlQuote(key))") { issues.append("token 回读不一致") }
-            let model = models.first(where: { !$0.isEmpty }) ?? (p.model?.isEmpty == false ? p.model : nil)
+            // 与 codexConfigToml 同一解析:无 gpt 系模型时 model 行被保留原样,跳过校验
+            let model = Self.resolveCodexModel(models: models, parsedModel: p.model)
             if let m = model, !back.contains("model = \(Self.tomlQuote(m))") { issues.append("model 回读不一致") }
             if !issues.isEmpty {
                 // 不再 throw:调用方(add)此刻 DB 事务已 COMMIT,throw 会制造

@@ -352,6 +352,13 @@ public final class Core {
                 }
             } catch {
                 lines.append("✗ cc-switch 失败: \(error.localizedDescription)")
+                // 写入失败 ≠ 旧 provider 消失:幂等路径 sync 失败、或路由变化后 cc.add 失败,
+                // 旧 provider 仍在 cc-switch 里且 entry.ccProviderID 仍指向它。
+                // 必须恢复旧 ccswitch 标签,否则 delete/reconcile 不再认领 → 孤儿 provider
+                if let dup, let oldTag = dup.targets.first(where: { $0.hasPrefix("ccswitch") }),
+                   !entry.targets.contains(oldTag) {
+                    entry.targets.append(oldTag)
+                }
             }
         }
 
@@ -418,20 +425,29 @@ public final class Core {
                     var merged = survivor
                     let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
                         .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                    var ccRolledBack = false
                     if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }), let pid = entry.ccProviderID {
                         do {
                             _ = try cc.remove(providerID: pid, renamedFrom: entry.ccRenamedFrom,
                                               renamedTo: entry.ccRenamedTo, appType: appType)
+                            ccRolledBack = true
                         } catch {
                             lines.append("⚠ 并发合并: 本进程刚写的 cc-switch provider(\(pid.prefix(8)))回滚失败,请手动清理: \(error.localizedDescription)")
                         }
                     }
+                    var dshRolledBack = false
                     if entry.targets.contains("dsh") {
-                        do { try DSHWriter.remove(providerID: entry.id) }
+                        do { try DSHWriter.remove(providerID: entry.id); dshRolledBack = true }
                         catch { lines.append("⚠ 并发合并: 本进程刚写的 DSH route 回滚失败: \(error.localizedDescription)") }
                     }
-                    // CPA 是聚合写入、Clash 是独立文件,无需回滚;把目标记录并入 survivor
-                    for t in entry.targets where !merged.targets.contains(t) { merged.targets.append(t) }
+                    // CPA 是聚合写入、Clash 是独立文件,无需回滚;把目标记录并入 survivor。
+                    // 已成功回滚的外部配置对应的 tag 绝不能并入:tag 会指向已删除的
+                    // provider/route,后续 delete 会按错误的 appType 清理 survivor 自己的产物
+                    for t in entry.targets where !merged.targets.contains(t) {
+                        if t.hasPrefix("ccswitch") && ccRolledBack { continue }
+                        if t == "dsh" && dshRolledBack { continue }
+                        merged.targets.append(t)
+                    }
                     if merged.cpaConfigPath == nil { merged.cpaConfigPath = entry.cpaConfigPath }
                     try history.update(merged)
                     entry = merged
@@ -652,18 +668,22 @@ public final class Core {
             .filter { !$0.server.isEmpty && $0.port > 0 && !$0.uuid.isEmpty }
     }
 
+    /// claude 系模型判定(sonnet/opus/haiku/fable 属 claude 家族)
+    public static func isClaudeModel(_ m: String) -> Bool {
+        let l = m.lowercased()
+        return l.contains("claude") || l.contains("sonnet") || l.contains("opus") || l.contains("haiku") || l.contains("fable")
+    }
+
+    /// gpt 系模型判定
+    public static func isGptModel(_ m: String) -> Bool {
+        let l = m.lowercased()
+        if l.contains("gpt-") || l.contains("/gpt") || l == "gpt" { return true }
+        if l.hasPrefix("gpt") && (l.count == 3 || l.dropFirst(3).first == "-" || l.dropFirst(3).first == ".") { return true }
+        return false
+    }
+
     public static func routeAppType(selectedModels: [String], modelsOverride: [String]?, default appType: String, forced: Bool = false) -> String {
         if forced { return appType }
-        func isGptModel(_ m: String) -> Bool {
-            let l = m.lowercased()
-            if l.contains("gpt-") || l.contains("/gpt") || l == "gpt" { return true }
-            if l.hasPrefix("gpt") && (l.count == 3 || l.dropFirst(3).first == "-" || l.dropFirst(3).first == ".") { return true }
-            return false
-        }
-        func isClaudeModel(_ m: String) -> Bool {
-            let l = m.lowercased()
-            return l.contains("claude") || l.contains("sonnet") || l.contains("opus") || l.contains("haiku") || l.contains("fable")
-        }
         let list = (modelsOverride?.isEmpty == false ? modelsOverride! : selectedModels)
         if list.isEmpty { return appType }
         if list.contains(where: { isClaudeModel($0) }) { return "claude" }
@@ -744,14 +764,16 @@ public final class Core {
         let test = APITester.test(url: url, key: key, proxy: proxyForHealth())
         guard test.ok else {
             let h = Self.healthFor(test)
+            // 只改 health 不动 status:status="dead" 会让条目从 UI 全部列表消失,
+            // 且 delete() 只认 status=="active",记录变成删不掉的僵尸。
+            // health="dead" + status="active" 会正常进入「待删除区」,与健康扫描路径一致
             entry.health = h.health
             entry.healthDetail = h.detail
             entry.healthAt = Date().timeIntervalSince1970
-            if test.authFailed || test.detail.contains("401") || test.detail.contains("403") {
-                entry.status = "dead"
-            }
             historyUpdateLogged(entry)
-            throw ParseError.io("✗ 不可用: \(test.detail)" + (entry.status == "dead" ? "(key 已失效,条目已标记 dead)" : ""))
+            let deadMark = (test.authFailed || test.detail.contains("401") || test.detail.contains("403"))
+                ? "(key 已失效,已移入待删除区)" : ""
+            throw ParseError.io("✗ 不可用: \(test.detail)\(deadMark)")
         }
         // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表
         var quotaNote: String? = nil
@@ -804,18 +826,24 @@ public final class Core {
         var filtered: [String] = []
         if let picker = pickModels {
             let sel = picker(testModels)
-            if sel.isEmpty { throw ParseError.io("已取消选择模型") }
+            if sel.isEmpty {
+                // 取消选择也是一次有效测试结果,落盘 health 再抛,避免结果丢失
+                historyUpdateLogged(entry)
+                throw ParseError.io("已取消选择模型")
+            }
             // 刷新时保留用户勾选/手输,不因启发式误杀
             filtered = sel.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         } else {
             filtered = testModels
         }
         guard !filtered.isEmpty else {
+            historyUpdateLogged(entry)
             throw ParseError.io("测试通过但未识别到模型,无法刷新")
         }
         entry.models = filtered
         entry.model = filtered.first
 
+        var syncWarn: String? = nil
         if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
            let pid = entry.ccProviderID {
             let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
@@ -824,7 +852,13 @@ public final class Core {
             p.url = url
             p.key = key
             p.model = filtered.first
-            try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: filtered, proxy: proxyForHealth())
+            do {
+                try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: filtered, proxy: proxyForHealth())
+            } catch {
+                // 模型列表已更新;cc-sync 失败降级为警告而非让整个刷新失败
+                // (与 editEntry 的降级模式一致),重试刷新或 reimport 可修复
+                syncWarn = "⚠ cc-switch 同步失败: \(error.localizedDescription)"
+            }
         }
 
         if entry.targets.contains("dsh") {
@@ -832,7 +866,8 @@ public final class Core {
         }
         try history.update(entry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
-        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)"
+        let w = syncWarn.map { "\n\($0)" } ?? ""
+        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)"
     }
 
     /// 编辑条目:改模型列表/名称,重新验证模型并同步所有目标(cc-switch/dsh)
@@ -941,6 +976,24 @@ public final class Core {
         p.key = ep.clientKey
         p.model = models.first
         p.name = "CPA-\(ep.baseURL)"
+
+        // 重复激活:先移除本条目上一次激活写入的 provider。
+        // claude 类型没有 URL 去重,不清理的话每次激活都在 cc-switch 新建一个,
+        // 旧 provider 变孤儿(无人认领、历史也不再指向它)
+        if let oldPID = entry.ccProviderID,
+           entry.targets.contains(where: { $0.hasPrefix("ccswitch") }) {
+            let oldAppType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+            if cc.providerExists(id: oldPID, appType: oldAppType) {
+                do {
+                    _ = try cc.remove(providerID: oldPID, renamedFrom: entry.ccRenamedFrom,
+                                      renamedTo: entry.ccRenamedTo, appType: oldAppType)
+                } catch {
+                    // 清理失败不阻断本次激活,只留痕
+                    AppLog.warn("activateCPA 清理旧 provider 失败: \(error.localizedDescription)")
+                }
+            }
+        }
 
         let r = try cc.add(p, appType: appType, models: models, proxy: proxyForHealth())
         entry.targets = entry.targets.filter { !$0.hasPrefix("ccswitch") }

@@ -711,6 +711,14 @@ public enum Parser {
         return result
     }
 
+    /// 中文字段标签词:是「键名」不是「值」。单行 token 化后标签会独立成 token,
+    /// 不排除的话「模型 gpt-5.6-sol」会把「模型」当成条目名称写进历史
+    static let labelWords: Set<String> = [
+        "模型", "名称", "名字", "密钥", "秘钥", "令牌", "地址", "接口",
+        "站点", "网站", "官网", "备注", "说明", "过期",
+        "key", "keys", "api", "apikey", "api_key", "token", "url", "name", "model", "base"
+    ]
+
     private static func isNameLike(_ s: String) -> Bool {
         let noise: [Character] = [",", ".", ";", "、", ":", "|", "$", "！", "？", "!", "?"]
         let l = s.lowercased()
@@ -718,6 +726,8 @@ public enum Parser {
         if l.contains("rpm") || l.contains("限流") || l.contains("额度") || l.contains("余额") {
             return false
         }
+        // 纯标签词不是名字
+        if labelWords.contains(l) { return false }
         return s.count >= 2 && s.count <= 40
             && !s.contains(where: { noise.contains($0) })
             && !s.contains(where: { $0.isWhitespace })

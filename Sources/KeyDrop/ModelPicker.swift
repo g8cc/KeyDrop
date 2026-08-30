@@ -171,6 +171,30 @@ enum ModelPicker {
         guard byte >= 0x20 || byte == 0x7F || byte == 0x0D || byte == 0x0A || byte == 0x03 else {
             return nil
         }
-        return String(UnicodeScalar(byte))
+        if byte < 0x80 {
+            return String(UnicodeScalar(byte))
+        }
+        // 多字节 UTF-8(如中文过滤词):按首字节推断序列长度,收齐后整体解码。
+        // 逐字节返回会让 runLoop 把每个字节单独追加进 query,输入必然乱码、过滤永不命中
+        let expected: Int
+        switch byte {
+        case 0xC2...0xDF: expected = 2
+        case 0xE0...0xEF: expected = 3
+        case 0xF0...0xF4: expected = 4
+        default: return nil
+        }
+        var bytes = [byte]
+        while bytes.count < expected {
+            if pending.isEmpty {
+                // 终端通常一次送齐整个字符;极慢链路下续字节可能晚到,短轮询等待
+                guard hasInputWithin(ms: 50) else { return nil }
+                var buf = [UInt8](repeating: 0, count: expected - bytes.count)
+                let n = read(STDIN_FILENO, &buf, buf.count)
+                guard n > 0 else { return nil }
+                pending += buf.prefix(n)
+            }
+            bytes.append(pending.removeFirst())
+        }
+        return String(bytes: bytes, encoding: .utf8)
     }
 }

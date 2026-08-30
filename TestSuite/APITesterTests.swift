@@ -16,6 +16,8 @@ final class MockHTTPServer {
         case html200     // /models → 200 HTML 兜底页(假阳性);/v1/models → 401
         case quota429    // /models → 200;POST chat → 429 quota exhausted
         case chat524     // /models → 200;POST chat → 424 服务不可用
+        case manyModels  // /models → 200,8 个模型(触发 >5 选择器路径)
+        case chatOK      // /models → 200 空列表;POST chat → 200(网关无模型列表但 chat 可用)
     }
     let mode: Mode
 
@@ -103,6 +105,17 @@ final class MockHTTPServer {
             } else if target.contains("/chat/completions") || target.contains("/responses") {
                 body = "{\"error\":{\"message\":\"Service temporarily unavailable\",\"type\":\"api_error\"}}"
             }
+        } else if mode == .manyModels {
+            if target.hasSuffix("/models") {
+                let items = (1...8).map { n in "{\"id\":\"model-\(n)-sample\",\"object\":\"model\"}" }
+                body = "{\"data\":[" + items.joined(separator: ",") + "]}"
+            }
+        } else if mode == .chatOK {
+            if target.hasSuffix("/models") {
+                body = "{\"data\":[]}"
+            } else if target.contains("/chat/completions") {
+                body = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+            }
         }
         let status: String
         if mode == .html200 && target.hasSuffix("/v1/models") {
@@ -111,7 +124,7 @@ final class MockHTTPServer {
             status = "429 Too Many Requests"
         } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
             status = "424 Failed Dependency"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .manyModels || mode == .chatOK || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"

@@ -71,6 +71,16 @@ final class TestEnv {
         setenv("KEYDROP_DSH_CREDENTIALS", dir + "/dsh-creds.yaml", 1)
         setenv("KEYDROP_FAKE_CC_RUNNING", "1", 1)
         setenv("KEYDROP_PROXY", "", 1)
+        // 隔离加固:以下路径若不显式指向临时目录,测试可能触达开发者本机的真实文件
+        // KEYDROP_LLM_PARSE=0:规则解析失败时不得真连本机 LLM 端点(127.0.0.1:8317, 15s 超时)
+        setenv("KEYDROP_LLM_PARSE", "0", 1)
+        // 指向不存在的路径:locateConfig() 的 ps 扫描/默认路径探测被短路,
+        // 否则测试一旦走 CPA 路径会定位并写入开发者真实的 config.yaml
+        setenv("KEYDROP_CPA_CONFIG", dir + "/cpa-config.yaml", 1)
+        setenv("KEYDROP_IMAGE_CHANNEL", dir + "/image-channel.json", 1)
+        setenv("KEYDROP_IMAGES_DIR", dir + "/images", 1)
+        setenv("KEYDROP_CLASH_PROFILES", dir + "/clash-profiles", 1)
+        setenv("KEYDROP_MCP_COMMAND", "/usr/bin/true keydrop-mcp-test", 1)
     }
 
     func read(_ path: String) -> String {

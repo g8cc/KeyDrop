@@ -12,6 +12,7 @@ ImageAPITests.run(harness)
 HistoryTests.run(harness)
 CoreTests.run(harness)
 RegressionTests.run(harness)
+ImportPipelineTests.run(harness)
 
 print("────────────────────────────")
 if harness.failures.isEmpty {
