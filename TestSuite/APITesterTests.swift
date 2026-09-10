@@ -15,9 +15,12 @@ final class MockHTTPServer {
         case balanceNoInfo // /models 200,余额接口 404
         case html200     // /models → 200 HTML 兜底页(假阳性);/v1/models → 401
         case quota429    // /models → 200;POST chat → 429 quota exhausted
+        case chat401     // /models → 200(公共端点);POST chat → 401(认证失败/key 失效)
         case chat524     // /models → 200;POST chat → 424 服务不可用
         case manyModels  // /models → 200,8 个模型(触发 >5 选择器路径)
         case chatOK      // /models → 200 空列表;POST chat → 200(网关无模型列表但 chat 可用)
+        case claudeModels // /models → 200,纯 claude 系(测 codex→claude 反向迁移)
+        case nonChatModels // /models → 200,图生在前 + chat 家族在后(测激活模型不落图生)
     }
     let mode: Mode
 
@@ -99,6 +102,12 @@ final class MockHTTPServer {
             } else if target.contains("/chat/completions") {
                 body = "{\"error\":{\"code\":\"429\",\"message\":\"quota exhausted\",\"type\":\"limitation\"}}"
             }
+        } else if mode == .chat401 {
+            if target.hasSuffix("/models") {
+                body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
+            } else if target.contains("/chat/completions") {
+                body = "{\"error\":{\"message\":\"Unauthorized\",\"type\":\"api_error\"}}"
+            }
         } else if mode == .chat524 {
             if target.hasSuffix("/models") {
                 body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
@@ -116,15 +125,21 @@ final class MockHTTPServer {
             } else if target.contains("/chat/completions") {
                 body = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
             }
+        } else if mode == .claudeModels {
+            body = "{\"data\":[{\"id\":\"claude-sonnet-4-5\",\"object\":\"model\"},{\"id\":\"claude-opus-4-1\",\"object\":\"model\"}]}"
+        } else if mode == .nonChatModels {
+            body = "{\"data\":[{\"id\":\"dall-e-3\",\"object\":\"model\"},{\"id\":\"deepseek-v4-flash-0731\",\"object\":\"model\"}]}"
         }
         let status: String
         if mode == .html200 && target.hasSuffix("/v1/models") {
             status = "401 Unauthorized"
         } else if mode == .quota429 && target.contains("/chat/completions") {
             status = "429 Too Many Requests"
+        } else if mode == .chat401 && target.contains("/chat/completions") {
+            status = "401 Unauthorized"
         } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
             status = "424 Failed Dependency"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .manyModels || mode == .chatOK || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"

@@ -70,7 +70,10 @@ public enum Parser {
         let suspicious = (parsed.model?.count ?? 0) > 50
             || (parsed.model?.contains("http") == true)
             || (parsed.name?.count ?? 0) < 3
-        if suspicious, let llm = LLMParser.extract(from: raw),
+        // 多 key 粘贴不做 LLM 改写:LLM 只会提取一把 key,还可能幻觉截断覆盖 parsed.key,
+        // 批量导入也不该多等一次 LLM 往返(15s 超时)
+        if suspicious, extractAllKeys(raw).count <= 1,
+           let llm = LLMParser.extract(from: raw),
            let key = llm.key, key != parsed.key {
             var p = ParsedKey()
             p.key = key
@@ -83,20 +86,24 @@ public enum Parser {
         return parsed
     }
 
+    /// 批量 key 提取。识别口径必须与 classify 单 key 判定同源(looksLikeKey),
+    /// 不能用前缀白名单:nvapi-/gsk_/sk-ant- 等厂商前缀会漏,
+    /// 多 key 检测(allKeys.count > 1)不触发,批量导入退化为只导第一把
     public static func extractAllKeys(_ raw: String) -> [String] {
-        let tokens = raw.split(whereSeparator: { $0.isNewline || $0 == " " || $0 == "\t" })
+        let tokens = raw.split(whereSeparator: { $0.isNewline || $0 == " " || $0 == "\t" || $0 == "," || $0 == ";" })
             .map(String.init)
-            .filter { !$0.isEmpty }
         var keys: [String] = []
         var seen = Set<String>()
-        for t in tokens {
-            if t.hasPrefix("cwk-") || t.hasPrefix("sk-") || t.hasPrefix("ak-") || t.hasPrefix("pk-") {
-                let clean = t.trimmingCharacters(in: .whitespaces)
-                if clean.count >= 16, clean.count <= 256, !seen.contains(clean) {
-                    keys.append(clean)
-                    seen.insert(clean)
-                }
-            }
+        for token in tokens {
+            // JSON 数组/markdown 引用包裹的批量粘贴:剥首尾引号与括号
+            var t = token.trimmingCharacters(in: CharacterSet(charactersIn: "\"'[]"))
+            // 裸域名先排除:28+ 字符域名串会过 looksLikeKey 通用分支(与 classify 的 URL 优先一致)
+            guard !t.isEmpty, !looksLikeURL(t) else { continue }
+            // base64 编码 key 先解码(如 c2st… → sk-…),否则写进配置的是密文
+            if let d = decodeKeyIfBase64(t) { t = d }
+            guard looksLikeKey(t), !seen.contains(t) else { continue }
+            keys.append(t)
+            seen.insert(t)
         }
         return keys
     }
@@ -160,6 +167,7 @@ public enum Parser {
         ("gemini|generativelanguage|gemini官方", "https://generativelanguage.googleapis.com/v1beta/openai/"),
         ("groq", "https://api.groq.com/openai/v1"),
         ("mistral", "https://api.mistral.ai/v1"),
+        ("nvidia|nvapi", "https://integrate.api.nvidia.com/v1"),
         ("volcengine|火山|ark", "https://ark.cn-beijing.volces.com/api/v3"),
         ("siliconflow|硅基流动", "https://api.siliconflow.cn/v1"),
         ("openrouter", "https://openrouter.ai/api/v1"),

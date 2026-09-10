@@ -217,6 +217,11 @@ public enum APITester {
                                          detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(服务不可用/限流)",
                                          authFailed: false)
                 }
+                if let st = chat.authStatus {
+                    return APITestResult(ok: false, style: style, models: models,
+                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(认证失败/key 失效)",
+                                         authFailed: true)
+                }
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
                                      authFailed: false)
@@ -247,8 +252,10 @@ public enum APITester {
     /// POST chat 健康检查结果
     /// - quota: 429/402 且 body 明确额度耗尽关键词
     /// - degraded: 429 限流(无 quota 词)/402/424/5xx → 服务不可用
-    /// - 都为 nil: 200/400/404 等 → 端点正常
-    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> (quota: Int?, degraded: Int?) {
+    /// - authStatus: 401/403(非 HTML 盾页)→ 认证失败/key 失效。/models 常是公共端点(无 key 也 200),
+    ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
+    ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> (quota: Int?, degraded: Int?, authStatus: Int?) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
@@ -267,18 +274,22 @@ public enum APITester {
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
+            // HTML 盾页(CF 挑战)≠ 认证失败,与 /models 探测口径一致
+            if status == 401 || (status == 403 && !isHTMLBody(body)) {
+                return (nil, nil, status)
+            }
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
-                    return (status, nil)
+                    return (status, nil, nil)
                 }
-                return (nil, status)
+                return (nil, status, nil)
             }
             if status == 424 || (500...599).contains(status) {
-                return (nil, status)
+                return (nil, status, nil)
             }
         }
-        return (nil, nil)
+        return (nil, nil, nil)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {

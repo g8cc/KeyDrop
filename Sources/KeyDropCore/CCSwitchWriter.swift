@@ -94,9 +94,9 @@ public final class CCSwitchWriter {
             settingsConfig = try claudeSettingsConfig(p, models: models, proxy: proxy)
         }
 
-        let diskCurrent = readSwitchSettings()?[currentKey(appType)] as? String
-        let appRunning = Self.ccSwitchRunning()
-
+        // 不要在 DB 事务前缓存运行态:cc-switch 可能恰好在导入期间启动。
+        // Claude live 配置的最终写入点会再次检查当前运行态,避免竞态窗口把新 provider
+        // 的环境写入 cc-switch 仍缓存的旧 current。
         let db = try DB(path: Self.dbPath)
         try db.exec("BEGIN IMMEDIATE")
         var dedupReplacedID: String? = nil
@@ -162,11 +162,18 @@ public final class CCSwitchWriter {
             }
 
             if appType == "opencode" {
+                // opencode 的「激活默认模型」不得落到图生/嵌入等非 chat 模型上(真实事故:
+                // fal-ai/gpt-image-2 + nano-banana 等被 first 当默认)。优先取 chat 家族,
+                // 次取非 non-chat;全 non-chat 则不设激活模型并警告(models 字典仍写全列表供手选)
+                let activeModel = Core.preferredChatModel(opencodeModels)
                 do {
-                    try mergeOpencodeProvider(p, providerID: id, modelDict: opencodeDict, firstModel: opencodeModels.first)
+                    try mergeOpencodeProvider(p, providerID: id, modelDict: opencodeDict, firstModel: activeModel)
                     result.directMode = true
                 } catch {
                     result.warnings.append("opencode.json 更新失败: \(error.localizedDescription)")
+                }
+                if activeModel == nil && !opencodeModels.isEmpty {
+                    result.warnings.append("所选模型全部为非 chat 模型(图生/嵌入/语音等),未设置激活模型;请在 opencode /model 手动选择对话模型")
                 }
                 return result
             }
@@ -192,6 +199,19 @@ public final class CCSwitchWriter {
                 return result
             }
 
+            // cc-switch 运行时,不直写 live ~/.claude/settings.json。
+            // 事故:KeyDrop 写 live=新 provider env 时,cc-switch 的 in-memory current 还是旧 provider;
+            // cc-switch 在自身事件(UI 切换/启动)会把当前 live 回写进 current 的 settings_config,
+            // 导致旧 provider 的 settings_config 被新 provider 的整块 env 覆盖(url/key/models 全变,
+            // endpoint/name 不动)→ 切回旧 provider 即用错配置(已发生多起)。
+            // cc-switch 不监听外部 switch-settings / DB is_current 改动(实测 25s 无反应),
+            // 所以 KeyDrop 无法靠改 switch-settings 让 cc-switch 应用新 current。
+            // 留给 cc-switch 的 UI 切换去激活:DB 已置新 provider is_current=1、
+            // switch-settings 的 currentProviderClaude 已更新,用户在 cc-switch 点新 provider 即正确应用。
+            // 必须在真正写 live 前再次检查,不能使用 DB 事务开始前的旧快照。
+            if Self.ccSwitchRunning() {
+                return result
+            }
             if let claude = readClaudeSettings() {
                 let token = ((claude["env"] as? [String: Any])?["ANTHROPIC_AUTH_TOKEN"] as? String) ?? ""
                 if token != "PROXY_MANAGED" {
@@ -691,6 +711,16 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         if promote {
             try updateSwitchSettings(pid, for: appType)
         }
+        // opencode 是共享文件:add()/syncModelsAfterRefresh() 都双写 DB + opencode.json,
+        // 重导入若只写 DB,opencode.json 里仍没有该 provider,opencode 看不到这条渠道。
+        // 仅当确实重建了当前 provider 时才需要,和 add() 一样 best-effort(失败不阻断 reimport)。
+        if appType == "opencode" {
+            do {
+                try mergeOpencodeProvider(p, providerID: pid, modelDict: opencodeDict, firstModel: Core.preferredChatModel(models))
+            } catch {
+                AppLog.warn("reimport opencode.json 写入失败: \(error.localizedDescription)")
+            }
+        }
         return true
     }
 
@@ -836,6 +866,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     }
 
     private func restoreLiveEnv(providerID: String, db: DB) {
+        // cc-switch 运行时由其独占 live,KeyDrop 不染指(同 add() 的事故修复理由)
+        guard !Self.ccSwitchRunning() else { return }
         if let claude = readClaudeSettings() {
             let token = ((claude["env"] as? [String: Any])?["ANTHROPIC_AUTH_TOKEN"] as? String) ?? ""
             guard token != "PROXY_MANAGED" else { return }
@@ -902,7 +934,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         // opencode.json 是共享文件(多 provider 共存),更新非当前 provider 的条目也安全;
         // codex/claude 是单文件单 provider,只有当前激活时才同步,避免覆盖其他 provider 的环境
         if appType == "opencode" {
-            try mergeOpencodeProvider(p, providerID: providerID, modelDict: opencodeDict, firstModel: models.first)
+            try mergeOpencodeProvider(p, providerID: providerID, modelDict: opencodeDict, firstModel: Core.preferredChatModel(models))
             return
         }
         guard isCurrent else { return }
@@ -917,6 +949,9 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 try mergeCodexConfig(p, models: models, wireApi: wireApi)
             }
         default:
+            // 同 add():cc-switch 运行时不直写 live,避免其把 live 回写进陈旧 current 的
+            // settings_config 造成腐败。仅 KeyDrop 独占 live(cc-switch 未运行)时才写。
+            guard !Self.ccSwitchRunning() else { return }
             try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models))
         }
     }
@@ -928,8 +963,18 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     static public func ccSwitchRunning() -> Bool {
         if ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "1" { return true }
         if ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "0" { return false }
-        return NSWorkspace.shared.runningApplications.contains {
-            $0.bundleIdentifier == "com.ccswitch.desktop"
+
+        // 官方 macOS bundle id 是 com.ccswitch.desktop。不同安装渠道/旧版本可能只保留
+        // 可执行文件名,所以同时按 bundle id、进程名和可执行文件名识别。
+        // 这里宁可少写一次 live 配置,也不能在 cc-switch 已运行但未被精确识别时覆盖
+        // 它正在管理的 Claude 配置,否则会触发旧 provider 的 settings_config 回写污染。
+        return NSWorkspace.shared.runningApplications.contains { app in
+            if app.bundleIdentifier == "com.ccswitch.desktop" { return true }
+            let names = [app.localizedName, app.executableURL?.lastPathComponent]
+                .compactMap { $0?.lowercased() }
+            return names.contains { name in
+                name == "cc-switch" || name == "cc switch" || name == "ccswitch"
+            }
         }
     }
 
@@ -1022,6 +1067,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     }
 
     private func clearLiveEnv() throws {
+        // cc-switch 运行时由其独占 live,KeyDrop 不染指(同 add() 的事故修复理由)
+        guard !Self.ccSwitchRunning() else { return }
         guard FileManager.default.fileExists(atPath: Self.claudeSettingsPath) else { return }
         try FileLock.withLock(FileLock.lockPath(for: Self.claudeSettingsPath)) {
             try clearLiveEnvLocked()

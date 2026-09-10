@@ -157,25 +157,33 @@ final class CPAWriter {
         return trimmed
     }
 
-    /// 找 `openai-compatibility:` 段下指定 name 的条目范围(从 `- name: X` 行到下一个 `- name:` 行或段尾)
+    /// 找 `openai-compatibility:` 段下指定 name 的条目范围(从 `- name: X` 行到下一个同级 `- ` 行或段尾)。
+    /// 条目边界必须按缩进判定:条目内 models 子序列的 `- name:` 项缩进更深,
+    /// 按 trimmed 前缀一刀切会把条目截断在 models 首项,合并时误判「无已有 models」重复写入
     private func findAggregatedEntry(in lines: [String], providerName: String) -> Range<Int>? {
         guard let section = findNamedSection(in: lines, key: "openai-compatibility:") else { return nil }
         var idx = section.start
         while idx < section.end {
             let l = lines[idx]
-            let t = l.trimmingCharacters(in: .whitespaces)
+            let t = l.drop(while: { $0 == " " || $0 == "\t" })
             if t.hasPrefix("- name:") || t == "-" || t.hasPrefix("- ") {
-                // 进入一个条目:取该条目起始行
                 let entryStart = idx
-                // 条目 name 行匹配?
+                let indent = String(l.prefix(l.count - t.count))
                 let nameOnLine = t.hasPrefix("- name:")
                     ? stripYAMLValue(String(t.dropFirst("- name:".count))).trimmingCharacters(in: .whitespaces)
                     : nil
-                // 扫到下一个 `- name:` 或段尾
+                // 条目结束 = 下一个同缩进(或更浅)的 `- ` 行 / 反缩进到父级键;子序列深层项不算
                 var j = idx + 1
                 while j < section.end {
-                    let lt = lines[j].trimmingCharacters(in: .whitespaces)
-                    if lt.hasPrefix("- name:") || lt == "-" { break }
+                    let lj = lines[j]
+                    let tj = lj.drop(while: { $0 == " " || $0 == "\t" })
+                    if tj.isEmpty { j += 1; continue }
+                    let indj = String(lj.prefix(lj.count - tj.count))
+                    if tj.hasPrefix("- ") || tj == "-" {
+                        if indj.count <= indent.count { break }
+                    } else if indj.count < indent.count {
+                        break
+                    }
                     j += 1
                 }
                 if nameOnLine == providerName {
@@ -254,8 +262,18 @@ final class CPAWriter {
 
     // MARK: - aggregated write helpers
 
-    /// 合并 keys 和 models 进现有聚合条目;keys 去重(已有的跳过),models 同样
+    /// 合并 keys 和 models 进现有聚合条目;keys 去重(已有的跳过),models 同样。
+    /// 必须先合并 models 再插 keys:models 的插入点在 api-key-entries 之后,
+    /// 先插 keys 会使 models 段的整体行号后移,按插入前行号扫描会漏掉部分已有模型。
+    /// 注意:models 只能在这里合并一次。曾经在插 keys 之后再合并一次(用已失效的
+    /// range),导致重复追加模型,条目无 models 段时更会写出重复的 `models:` 键,
+    /// 触发 YAML 重复键校验回滚、第二批导入整体失败。
     private func mergeIntoAggregatedEntry(_ lines: inout [String], range: Range<Int>, keys: [String], models: [String]) throws {
+        // models 合并(去重):必须在插 keys 之前完成,且只做一次
+        if !models.isEmpty {
+            try mergeAggregatedModels(&lines, entryRange: range, newModels: models)
+        }
+
         // 提取已有 keys
         var existingKeys = Set<String>()
         if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: range) {
@@ -268,11 +286,10 @@ final class CPAWriter {
             }
         }
         let newKeys = keys.filter { !existingKeys.contains($0) }
-        guard !newKeys.isEmpty || !models.isEmpty else { return }
+        guard !newKeys.isEmpty else { return }
 
         // 在 api-key-entries 末尾追加新 key
-        if !newKeys.isEmpty,
-           let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: range) {
+        if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: range) {
             // 计算 entries 缩进(从首行推断)
             let indent: String = {
                 if entriesRange.isEmpty { return "      " }
@@ -287,11 +304,6 @@ final class CPAWriter {
             }
             let block = newKeys.map { "\(indent)- api-key: \(yamlScalar($0))" }
             lines.insert(contentsOf: block, at: insertAt)
-        }
-
-        // models 合并:找到现有 models 段追加,或新建
-        if !models.isEmpty {
-            try mergeAggregatedModels(&lines, entryRange: range, newModels: models)
         }
     }
 

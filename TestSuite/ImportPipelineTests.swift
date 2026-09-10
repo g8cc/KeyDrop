@@ -30,9 +30,11 @@ enum ImportPipelineTests {
             t.equal(row1[0][0], "claude", "[claude] DB app_type")
             t.contains(row1[0][1] ?? "", "claude-sonnet-4-5", "[claude] DB settings_config 含模型")
             t.contains(row1[0][1] ?? "", "sk-routeclaude1111111", "[claude] DB settings_config 含 key")
-            let live1 = e1.read("claude.json")
-            t.contains(live1, "ANTHROPIC_AUTH_TOKEN", "[claude] live 配置写入")
-            t.contains(live1, "https://route.example.com/v1", "[claude] base URL 原样写入")
+            // cc-switch 运行时 KeyDrop 不直写 live(防 settings_config 回写腐败,见 CCSwitchWriter.add 注释);
+            // 改断言 DB settings_config(永远写入)。live 门控由独立测试「live 门控」覆盖。
+            let cfg1 = row1[0][1] ?? ""
+            t.contains(cfg1, "ANTHROPIC_AUTH_TOKEN", "[claude] settings_config 含 token 键")
+            t.contains(cfg1, "https://route.example.com/v1", "[claude] base URL 原样写入")
 
             // gpt 系 → app_type=codex + codex.toml + auth.json
             let (e2, c2) = makeEnv("pipe-route-codex")
@@ -93,8 +95,10 @@ enum ImportPipelineTests {
             _ = try! c1.add(raw: "\(rawURL) sk-urlnormclaude11111", ccOverride: true, cpaOverride: false,
                             dshOverride: false, models: ["claude-sonnet-4-5"], force: true,
                             appType: "claude", appTypeForced: true)
-            t.contains(e1.read("claude.json"), "\"ANTHROPIC_BASE_URL\" : \"\(rawURL)\"",
-                       "[claude] base URL 原样(不补 /v1)")
+            let cfgUrlClaude = (try? db(e1).scalar("SELECT settings_config FROM providers WHERE app_type='claude' LIMIT 1")) ?? "{}"
+            t.contains(cfgUrlClaude, "\"ANTHROPIC_BASE_URL\":\"\(rawURL)\"",
+                       "[claude] settings_config base URL 原样(不补 /v1)")
+            t.expect(!cfgUrlClaude.contains("\(rawURL)/v1"), "[claude] claude 不补 /v1")
 
             // codex:openai 语义必须带 /v1
             let (e2, c2) = makeEnv("pipe-url-codex")
@@ -146,7 +150,8 @@ enum ImportPipelineTests {
                                  models: ["claude-sonnet-4-5"], force: true, appType: "claude", appTypeForced: true)
             t.equal(r2.entry.key, "sk-fmtanth22222222", "[ANTHROPIC JSON] key 提取")
             t.equal(r2.entry.url, "https://fmt.example.com", "[ANTHROPIC JSON] url 提取")
-            t.contains(e2.read("claude.json"), "sk-fmtanth22222222", "[ANTHROPIC JSON] 落盘 claude")
+            let cfg2 = (try? db(e2).scalar("SELECT settings_config FROM providers WHERE id=?", [r2.entry.ccProviderID!])) ?? "{}"
+            t.contains(cfg2, "sk-fmtanth22222222", "[ANTHROPIC JSON] settings_config 落盘")
 
             // 环境变量格式(单行 KEY=VALUE 空格分隔)
             let (e3, c3) = makeEnv("pipe-fmt-env")
@@ -156,7 +161,8 @@ enum ImportPipelineTests {
                                  models: ["claude-sonnet-4-5"], force: true, appType: "claude", appTypeForced: true)
             t.equal(r3.entry.key, "sk-fmtenv3333333333", "[ENV] key 提取")
             t.equal(r3.entry.url, "https://fmt.example.com", "[ENV] url 提取")
-            t.contains(e3.read("claude.json"), "sk-fmtenv3333333333", "[ENV] 落盘 claude")
+            let cfg3 = (try? db(e3).scalar("SELECT settings_config FROM providers WHERE id=?", [r3.entry.ccProviderID!])) ?? "{}"
+            t.contains(cfg3, "sk-fmtenv3333333333", "[ENV] settings_config 落盘")
 
             // curl 命令(解析层已有;这里验证写入链路)
             let (e4, c4) = makeEnv("pipe-fmt-curl")
@@ -279,8 +285,8 @@ enum ImportPipelineTests {
                                   appType: "claude", appTypeForced: true,
                                   proxy: "http://127.0.0.1:7890")
             t.expect(r.ok, "带代理导入成功")
-            let claude = env.read("claude.json")
-            t.contains(claude, "http://127.0.0.1:7890", "[claude] 代理写入环境变量")
+            let cfgProxy = (try? db(env).scalar("SELECT settings_config FROM providers WHERE id=?", [r.entry.ccProviderID!])) ?? "{}"
+            t.contains(cfgProxy, "http://127.0.0.1:7890", "[claude] 代理写入 settings_config")
             let cpa = env.read("cpa-config.yaml")
             // yamlScalar 对含冒号的 URL 加双引号
             t.contains(cpa, "proxy-url: \"http://127.0.0.1:7890\"", "[cpa] 代理写入条目")
@@ -301,6 +307,56 @@ enum ImportPipelineTests {
             t.equal(second.entry.id, firstID(core, key: "sk-idemmodel11111111"), "同条目幂等")
             t.contains(env.read("codex.toml"), "model = \"gpt-5.6-mini\"", "[幂等后] 模型同步为 B")
             t.expect(!env.read("codex.toml").contains("model = \"gpt-5.6-sol\""), "[幂等后] 旧模型无残留")
+        }
+
+        // MARK: - live 门控:cc-switch 运行状态决定 KeyDrop 是否直写 live claude.json
+        // 事故修复:cc-switch 运行时 KeyDrop 写 live 会被 cc-switch 回写进陈旧 current 的
+        // settings_config,整块覆盖旧 provider 的 url/key/models。运行时交给 cc-switch 应用,
+        // KeyDrop 只写 DB;未运行时 KeyDrop 独占 live。
+
+        h.runSuite("导入管线.live 门控") { t in
+            // cc-switch 运行(FAKE=1,harness 默认)→ 不写 live claude.json
+            let (e1, c1) = makeEnv("pipe-livegate-running")
+            defer { e1.cleanup() }
+            _ = try! c1.add(raw: "https://gate.example.com/v1 sk-gaterun1111111111",
+                             ccOverride: true, cpaOverride: false, dshOverride: false,
+                             models: ["claude-sonnet-4-5"], force: true, appType: "claude", appTypeForced: true)
+            t.expect(!FileManager.default.fileExists(atPath: e1.dir + "/claude.json"),
+                     "[运行] 不写 live claude.json(交给 cc-switch 应用)")
+            let cfgRun = (try? db(e1).scalar("SELECT settings_config FROM providers WHERE app_type='claude' LIMIT 1")) ?? "{}"
+            t.contains(cfgRun, "sk-gaterun1111111111", "[运行] DB settings_config 仍写入")
+
+            // 回归复现:旧 cc-switch 进程可能仍缓存旧 current provider,随后会把 live
+            // 配置回写到旧 provider。导入新 key 后 live 必须为空,否则旧 provider 会被
+            // 新 key/base_url/model 整块污染。
+            let oldPID = try! db(e1).scalar("SELECT id FROM providers WHERE is_current=1 AND app_type='claude'") ?? ""
+            let oldConfig = try! db(e1).scalar("SELECT settings_config FROM providers WHERE id=?", [oldPID]) ?? ""
+            let second = try! c1.add(raw: "https://gate-new.example.com/v1 sk-gatenew1111111111",
+                                     ccOverride: true, cpaOverride: false, dshOverride: false,
+                                     models: ["claude-opus-4-1"], force: true,
+                                     appType: "claude", appTypeForced: true)
+            t.expect(second.ok, "[运行] 导入第二个 provider 成功")
+            t.expect(!e1.fileExists("claude.json"), "[运行] 第二次导入仍不生成 live 配置")
+            // 用测试替身模拟 cc-switch 的旧进程回写动作;没有 live 就不会发生污染。
+            let live = e1.read("claude.json")
+            if !live.isEmpty {
+                try! db(e1).run("UPDATE providers SET settings_config=? WHERE id=?", [live, oldPID])
+            }
+            let oldAfter = try! db(e1).scalar("SELECT settings_config FROM providers WHERE id=?", [oldPID]) ?? ""
+            t.contains(oldAfter, "sk-gaterun1111111111", "[运行] 旧 provider key 保持不变")
+            t.contains(oldAfter, "gate.example.com/v1", "[运行] 旧 provider base_url 保持不变")
+            t.contains(oldAfter, "claude-sonnet-4-5", "[运行] 旧 provider model 保持不变")
+            t.expect(oldAfter == oldConfig, "[运行] 旧 provider settings_config 未被新导入污染")
+
+            // cc-switch 未运行(FAKE=0)→ KeyDrop 独占 live,直接写
+            setenv("KEYDROP_FAKE_CC_RUNNING", "0", 1)
+            defer { setenv("KEYDROP_FAKE_CC_RUNNING", "1", 1) }
+            let (e2, c2) = makeEnv("pipe-livegate-direct")
+            defer { e2.cleanup() }
+            _ = try! c2.add(raw: "https://gate.example.com/v1 sk-gatedirect1111111",
+                            ccOverride: true, cpaOverride: false, dshOverride: false,
+                            models: ["claude-sonnet-4-5"], force: true, appType: "claude", appTypeForced: true)
+            t.contains(e2.read("claude.json"), "sk-gatedirect1111111", "[直连] 写 live claude.json")
         }
     }
 

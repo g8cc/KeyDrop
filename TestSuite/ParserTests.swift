@@ -69,6 +69,25 @@ enum ParserTests {
             let keys = Parser.extractAllKeys("sk-aaa111222333444555 sk-bbb222333444555 sk-ccc222333444555")
             t.equal(keys.count, 3, "提取全部 key")
 
+            // 回归:nvapi-(NVIDIA)等厂商前缀不在旧白名单(cwk-/sk-/ak-/pk-)里,
+            // 批量 nvapi key 提取为 0,多 key CPA 导入路径不触发,只导入第一把
+            let nv = Parser.extractAllKeys(
+                "https://integrate.api.nvidia.com/v1\nnvapi-aaa111bbb222ccc333ddd111\nnvapi-eee444fff555ggg666hhh222"
+            )
+            t.equal(nv.count, 2, "nvapi 批量提取")
+
+            // URL/裸域名不计入 key(28+ 字符域名串会过 looksLikeKey 通用分支,需 URL 优先排除)
+            let dom = Parser.extractAllKeys(
+                "https://host-a.example.net api.integrate.example-nvidia.com sk-abc123def456ghi789jkl"
+            )
+            t.equal(dom.count, 1, "URL/裸域名不算 key")
+
+            // 只贴 key 不贴 URL:nvapi 官方 URL fallback
+            let nvParsed = try! Parser.parseWithFallback(
+                "nvapi-aaa111bbb222ccc333ddd111\nnvapi-eee444fff555ggg666hhh222"
+            )
+            t.equal(nvParsed.url, "https://integrate.api.nvidia.com/v1", "nvapi 官方 URL fallback")
+
             // CJK 修复:中文段不误入模型
             let cjk = try! Parser.parseWithFallback("sk-abc123def456ghi789jkl 500rmb 随便")
             t.expect((cjk.models ?? []).allSatisfy { !$0.contains("rmb") && !$0.contains("随便") }, "CJK/rmb 不进模型")

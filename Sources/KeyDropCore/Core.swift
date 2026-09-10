@@ -349,6 +349,26 @@ public final class Core {
                     for warning in r.warnings {
                         lines.append("  ⚠ \(warning)")
                     }
+                    // 家族变化的重导入:entry.targets 初始化时已过滤掉旧 ccswitch 标签,
+                    // 新标签只指向刚建的 provider。若不清理旧 app_type 的 provider,
+                    // 它会变成无人认领的孤儿(delete/reconcile 都不再引用它)——违反账本不变量②。
+                    // 顺序必须是「先建后删」:cc.add 失败时旧 provider 仍在,catch 恢复旧标签
+                    // 不会指向已删产物;先删后建则在建失败时制造「标签指向不存在的产物」。
+                    // 同 app_type 的重建/去重由 cc.add 内部处理,这里只管跨 app_type 的旧产物。
+                    if let dup, let oldPid = dup.ccProviderID,
+                       let oldTag = dup.targets.first(where: { $0.hasPrefix("ccswitch") }) {
+                        let oldAppType = oldTag.hasPrefix("ccswitch-")
+                            ? String(oldTag.dropFirst("ccswitch-".count)) : "claude"
+                        if oldAppType != resolvedAppType, cc.providerExists(oldPid, appType: oldAppType) {
+                            do {
+                                _ = try cc.remove(providerID: oldPid, renamedFrom: dup.ccRenamedFrom,
+                                                  renamedTo: dup.ccRenamedTo, appType: oldAppType)
+                                lines.append("↺ 家族变化: 已移除旧 \(oldAppType) provider")
+                            } catch {
+                                lines.append("⚠ 旧 \(oldAppType) provider 清理失败(可能残留孤儿): \(error.localizedDescription)")
+                            }
+                        }
+                    }
                 }
             } catch {
                 lines.append("✗ cc-switch 失败: \(error.localizedDescription)")
@@ -674,12 +694,16 @@ public final class Core {
         return l.contains("claude") || l.contains("sonnet") || l.contains("opus") || l.contains("haiku") || l.contains("fable")
     }
 
-    /// gpt 系模型判定
+    /// gpt 系模型判定(chat/responses 系 → codex)。
+    /// 只认 gpt 后紧跟数字或 -oss 的家族(gpt-4o / gpt-5 / gpt-oss / openai/gpt-4.5 等);
+    /// gpt-image / gpt-vision / gpt-realtime / gpt-ocr 等非 chat 模型不认。
+    /// 真实事故:fal-ai/gpt-image-2 被子串 contains("gpt-") 误判为 gpt → 图生模型被导入 codex。
     public static func isGptModel(_ m: String) -> Bool {
         let l = m.lowercased()
-        if l.contains("gpt-") || l.contains("/gpt") || l == "gpt" { return true }
-        if l.hasPrefix("gpt") && (l.count == 3 || l.dropFirst(3).first == "-" || l.dropFirst(3).first == ".") { return true }
-        return false
+        if l == "gpt" { return true }
+        // 任意位置出现 gpt 家族:gpt 后必须紧跟数字(-/. 可省略)或 -oss;
+        // 前一个字符必须非字母数字,避免 chatgpt 等词内子串误配
+        return l.range(of: #"(?:^|[^a-z0-9])gpt[-.]?(?:oss|[0-9])"#, options: .regularExpression) != nil
     }
 
     public static func routeAppType(selectedModels: [String], modelsOverride: [String]?, default appType: String, forced: Bool = false) -> String {
@@ -689,6 +713,32 @@ public final class Core {
         if list.contains(where: { isClaudeModel($0) }) { return "claude" }
         if list.contains(where: { isGptModel($0) }) { return "codex" }
         return "opencode"
+    }
+
+    /// 非 chat 模型判定:纯图生 / 视觉 / 嵌入 / 重排 / 语音 / OCR 等。
+    /// 这类模型不能当编码/对话 agent 的激活模型,选中后会让 codex/opencode 拿图生模型当默认。
+    /// 关键词边界用 (前导分隔或开头)+词尾,避免误伤 vision-capable chat 模型(如 "deepseek-v4-flash-vision",
+    /// 它仍是对话模型,不含 image/embed 等纯非 chat 标记)。真实事故:fal-ai/gpt-image-2 被当 codex 默认模型。
+    public static func isNonChatModel(_ m: String) -> Bool {
+        let l = m.lowercased()
+        return l.range(of: #"(?:^|[-/._])(image|dall|dalle|flux|sora|whisper|tts|embed|embedding|rerank|reranker|moderation|realtime|ocr|speech|audio)\b"#, options: .regularExpression) != nil
+    }
+
+    /// 已知 chat 家族(deepseek/qwen/kimi/glm/llama/mistral/minimax/mimo/longcat/grok/yi/phi 等)。
+    /// 用于激活模型优先级:有 chat 家族时优先选它,而非 fal-ai/nano-banana 这类难判定的多模态。
+    static func looksLikeChatFamily(_ m: String) -> Bool {
+        let l = m.lowercased()
+        return l.range(of: #"(?:deepseek|qwen|kimi|glm|llama|mistral|minimax|mimo|longcat|grok|\byi\b|phi|gemma|command|internlm|yi-|aquila)"#, options: .regularExpression) != nil
+            || isClaudeModel(m) || isGptModel(m)
+    }
+
+    /// 激活模型优先选择:① 已知 chat 家族 ② 其他非 non-chat 模型;全 non-chat 返回 nil(不设激活模型)。
+    /// 调用方:opencode 写入的 firstModel。模型列表本身不变(用户勾选的仍可写入 models 字典),
+    /// 仅「激活默认」不应落到图生模型上。
+    public static func preferredChatModel(_ models: [String]) -> String? {
+        let chatFamily = models.first(where: { looksLikeChatFamily($0) })
+        if let chatFamily { return chatFamily }
+        return models.first(where: { !isNonChatModel($0) && !$0.isEmpty })
     }
 
     /// 订阅拉取专用 session:进程级单例。
@@ -787,40 +837,79 @@ public final class Core {
         entry.healthAt = Date().timeIntervalSince1970
         let currentModels = Set(entry.models ?? (entry.model.map { [$0] } ?? []))
         let testModels = test.models.filter { Parser.looksLikeModel($0) }
-        if testModels.isEmpty {
-            historyUpdateLogged(entry)
-            // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
-            if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
-               let pid = entry.ccProviderID {
-                let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
-                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+
+        // ccswitch 同步/迁移闭包:统一处理「家族不变 → 原地 sync」与「家族变化 → 迁移」。
+        // 真实事故:claude 网关刷新后 /models 返回全 gpt,refresh 把 gpt 列表写入 claude provider,
+        // claudeEnv 过滤掉非-claude 模型 → settings_config 只剩 url+token 无 ANTHROPIC_MODEL*,
+        // Claude Code 回退默认模型打第三方 URL 必失败。修复:按刷新后模型重路由 appType,
+        // 不匹配则删旧 provider 建新 provider,并更新 entry.targets/ccProviderID/models/model。
+        // 返回需要附加到用户消息的 warning(若有);entry 可能被就地修改。
+        func ccSyncOrMigrate(_ entry: inout HistoryEntry, models: [String]) -> String? {
+            guard entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
+                  let oldPid = entry.ccProviderID,
+                  let url = entry.url, let key = entry.key, !key.isEmpty
+            else { return nil }
+            let oldTag = entry.targets.first(where: { $0.hasPrefix("ccswitch") }) ?? "ccswitch"
+            let oldAppType = oldTag.hasPrefix("ccswitch-")
+                ? String(oldTag.dropFirst("ccswitch-".count)) : "claude"
+            let newAppType = Self.routeAppType(
+                selectedModels: [], modelsOverride: models, default: oldAppType, forced: false
+            )
+            // 家族不变:原地 sync models,不动 targets/pid
+            if newAppType == oldAppType {
                 var p = ParsedKey()
-                p.url = url
-                p.key = key
-                p.model = entry.model
-                try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: currentModels.sorted(), proxy: proxyForHealth())
+                p.url = url; p.key = key; p.model = models.first ?? entry.model
+                do { try cc.syncModelsAfterRefresh(p, providerID: oldPid, appType: oldAppType, models: models, proxy: proxyForHealth()) }
+                catch { return "⚠ cc-switch 同步失败: \(error.localizedDescription)" }
+                return nil
             }
+            // 家族变化:删旧建新。newTag 仅替换 ccswitch* 前缀,其他 targets(dsh/cpa/clash)原样保留
+            let newTag = "ccswitch" + (newAppType == "claude" ? "" : "-\(newAppType)")
+            var p = ParsedKey()
+            p.url = url; p.key = key; p.model = models.first ?? entry.model
+            _ = try? cc.remove(providerID: oldPid, renamedFrom: nil, renamedTo: nil, appType: oldAppType)
+            do {
+                let r = try cc.add(p, nameOverride: entry.name, appType: newAppType, models: models, proxy: proxyForHealth())
+                entry.targets = entry.targets.filter { !$0.hasPrefix("ccswitch") } + [newTag]
+                entry.ccProviderID = r.providerID
+                entry.models = models
+                entry.model = models.first
+                return "已迁移: \(oldAppType) → \(newAppType)\(r.warnings.isEmpty ? "" : " (\(r.warnings.joined(separator: "; ")))")"
+            } catch {
+                // 迁移失败比 sync 失败严重:旧 provider 已删,新 provider 没建出来 → 该 entry 在 cc-switch 里孤儿。
+                // 重建旧 app_type 的 provider 尽力补救(旧 pid 不可复用——remove 已删且 cc-switch 内存可能仍持有),
+                // 把 entry 指回新建的回滚 provider 并提示 reimport。
+                var p2 = ParsedKey()
+                p2.url = url; p2.key = key; p2.model = models.first ?? entry.model
+                if let rb = try? cc.add(p2, nameOverride: entry.name, appType: oldAppType, models: models, proxy: proxyForHealth()) {
+                    entry.ccProviderID = rb.providerID
+                }
+                return "⚠ 迁移失败已回滚: \(error.localizedDescription);建议重新导入该 key"
+            }
+        }
+
+        if testModels.isEmpty {
+            // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
+            let migrateNote = ccSyncOrMigrate(&entry, models: currentModels.sorted())
+            // 必须在 ccSyncOrMigrate 之后再落盘:它可能就地修改 entry(targets/ccProviderID/models),
+            // 提前落盘会把迁移结果丢掉,而旧 provider 已删 → 历史指向已删 provider 的孤儿态
+            // (下面「模型无变化」分支即为此处的正确写法)
+            try history.update(entry)
             let keep = currentModels.isEmpty ? "无" : currentModels.joined(separator: ", ")
             let q = quotaNote.map { "(\($0) — 充值后刷新自动恢复)" } ?? ""
-            return "✓ \(quotaNote != nil ? "端点可用但无额度" : "可用"): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)"
+            let m = migrateNote.map { "\n\($0)" } ?? ""
+            return "✓ \(quotaNote != nil ? "端点可用但无额度" : "可用"): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)\(m)"
         }
         let modelsChanged = currentModels != Set(testModels)
 
         if !modelsChanged {
             historyUpdateLogged(entry)
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
-            if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
-               let pid = entry.ccProviderID {
-                let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
-                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
-                var p = ParsedKey()
-                p.url = url
-                p.key = key
-                p.model = entry.model
-                try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: currentModels.sorted(), proxy: proxyForHealth())
-            }
+            let migrateNote = ccSyncOrMigrate(&entry, models: currentModels.sorted())
+            try history.update(entry)
             let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
-            return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,无变化)\(q)"
+            let m = migrateNote.map { "\n\($0)" } ?? ""
+            return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,无变化)\(q)\(m)"
         }
 
         var filtered: [String] = []
@@ -844,22 +933,8 @@ public final class Core {
         entry.model = filtered.first
 
         var syncWarn: String? = nil
-        if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
-           let pid = entry.ccProviderID {
-            let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
-                .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
-            var p = ParsedKey()
-            p.url = url
-            p.key = key
-            p.model = filtered.first
-            do {
-                try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: filtered, proxy: proxyForHealth())
-            } catch {
-                // 模型列表已更新;cc-sync 失败降级为警告而非让整个刷新失败
-                // (与 editEntry 的降级模式一致),重试刷新或 reimport 可修复
-                syncWarn = "⚠ cc-switch 同步失败: \(error.localizedDescription)"
-            }
-        }
+        // 主分支:模型已变化,ccSyncOrMigrate 会按新模型列表决定原地 sync 还是迁移家族
+        syncWarn = ccSyncOrMigrate(&entry, models: filtered)
 
         if entry.targets.contains("dsh") {
             _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: filtered)

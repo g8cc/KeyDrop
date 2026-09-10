@@ -69,7 +69,9 @@ final class TestEnv {
         setenv("KEYDROP_CODEX_AUTH", dir + "/codex-auth.json", 1)
         setenv("KEYDROP_DSH_SETTINGS", dir + "/dsh.yaml", 1)
         setenv("KEYDROP_DSH_CREDENTIALS", dir + "/dsh-creds.yaml", 1)
-        setenv("KEYDROP_FAKE_CC_RUNNING", "1", 1)
+        // override=0:不覆盖测试内已显式 setenv 的值(如 live 门控测试切 FAKE_CC_RUNNING=0);
+        // 未设置时默认 1(cc-switch「运行中」),与历史行为一致
+        setenv("KEYDROP_FAKE_CC_RUNNING", "1", 0)
         setenv("KEYDROP_PROXY", "", 1)
         // 隔离加固:以下路径若不显式指向临时目录,测试可能触达开发者本机的真实文件
         // KEYDROP_LLM_PARSE=0:规则解析失败时不得真连本机 LLM 端点(127.0.0.1:8317, 15s 超时)
