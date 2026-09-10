@@ -10,6 +10,12 @@ import Darwin
 public enum FileLock {
 
     public static func withLock<T>(_ path: String, _ body: () throws -> T) rethrows -> T {
+        // 锁文件父目录可能尚未创建(首次运行 ~/.keydrop、~/.dsh 不存在),
+        // open 会因 ENOENT 失败并静默退化为无锁。先补建目录,让首次写入也有锁保护。
+        let parent = (path as NSString).deletingLastPathComponent
+        if !parent.isEmpty, !FileManager.default.fileExists(atPath: parent) {
+            try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        }
         let fd = open(path, O_CREAT | O_RDWR, 0o600)
         guard fd >= 0 else {
             // 拿不到锁文件(权限/只读盘)时退化为无锁行为,但必须留痕:

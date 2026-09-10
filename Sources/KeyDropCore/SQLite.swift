@@ -22,8 +22,12 @@ public final class DB {
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
         let rc = sqlite3_open_v2(path, &handle, flags, nil)
         guard rc == SQLITE_OK, let handle else {
-            let msg = handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "rc=\(rc)"
-            if let handle { sqlite3_close(handle) }
+            // sqlite3_open_v2 失败时仍可能写出一个有效 handle;deinit 会再 close 一次,
+            // 对同一指针二次 close 是 UB(已实测第二次返回 SQLITE_MISUSE)。
+            // 所以这里 close 后必须把 self.handle 置 nil。
+            let msg = self.handle.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "rc=\(rc)"
+            if let h = self.handle { sqlite3_close(h) }
+            self.handle = nil
             throw SQLiteError.open("\(path): \(msg)")
         }
         sqlite3_busy_timeout(handle, 8000)

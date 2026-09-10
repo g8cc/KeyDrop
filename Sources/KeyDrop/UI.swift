@@ -534,8 +534,9 @@ final class AppState: ObservableObject {
     }
 
     func clearDead() {
+        // proxy-ok 是「直连不可用但经代理可用」,不是失效,绝不能被一键清除误删
         let ids = core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err" || $0.health == "proxy-ok") }
+            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err") }
             .map { $0.id }
         guard !ids.isEmpty, !isBusy else { return }
         isBusy = true
@@ -1300,7 +1301,7 @@ struct PanelView: View {
     private var deadItems: [HistoryEntry] {
         _ = state.historyVersion
         return state.core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err" || $0.health == "proxy-ok") }
+            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err") }
             .filter(matches)
             .sorted { $0.ts > $1.ts }
             .prefix(60)

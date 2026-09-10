@@ -63,7 +63,9 @@ public enum ImageMCPWriter {
         if let raw = getenv("KEYDROP_MCP_COMMAND") {
             let override = String(cString: raw)
             if !override.isEmpty {
-                return override.split(separator: " ").map(String.init)
+                let parts = override.split(separator: " ").map(String.init)
+                // 纯空白字符串 split 后为空数组,不能当成有效命令(否则调用方 [0] 越界崩溃)
+                if !parts.isEmpty { return parts }
             }
         }
         let exe = Bundle.main.executablePath ?? "/usr/local/bin/keydrop"
@@ -92,6 +94,12 @@ public enum ImageMCPWriter {
         ]
         obj["mcpServers"] = servers
         let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        // ~/.claude 可能不存在(未装/未初始化),必须补建目录,否则原子写直接抛错,
+        // 而 writeAll 首个失败会中止后续 codex/opencode 的注册
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
         try data.write(to: URL(fileURLWithPath: path), options: .atomic)
         return false
     }
@@ -116,12 +124,22 @@ public enum ImageMCPWriter {
         return false
     }
 
-    /// 全部写入;返回各目标是否已存在(未改动)
+    /// 全部写入;返回各目标是否已存在(未改动)。
+    /// 逐个尝试:任一目标失败不得中止其余目标(旧实现 writeClaude 抛错会让
+    /// codex/opencode 彻底不写,而 ~/.claude 不存在是常见情况)。
     public static func writeAll() throws -> [String: Bool] {
         var out: [String: Bool] = [:]
-        out["claude"] = try writeClaude()
-        out["codex"] = try writeCodex()
-        out["opencode"] = try writeOpencode()
+        var errors: [String] = []
+        func attempt(_ name: String, _ body: () throws -> Bool) {
+            do { out[name] = try body() }
+            catch { errors.append("\(name): \(error.localizedDescription)") }
+        }
+        attempt("claude") { try writeClaude() }
+        attempt("codex") { try writeCodex() }
+        attempt("opencode") { try writeOpencode() }
+        if !errors.isEmpty {
+            throw WriterError.file("MCP 配置部分写入失败: " + errors.joined(separator: "; "))
+        }
         return out
     }
 
@@ -148,7 +166,12 @@ public enum ImageMCPWriter {
         ]
         root["mcp"] = mcp
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: URL(fileURLWithPath: path))
+        // 同 writeClaude:~/.config/opencode 可能不存在;写用原子避免半截 JSON
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
         return existed
     }
 }

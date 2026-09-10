@@ -11,6 +11,20 @@ enum DSHWriterTests {
             t.equal(DSHWriter.normalizeBaseURL("https://x.com/v1/"), "https://x.com/v1", "/v1/ 去尾斜杠")
             t.equal(DSHWriter.normalizeBaseURL("https://x.com/api"), "https://x.com/api", "/api 保持")
             t.equal(DSHWriter.normalizeBaseURL("https://x.com/chat/completions"), "https://x.com/chat/completions", "/chat/completions 保持")
+            // 已含版本段不得再拼 /v1(火山 ark/智谱/gemini 真实 baseURL)
+            t.equal(DSHWriter.normalizeBaseURL("https://ark.cn-beijing.volces.com/api/v3"),
+                    "https://ark.cn-beijing.volces.com/api/v3", "/api/v3 保持")
+            t.equal(DSHWriter.normalizeBaseURL("https://open.bigmodel.cn/api/paas/v4"),
+                    "https://open.bigmodel.cn/api/paas/v4", "/api/paas/v4 保持")
+            t.equal(DSHWriter.normalizeBaseURL("https://generativelanguage.googleapis.com/v1beta/openai/"),
+                    "https://generativelanguage.googleapis.com/v1beta/openai", "/v1beta/openai 保持(仅去尾斜杠)")
+            t.equal(DSHWriter.normalizeBaseURL("https://api.deepseek.com"), "https://api.deepseek.com/v1", "无路径仍补 /v1")
+
+            // YAML 标量:# / % / : 开头必须转引号,否则会被当注释/报错
+            t.expect(DSHWriter.yamlScalar("#1model").hasPrefix("\""), "# 开头转引号")
+            t.expect(DSHWriter.yamlScalar("%dirmodel").hasPrefix("\""), "% 开头转引号")
+            t.expect(DSHWriter.yamlScalar(":x").hasPrefix("\""), ": 开头转引号")
+            t.equal(DSHWriter.yamlScalar("deepseek-v4-flash"), "deepseek-v4-flash", "普通模型名裸写")
 
             // routeKey / env 命名
             t.equal(DSHWriter.routeKey(providerID: "0219dfa3-311a-4df3-943b-1ee73e186941"), "keydrop-0219dfa3", "routeKey")
@@ -67,6 +81,25 @@ enum DSHWriterTests {
             let coexist = env.read("dsh.yaml")
             t.contains(coexist, "cpa:", "原块保留")
             t.contains(coexist, "keydrop-ab12cd34:", "新块追加")
+
+            // 读失败(非 UTF-8)必须抛错,绝不能当空文件整体覆盖 → 清空其它 provider
+            let env2 = try! TestEnv("dsh-readfail")
+            defer { env2.cleanup() }
+            let badSettings = env2.dir + "/dsh.yaml"
+            let badCreds = env2.dir + "/dsh-creds.yaml"
+            let original = Data([0x6c, 0x6c, 0x6d, 0x2d, 0x70, 0x69, 0x2d, 0x61, 0x69, 0x3a, 0xFF, 0xFE])
+            try! original.write(to: URL(fileURLWithPath: badSettings))
+            try! Data([0xFF, 0xFE, 0x00]).write(to: URL(fileURLWithPath: badCreds))
+            var threw = false
+            do {
+                _ = try DSHWriter.add(providerID: "deadbeef-1111-2222-3333-444455556666",
+                                      key: "sk-x", url: "https://x.com", models: ["deepseek-v4-flash"])
+            } catch { threw = true }
+            t.expect(threw, "读失败时抛错,拒绝覆盖")
+            t.expect(try! Data(contentsOf: URL(fileURLWithPath: badSettings)) == original,
+                     "读失败时 settings 内容不变(未被清空)")
+            t.expect(try! Data(contentsOf: URL(fileURLWithPath: badCreds)) == Data([0xFF, 0xFE, 0x00]),
+                     "读失败时 credentials 内容不变")
         }
     }
 }

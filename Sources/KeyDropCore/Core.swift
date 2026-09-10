@@ -326,7 +326,7 @@ public final class Core {
                     entry.targets.append(appTag)
                     anyOK = true
                     let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
-                    lines.append("✓ cc-switch: 已更新已有 provider「\(dup.name)」到 \(appLabel)(幂等)")
+                    lines.append("✓ cc-switch: 已更新已有 provider「\(dup.name ?? "")」到 \(appLabel)(幂等)")
                 } else {
                     let r = try cc.add(parsed, appType: resolvedAppType, models: selectedModels, proxy: proxyURL)
                     entry.targets.append(appTag)

@@ -28,10 +28,16 @@ public enum DSHWriter {
         m.lowercased().contains("deepseek")
     }
 
-    /// openai-completions 语义要求 baseURL 以 /v1 结尾(不带 /v1 的网关会被兜底到网页首页)
+    /// openai-completions 语义要求 baseURL 以 /v1 结尾(不带 /v1 的网关会被兜底到网页首页)。
+    /// 但已经带版本段的地址不能再追加:/api/v3(火山 ark)、/api/paas/v4(智谱)、
+    /// /v1beta/openai(gemini) 这类拼上 /v1 会变成不存在的路径,DSH 请求 404。
     public static func normalizeBaseURL(_ url: String) -> String {
         let u = url.hasSuffix("/") ? String(url.dropLast()) : url
-        if u.hasSuffix("/v1") || u.hasSuffix("/api") || u.hasSuffix("/chat/completions") { return u }
+        if u.hasSuffix("/chat/completions") { return u }
+        let path = URL(string: u)?.path ?? ""
+        // 路径里已含 /v<数字> 版本段(含 v1beta)或 /api 结尾 → 视为完整 baseURL
+        if path.range(of: #"/v[0-9]"#, options: .regularExpression) != nil { return u }
+        if path.hasSuffix("/api") { return u }
         return u + "/v1"
     }
 
@@ -41,7 +47,17 @@ public enum DSHWriter {
         guard FileManager.default.fileExists(atPath: path) else { return }
         let bak = path + ".keydrop-bak"
         try? FileManager.default.removeItem(atPath: bak)
-        try? FileManager.default.copyItem(atPath: path, toPath: bak)
+        do { try FileManager.default.copyItem(atPath: path, toPath: bak) }
+        catch { AppLog.warn("DSH 备份失败(\(path)): \(error.localizedDescription)") }
+    }
+
+    /// 读取已存在文件:不存在返回空串;存在但读取/解码失败则抛错。
+    /// 不能用 `try? String(...) ?? ""` —— 那会把「读失败」当成「空文件」,
+    /// 随后的整体覆盖写会清空文件里其它 provider 的配置与明文 key。
+    private static func readExisting(_ path: String) throws -> String {
+        guard FileManager.default.fileExists(atPath: path) else { return "" }
+        do { return try String(contentsOfFile: path, encoding: .utf8) }
+        catch { throw WriterError.file("读取失败,拒绝覆盖: \(path)(\(error.localizedDescription))") }
     }
 
     /// Appends (or updates) a provider route and its credential.
@@ -59,8 +75,8 @@ public enum DSHWriter {
 
         backupFile(settingsPath)
         backupFile(credentialsPath)
-        var settings = (try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? ""
-        var creds = (try? String(contentsOfFile: credentialsPath, encoding: .utf8)) ?? ""
+        var settings = try readExisting(settingsPath)
+        var creds = try readExisting(credentialsPath)
 
         removeRoute(&settings, route: route)
         removeCredential(&creds, env: env)
@@ -104,7 +120,7 @@ public enum DSHWriter {
             try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
             // 原子写=临时文件+rename,新文件继承 umask(通常 0644),会把 add 时设置的
             // 0600 重置成全员可读 —— 凭证文件里还有其他 provider 的明文 key,必须重设权限
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
         }
     }
 
@@ -114,6 +130,7 @@ public enum DSHWriter {
         if !s.isEmpty,
            s.range(of: #"^[A-Za-z0-9_\-./:%#=]+$"#, options: .regularExpression) != nil,
            !s.hasPrefix("-"), !s.hasPrefix("?"),
+           !s.hasPrefix("#"), !s.hasPrefix("%"), !s.hasPrefix(":"),
            !s.contains(": "), !s.hasSuffix(":") {
             return s
         }

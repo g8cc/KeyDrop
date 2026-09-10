@@ -706,5 +706,26 @@ enum RegressionTests {
             t.contains(oc, r.providerID, "opencode.json 已写入重建的 provider(修复前只写 DB)")
             t.contains(oc, "deepseek-v4-flash", "opencode.json 含模型")
         }
+
+        // 修复:SQLite 打开失败时已 close 一次,deinit 又 close 同一指针(UB);
+        // 修复后应正常抛错且不二次 close。
+        h.runSuite("Regression.DB 打开失败不二次释放") { t in
+            do {
+                _ = try DB(path: "/keydrop-nonexistent-\(UUID().uuidString)/db.sqlite")
+                t.expect(false, "不存在的父目录应打开失败")
+            } catch {
+                t.expect(true, "打开失败正常抛错: \(error.localizedDescription)")
+            }
+        }
+
+        // 修复:锁文件父目录不存在时 open 失败会静默退化为无锁;
+        // 修复后自动创建父目录,首次写入也有锁保护。
+        h.runSuite("Regression.FileLock 父目录自动创建") { t in
+            let env = try! TestEnv("reg-filelock-parent")
+            defer { env.cleanup() }
+            let lockPath = env.dir + "/newdir/sub/data.json.keydrop-lock"
+            try? FileLock.withLock(lockPath) { }
+            t.expect(FileManager.default.fileExists(atPath: lockPath), "锁文件父目录自动创建")
+        }
     }
 }

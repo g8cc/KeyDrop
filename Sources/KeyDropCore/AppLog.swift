@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 public enum AppLog {
 
@@ -32,17 +33,25 @@ public enum AppLog {
         let line = "\(tsFormatter.string(from: Date())) [\(level)] \(safe)\n"
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            // 日志可能含 key 片段,目录/文件权限收紧到仅属主可读写
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
             if !FileManager.default.fileExists(atPath: file.path) {
-                FileManager.default.createFile(atPath: file.path, contents: nil)
+                FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
             }
-            if let fh = FileHandle(forWritingAtPath: file.path) {
-                defer { try? fh.close() }
-                do {
-                    try fh.seekToEnd()
-                    // 用 throwing 全量写:旧 write(_:) 是部分写语义,磁盘异常时静默丢行
-                    try fh.write(contentsOf: Data(line.utf8))
-                } catch {
-                    NSLog("AppLog write body failed: \(error)")
+            // 必须用 O_APPEND:菜单栏 app 与 CLI 是两个进程,进程内 NSLock 管不到对方,
+            // 旧实现 FileHandle + seekToEnd 会让两进程 seek 到同一 offset 互相覆盖丢行。
+            let fd = open(file.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+            if fd >= 0 {
+                defer { close(fd) }
+                let bytes = Array(line.utf8)
+                var off = 0
+                while off < bytes.count {
+                    let w = bytes.withUnsafeBytes { raw -> Int in
+                        guard let base = raw.baseAddress else { return 0 }
+                        return Darwin.write(fd, base.advanced(by: off), bytes.count - off)
+                    }
+                    if w <= 0 { break }
+                    off += w
                 }
             }
             rotateIfNeeded()
@@ -92,9 +101,26 @@ public enum AppLog {
 
         var out = maskTokens(t)
         for (i, u) in urls.enumerated() {
-            out = out.replacingOccurrences(of: "\u{0}URL\(i + 1)\u{0}", with: u)
+            out = out.replacingOccurrences(of: "\u{0}URL\(i + 1)\u{0}", with: maskURLSecrets(u))
         }
         return out
+    }
+
+    /// URL 里的凭据不能因为「整段是 URL」就原样还原:
+    /// ?api_key=/&token= 查询参数、以及 https://user:pass@host 的 userinfo 都要遮。
+    private static let urlQuerySecretRegex = try! NSRegularExpression(
+        pattern: #"(?i)([?&](?:api[_-]?key|apikey|key|token|access_token|auth|password|secret)=)[^&\s"']+"#)
+    private static let urlUserInfoRegex = try! NSRegularExpression(pattern: #"://[^/@\s"']+@"#)
+
+    private static func maskURLSecrets(_ u: String) -> String {
+        var s = u
+        let ns = s as NSString
+        s = urlQuerySecretRegex.stringByReplacingMatches(
+            in: s, range: NSRange(location: 0, length: ns.length), withTemplate: "$1***")
+        let ns2 = s as NSString
+        s = urlUserInfoRegex.stringByReplacingMatches(
+            in: s, range: NSRange(location: 0, length: ns2.length), withTemplate: "://***@")
+        return s
     }
 
     private static func maskTokens(_ s: String) -> String {
@@ -110,9 +136,12 @@ public enum AppLog {
                 out += ns.substring(with: NSRange(location: pos, length: r.location - pos))
             }
             let tok = ns.substring(with: r)
-            // 只截断疑似密钥的长 token。原先一律截 12 字符,会把路径、模型名
-            // (claude-sonnet-4-5)、文件名等全部破坏,日志失去排障价值
-            if tok.count >= 24 {
+            // 只截断疑似密钥的 token。旧实现一律截 12 字符会破坏路径/模型名;
+            // 但阈值只按长度 ≥24 会漏掉 16–23 字符的合法 key(key 判定门槛是 16)。
+            // 因此长 token 一律截断,短 token 仅当它长得像 key(如 sk-…/gsk_…/nvapi-…)且不含 /
+            // 时才截断,兼顾日志可读性与密钥不外泄。
+            let looksLikeKey = tok.count >= 16 && !tok.contains("/") && Parser.looksLikeKey(tok)
+            if tok.count >= 24 || looksLikeKey {
                 out += String(tok.prefix(12)) + "…(\(tok.count)ch)"
             } else {
                 out += tok

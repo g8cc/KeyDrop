@@ -21,9 +21,14 @@ public enum ImageAPI {
 
     private static func session(timeout: TimeInterval, proxy: String?) -> URLSession {
         let p = proxy?.trimmingCharacters(in: .whitespaces) ?? ""
+        // 缓存 key 必须包含 timeout:URLRequest.timeoutInterval 只覆盖 request 超时,
+        // 不覆盖 session 的 timeoutIntervalForResource。若只按 proxy 复用,
+        // probe(10s,resource=20s) 建的 session 会被 generate(120s) 命中,
+        // 慢生图会在 ~20s 被资源超时切断。
+        let key = "\(p)|\(timeout)"
         sessionLock.lock()
         defer { sessionLock.unlock() }
-        if let cached = sessionCache[p] { return cached }
+        if let cached = sessionCache[key] { return cached }
         // 上限保护:同 APITester.session(for:)
         if sessionCache.count >= 8 {
             let evicted = sessionCache
@@ -50,7 +55,7 @@ public enum ImageAPI {
             c.connectionProxyDictionary = [:]
         }
         let s = URLSession(configuration: c)
-        sessionCache[p] = s
+        sessionCache[key] = s
         return s
     }
 
@@ -145,19 +150,30 @@ public enum ImageAPI {
 
         let o = NetSync.run(session: session(timeout: timeout, proxy: proxy), request: req, timeout: timeout + 10)
         // 结果处理与旧回调体一致,只是从闭包改为同步执行(竞态已由 NetSync 内部消除)
-        let img: Data = try awaitDecode(o, timeout: timeout)
+        let img: Data = try awaitDecode(o, timeout: timeout, proxy: proxy)
 
         let dir = (ProcessInfo.processInfo.environment["KEYDROP_IMAGES_DIR"]
             ?? (NSHomeDirectory() + "/.keydrop/images"))
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let name = "img-\(Int(Date().timeIntervalSince1970)).png"
+        // 秒级时间戳同秒会互相覆盖;并保证扩展名与实际图片格式一致
+        let name = "img-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6).lowercased()).\(imageExtension(img))"
         let path = dir + "/" + name
         try img.write(to: URL(fileURLWithPath: path))
         return path
     }
 
+    /// 按文件头判断图片格式,避免把 JPEG/WebP 存成 .png 打不开
+    private static func imageExtension(_ d: Data) -> String {
+        guard d.count >= 12 else { return "png" }
+        if d[0] == 0x89, d[1] == 0x50, d[2] == 0x4E, d[3] == 0x47 { return "png" }
+        if d[0] == 0xFF, d[1] == 0xD8 { return "jpg" }
+        if String(data: d[8..<12], encoding: .ascii) == "WEBP" { return "webp" }
+        if String(data: d[0..<3], encoding: .ascii) == "GIF" { return "gif" }
+        return "png"
+    }
+
     /// 把生图接口响应解码成图片数据;错误码/文案保持旧行为
-    private static func awaitDecode(_ o: NetSync.Outcome, timeout: TimeInterval) throws -> Data {
+    private static func awaitDecode(_ o: NetSync.Outcome, timeout: TimeInterval, proxy: String?) throws -> Data {
         if let err = o.error {
             // 超时强制取消的回调在这里到达:给用户可读的超时文案,而非生硬的 "cancelled"
             if (err as? URLError)?.code == .cancelled {
@@ -185,10 +201,14 @@ public enum ImageAPI {
         }
         if let urlStr = first["url"] as? String, let url = URL(string: urlStr) {
             // Data(contentsOf:) 对 http 请求不可取消且无大小上限,挂起的服务端会
-            // 卡住远超预期时长 —— 改走 NetSync 复用带超时的会话
-            let o = NetSync.run(session: session(timeout: 30, proxy: nil), url: url, timeout: 40)
-            guard o.error == nil, let d = o.data, !d.isEmpty else {
-                throw NSError(domain: "ImageAPI", code: -2, userInfo: [NSLocalizedDescriptionKey: "图片 URL 下载失败"])
+            // 卡住远超预期时长 —— 改走 NetSync 复用带超时的会话。
+            // 必须传原代理,否则代理环境下图片下载必失败;并校验 200,
+            // 否则 404/403 的错误页会被当成图片存成 .png
+            let o = NetSync.run(session: session(timeout: 30, proxy: proxy), url: url, timeout: 40)
+            let st = NetSync.statusCode(o)
+            guard o.error == nil, st == 200, let d = o.data, !d.isEmpty else {
+                throw NSError(domain: "ImageAPI", code: -2,
+                              userInfo: [NSLocalizedDescriptionKey: "图片 URL 下载失败(HTTP \(st == 0 ? "超时" : "\(st)"))"])
             }
             return d
         }

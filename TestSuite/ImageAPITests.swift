@@ -113,6 +113,42 @@ enum ImageAPITests {
             t.equal(existed2["opencode"], true, "opencode 二次写入已存在")
             let claude2 = env.read("claude.json")
             t.expect(claude2.components(separatedBy: "keydrop-image").count == 2, "claude 不重复写入")
+
+            // mcpCommand:纯空白 override 不得产生空命令(否则调用方 [0] 越界崩溃)
+            setenv("KEYDROP_MCP_COMMAND", "   ", 1)
+            t.expect(!ImageMCPWriter.mcpCommand().isEmpty, "空白 mcp 命令回退默认而非空数组")
+            setenv("KEYDROP_MCP_COMMAND", "/tmp/fake-keydrop mcp-image", 1)
+
+            // 父目录不存在时也要能写(claude/opencode 默认目录在干净机器上不存在)
+            let env2 = try! TestEnv("img-mcp-nested")
+            defer { env2.cleanup() }
+            setenv("KEYDROP_CLAUDE_SETTINGS", env2.dir + "/nested/claude.json", 1)
+            setenv("KEYDROP_OPENCODE_CONFIG", env2.dir + "/nested/oc/opencode.json", 1)
+            setenv("KEYDROP_CODEX_CONFIG", env2.dir + "/nested/codex/config.toml", 1)
+            do {
+                _ = try ImageMCPWriter.writeAll()
+                t.expect(true, "父目录不存在时 writeAll 成功")
+            } catch {
+                t.expect(false, "父目录不存在时 writeAll 失败: \(error.localizedDescription)")
+            }
+            t.expect(FileManager.default.fileExists(atPath: env2.dir + "/nested/claude.json"), "claude 父目录自动创建")
+            t.expect(FileManager.default.fileExists(atPath: env2.dir + "/nested/oc/opencode.json"), "opencode 父目录自动创建")
+
+            // 单个目标失败不得阻断其余目标
+            let env3 = try! TestEnv("img-mcp-partial")
+            defer { env3.cleanup() }
+            env3.write("bad-claude.json", "{ not json")
+            setenv("KEYDROP_CLAUDE_SETTINGS", env3.dir + "/bad-claude.json", 1)
+            setenv("KEYDROP_CODEX_CONFIG", env3.dir + "/codex.toml", 1)
+            setenv("KEYDROP_OPENCODE_CONFIG", env3.dir + "/opencode.json", 1)
+            do {
+                _ = try ImageMCPWriter.writeAll()
+                t.expect(false, "claude 坏 JSON 应报错")
+            } catch {
+                t.expect(true, "部分失败抛错: \(error.localizedDescription)")
+            }
+            t.contains(env3.read("codex.toml"), "mcp_servers.keydrop-image", "claude 失败不阻断 codex 写入")
+            t.contains(env3.read("opencode.json"), "keydrop-image", "claude 失败不阻断 opencode 写入")
         }
     }
 }
