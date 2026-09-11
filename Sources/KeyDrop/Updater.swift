@@ -250,7 +250,6 @@ final class Updater {
             sleep 1
             open \(Self.shellEscape(runningPath))
             (sleep 8 && rm -rf \(Self.shellEscape(tmp))) &
-            (sleep 6 && rm -rf \(Self.shellEscape(backupPath))) &
             """
             let sh = Process()
             sh.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -267,6 +266,22 @@ final class Updater {
     }
 
     // MARK: - 更新包校验
+
+    /// 启动后延迟清理上次更新留下的 .keydrop-old 备份与 /tmp 更新目录。
+    /// 旧实现由替换脚本在 6 秒后无条件删备份:若新版本一启动就崩,唯一可用的旧版也没了,
+    /// 用户被锁死在坏版本上。改为「新版本正常运行到启动后若干秒」才清理,
+    /// 启动即崩时备份仍在,可手动恢复。
+    static func cleanupAfterUpdate() {
+        let fm = FileManager.default
+        let backup = Bundle.main.bundlePath + ".keydrop-old"
+        if fm.fileExists(atPath: backup) { try? fm.removeItem(atPath: backup) }
+        let tmpRoot = NSTemporaryDirectory()
+        if let entries = try? fm.contentsOfDirectory(atPath: tmpRoot) {
+            for e in entries where e.hasPrefix("KeyDropUpdate-") {
+                try? fm.removeItem(atPath: tmpRoot + e)
+            }
+        }
+    }
 
     /// 校验下载解压出的 KeyDrop.app:身份、版本、可执行文件与 ad-hoc 签名完整性
     private static func verifyNewBundle(at path: String, expectedVersion: String) throws {

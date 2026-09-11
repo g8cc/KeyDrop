@@ -61,22 +61,35 @@ public enum AppLog {
     }
 
     private static func rotateIfNeeded() {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
-              let size = attrs[.size] as? Int64,
-              size >= maxBytes
-        else { return }
+        guard fileSize() >= maxBytes else { return }
+        // 轮转必须跨进程串行:两进程同时轮转会互相覆盖/把行写进已改名的 .1,
+        // 而 moveItem 目标已存在的失败又被 try? 吞掉。用独立 lock 文件 flock 保护。
+        // 不能调 FileLock:它在失败时会调 AppLog,与这里形成递归。
+        let lockPath = dir.appendingPathComponent("keydrop.log.rotate-lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        if fd >= 0 { flock(fd, LOCK_EX) }
+        defer { if fd >= 0 { flock(fd, LOCK_UN); close(fd) } }
+        // 拿到锁后重新判断:等锁期间其它进程可能已经轮转过
+        guard fileSize() >= maxBytes else { return }
         let oldest = dir.appendingPathComponent("keydrop.log.\(maxFiles)")
         try? FileManager.default.removeItem(at: oldest)
         if maxFiles > 1 {
             for i in stride(from: maxFiles - 1, through: 1, by: -1) {
                 let src = dir.appendingPathComponent("keydrop.log.\(i)")
                 if FileManager.default.fileExists(atPath: src.path) {
-                    try? FileManager.default.moveItem(at: src, to: dir.appendingPathComponent("keydrop.log.\(i + 1)"))
+                    let dst = dir.appendingPathComponent("keydrop.log.\(i + 1)")
+                    try? FileManager.default.removeItem(at: dst)
+                    try? FileManager.default.moveItem(at: src, to: dst)
                 }
             }
         }
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("keydrop.log.1"))
         try? FileManager.default.moveItem(at: file, to: dir.appendingPathComponent("keydrop.log.1"))
-        FileManager.default.createFile(atPath: file.path, contents: nil)
+        FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
+    }
+
+    private static func fileSize() -> Int64 {
+        ((try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? Int64) ?? 0
     }
 
     /// 长令牌/密钥截断为前 12 字符 + …,URL 与短串不受影响

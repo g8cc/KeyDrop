@@ -83,6 +83,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.setupUpdater()
         }
 
+        // 更新成功后延迟清理旧包备份(见 Updater.cleanupAfterUpdate):以「新版本已正常运行 15 秒」
+        // 作为成功判据,而不是由替换脚本无条件定时删;启动即崩时备份仍在,可手动恢复
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 15) {
+            Updater.cleanupAfterUpdate()
+        }
+
         // selfHeal 的对账可能逐条做网络测试(单条最长 10s),放后台避免阻塞主线程卡启动
         DispatchQueue.global(qos: .utility).async {
             let healed = Core.shared.selfHeal()

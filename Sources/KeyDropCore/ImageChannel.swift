@@ -34,13 +34,23 @@ public enum ImageChannelStore {
         )
         let data = try JSONEncoder().encode(c)
         let tmp = url.appendingPathExtension("tmp")
-        try data.write(to: tmp, options: .atomic)
+        try? FileManager.default.removeItem(at: tmp)
         // 文件内容是明文 key,权限对齐 history.json(600)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
-        if FileManager.default.fileExists(atPath: url.path) {
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        } else {
-            try FileManager.default.moveItem(at: tmp, to: url)
+        do {
+            try data.write(to: tmp, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+            if FileManager.default.fileExists(atPath: url.path) {
+                // replaceItemAt 会保留【原文件】的权限/ACL,若原文件是 0644,
+                // 新文件的 600 会被丢弃 —— 替换后再收一次
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: url)
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        } catch {
+            // 失败时清掉 .tmp(内含明文 key),不留在磁盘上
+            try? FileManager.default.removeItem(atPath: tmp.path)
+            throw error
         }
     }
 }

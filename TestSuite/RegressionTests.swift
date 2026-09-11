@@ -727,5 +727,21 @@ enum RegressionTests {
             try? FileLock.withLock(lockPath) { }
             t.expect(FileManager.default.fileExists(atPath: lockPath), "锁文件父目录自动创建")
         }
+
+        // 修复:ClashWriter 曾对所有协议统一写 uuid:,trojan/hysteria2 在 mihomo 里因缺 password 失败。
+        h.runSuite("Regression.Clash 凭据字段按协议") { t in
+            let env = try! TestEnv("reg-clash-cred")
+            defer { env.cleanup() }
+            let trojan = ClashProxy(name: "tj", type: "trojan", server: "s.example.org", port: 443,
+                                    uuid: "pw123", sni: "s.example.org")
+            let vless = ClashProxy(name: "vl", type: "vless", server: "s.example.org", port: 443,
+                                   uuid: "11111111-2222-3333-4444-555555555555", sni: "s.example.org")
+            let (msg, file) = try! Core.addClashProxies([trojan, vless])
+            t.expect(file != nil, "生成订阅文件: \(msg)")
+            let yaml = (try? String(contentsOfFile: env.dir + "/clash-profiles/" + (file ?? ""), encoding: .utf8)) ?? ""
+            t.contains(yaml, "type: trojan", "trojan 节点写入")
+            t.contains(yaml, "password: \"pw123\"", "trojan 用 password 字段(修复前误写 uuid)")
+            t.contains(yaml, "uuid: \"11111111", "vless 仍用 uuid 字段")
+        }
     }
 }

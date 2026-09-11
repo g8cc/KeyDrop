@@ -53,7 +53,9 @@ final class ClashWriter {
               type: \(yamlScalar(p.type))
               server: \(yamlScalar(p.server))
               port: \(p.port)
-              uuid: \(yamlQuote(p.uuid))
+            """
+            yaml += credentialLine(for: p)
+            yaml += """
               sni: \(yamlScalar(p.sni))
               skip-cert-verify: \(p.skipCertVerify)
               udp: \(p.udp)
@@ -82,6 +84,26 @@ final class ClashWriter {
             msg += ", 跳过 \(proxies.count - valid.count) 个无效节点"
         }
         return (msg, "\(name).yaml")
+    }
+
+    /// 凭据字段名随协议不同:anytls/vless/vmess 用 uuid,trojan/hysteria2 用 password,
+    /// ss 用 cipher+password。旧实现一律写 `uuid:`,导致 trojan/ss/hysteria2 节点
+    /// 在 mihomo 里因缺 password 而加载失败(被静默丢弃)。
+    private static func credentialLine(for p: ClashProxy) -> String {
+        let t = p.type.lowercased()
+        if t == "ss" {
+            // ss://method:password → 拆出 cipher;不含冒号只能写 password(尽力而为)
+            if let colon = p.uuid.firstIndex(of: ":") {
+                let cipher = String(p.uuid[..<colon])
+                let pass = String(p.uuid[p.uuid.index(after: colon)...])
+                return "    cipher: \(yamlScalar(cipher))\n    password: \(yamlQuote(pass))\n"
+            }
+            return "    password: \(yamlQuote(p.uuid))\n"
+        }
+        if t == "trojan" || t == "hysteria2" || t == "hy2" {
+            return "    password: \(yamlQuote(p.uuid))\n"
+        }
+        return "    uuid: \(yamlQuote(p.uuid))\n"
     }
 
     private static func yamlScalar(_ s: String) -> String {

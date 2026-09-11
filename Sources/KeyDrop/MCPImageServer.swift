@@ -125,8 +125,13 @@ enum MCPImageServer {
                 result = nil
                 errResp = ["code": -32601, "message": "未知方法: \(method)"]
             }
-            response["result"] = result ?? NSNull()
-            response["error"] = errResp ?? NSNull()
+            // JSON-RPC 2.0:result 与 error 只能出现其一。旧实现两个键都写(其中一个为 NSNull),
+            // 部分客户端用 `"error" in msg` 判断失败,会把成功响应(含 error:null)当错误处理。
+            if let errResp {
+                response["error"] = errResp
+            } else {
+                response["result"] = result ?? [:]
+            }
             let data = (try? JSONSerialization.data(withJSONObject: response)) ?? Data()
             let frame = "Content-Length: \(data.count)\r\n\r\n".data(using: .utf8)! + data
             stdout.write(frame)

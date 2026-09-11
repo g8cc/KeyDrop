@@ -149,6 +149,16 @@ enum ImageAPITests {
             }
             t.contains(env3.read("codex.toml"), "mcp_servers.keydrop-image", "claude 失败不阻断 codex 写入")
             t.contains(env3.read("opencode.json"), "keydrop-image", "claude 失败不阻断 opencode 写入")
+
+            // 修复:replaceItemAt 会保留旧文件权限,明文 key 文件必须先造 0644 再存 600
+            let env4 = try! TestEnv("img-perm")
+            defer { env4.cleanup() }
+            let chPath = env4.dir + "/image-channel.json"
+            try! Data("{}".utf8).write(to: URL(fileURLWithPath: chPath))
+            try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: chPath)
+            try! ImageChannelStore.save(ImageChannel(url: "https://x.example.com", key: "sk-abcdef1234567890", model: "m"))
+            let perms = (try! FileManager.default.attributesOfItem(atPath: chPath))[.posixPermissions] as? NSNumber
+            t.equal(perms?.intValue, 0o600, "明文渠道文件权限收紧为 600(不被 replaceItemAt 保留旧权限)")
         }
     }
 }

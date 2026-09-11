@@ -12,6 +12,11 @@ enum UpdaterTests {
             t.equal(Version.compare("1.0.0", "1.0.0"), .orderedSame, "相同")
             t.equal(Version.compare("1.0.0.1", "1.0.0"), .orderedDescending, "多段数字")
             t.equal(Version.compare("1.0.1-beta", "1.0.0"), .orderedDescending, "后缀忽略")
+            // 修复:compactMap 会因溢出/非数字丢段造成错位
+            t.equal(Version.compare("1.99999999999999999999", "1.5"), .orderedDescending,
+                    "超长数字段视为极大,不因溢出丢弃")
+            t.equal(Version.compare("1.foo.5", "1.2.0"), .orderedAscending, "非数字段按 0 保留段位")
+            t.equal(Version.compare("1.2.0", "1.foo.5"), .orderedDescending, "非数字段比较对称")
         }
     }
 }
