@@ -9,6 +9,7 @@ enum CLI {
             return 0
         }
         var ccOverride: Bool? = nil
+        var grokOverride: Bool? = nil
         var cpaOverride: Bool? = nil
         var dshOverride: Bool? = nil
         var modelsOverride: [String] = []
@@ -25,6 +26,8 @@ enum CLI {
             switch t {
             case "--cc": ccOverride = true
             case "--no-cc": ccOverride = false
+            case "--grok": grokOverride = true
+            case "--no-grok": grokOverride = false
             case "--cpa": cpaOverride = true
             case "--no-cpa": cpaOverride = false
             case "--dsh": dshOverride = true
@@ -76,13 +79,14 @@ enum CLI {
         case "add":
             let text = inputText(from: remaining)
             guard !text.isEmpty else {
-                print("用法: KeyDrop --add <key内容> [--cc] [--no-cc] [--cpa] [--no-cpa] [--dsh] [--no-dsh] [--cpa-config <path>] [--proxy <url>]")
+                print("用法: KeyDrop --add <key内容> [--cc] [--no-cc] [--grok] [--no-grok] [--cpa] [--no-cpa] [--dsh] [--no-dsh] [--cpa-config <path>] [--proxy <url>]")
                 return 2
             }
             do {
                 let outcome = try Core.shared.add(
                     raw: text,
                     ccOverride: ccOverride,
+                    grokOverride: grokOverride,
                     cpaOverride: cpaOverride,
                     dshOverride: dshOverride,
                     models: modelsOverride.isEmpty ? nil : modelsOverride,
@@ -348,8 +352,8 @@ enum CLI {
     用法:
       KeyDrop                        启动菜单栏小窗
       KeyDrop --add "<内容>"         解析→测试→选模型→添加(明文/base64/JSON/zip路径/文件路径/curl命令)
-                                      [--cc|--no-cc] [--cpa|--no-cpa] [--cpa-config <path>]
-                                       [--app claude|opencode|codex] [--model 名称1,名称2] [--force 跳过测试]
+                                      [--cc|--no-cc] [--grok|--no-grok] [--cpa|--no-cpa] [--cpa-config <path>]
+                                       [--app claude|opencode|codex|grok] [--model 名称1,名称2] [--force 跳过测试]
                                        [--proxy http://127.0.0.1:7890] (或环境变量 KEYDROP_PROXY)
       KeyDrop --parse "<内容>"       只看解析结果,不写入
       KeyDrop --list                 历史记录

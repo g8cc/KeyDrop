@@ -26,6 +26,7 @@ public final class Core {
     public func add(
         raw: String,
         ccOverride: Bool? = nil,
+        grokOverride: Bool? = nil,
         cpaOverride: Bool? = nil,
         dshOverride: Bool? = nil,
         models: [String]? = nil,
@@ -269,7 +270,14 @@ public final class Core {
         }
         parsed.model = selectedModels.first
 
-        let resolvedAppType = Self.routeAppType(selectedModels: selectedModels, modelsOverride: models, default: appType, forced: appTypeForced)
+        let useGrok = grokOverride ?? prefs.useGrok
+        let routedAppType = Self.routeAppType(selectedModels: selectedModels, modelsOverride: models, default: appType, forced: appTypeForced)
+        // Grok Build is opt-out. If disabled, a pure Grok selection falls back to
+        // OpenCode; a mixed Grok/non-Grok selection already routes to OpenCode.
+        // 显式 --app grok 同样服从 --no-grok:routeAppType 的 forced 分支已保证只有
+        // 纯 Grok 列表才路由 grok,若此处豁免,useGrok=false 时 grok 写入块与
+        // cc 写入块(resolvedAppType != "grok" 才进)双双跳过 → 「没有选中的目标」死路
+        let resolvedAppType = routedAppType == "grok" && !useGrok ? "opencode" : routedAppType
         if resolvedAppType != appType {
             notes.append("按所选模型导入到 \(resolvedAppType)")
         }
@@ -293,11 +301,18 @@ public final class Core {
             // 这些目标在外部配置中仍然存在,删除时必须继续负责清理。
             // ccswitch 目标只在本次重新写入 cc 时才重建;本次开关关闭时必须保留,
             // 否则 cc-switch 里的旧 provider 变孤儿 —— delete/reconcile 都不再认领它
-            targets: dup?.targets.filter { $0.hasPrefix("ccswitch") ? !useCC : true } ?? [],
+            targets: dup?.targets.filter {
+                if $0.hasPrefix("ccswitch") { return !useCC || resolvedAppType == "grok" }
+                // Keep the old Grok tag until the replacement target is written;
+                // on a failed route change it must remain deletable/reconcilable.
+                if $0 == "grok" { return true }
+                return true
+            } ?? [],
             ccProviderID: dup?.ccProviderID,
-            ccRenamedFrom: nil,
-            ccRenamedTo: nil,
-            cpaConfigPath: nil,
+            ccRenamedFrom: dup?.ccRenamedFrom,
+            ccRenamedTo: dup?.ccRenamedTo,
+            cpaConfigPath: dup?.cpaConfigPath,
+            grokConfigPath: dup?.grokConfigPath,
             status: "active",
             health: addHealth?.health,
             healthDetail: addHealth?.detail,
@@ -315,7 +330,7 @@ public final class Core {
         var anyOK = false
         var anyTarget = false
 
-        if useCC {
+        if useCC && resolvedAppType != "grok" {
             anyTarget = true
             let appTag = resolvedAppType == "claude" ? "ccswitch" : "ccswitch-\(resolvedAppType)"
             do {
@@ -382,6 +397,49 @@ public final class Core {
             }
         }
 
+        if useGrok && resolvedAppType == "grok" {
+            anyTarget = true
+            do {
+                let writer = GrokBuildWriter(configPath: dup?.grokConfigPath)
+                let msg = try writer.sync(
+                    baseURL: url,
+                    key: key,
+                    models: selectedModels,
+                    removing: dup?.models ?? (dup?.model.map { [$0] } ?? [])
+                )
+                entry.grokConfigPath = writer.configPath
+                if !entry.targets.contains("grok") { entry.targets.append("grok") }
+                anyOK = true
+                lines.append("✓ Grok Build: \(msg)")
+
+                // Route migrations are written first, then the old cc-switch
+                // provider is removed so a failed new write remains recoverable.
+                if let dup, let oldPID = dup.ccProviderID,
+                   dup.targets.contains(where: { $0.hasPrefix("ccswitch") }) {
+                    let oldAppType = dup.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                        .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                    if cc.providerExists(oldPID, appType: oldAppType) {
+                        do {
+                            _ = try cc.remove(providerID: oldPID, renamedFrom: dup.ccRenamedFrom,
+                                              renamedTo: dup.ccRenamedTo, appType: oldAppType)
+                            entry.targets.removeAll { $0.hasPrefix("ccswitch") }
+                            entry.ccProviderID = nil
+                            entry.ccRenamedFrom = nil
+                            entry.ccRenamedTo = nil
+                            lines.append("↺ 家族变化: 已移除旧 \(oldAppType) provider")
+                        } catch {
+                            lines.append("⚠ 旧 \(oldAppType) provider 清理失败(可能残留孤儿): \(error.localizedDescription)")
+                        }
+                    }
+                }
+            } catch {
+                lines.append("✗ Grok Build 失败: \(error.localizedDescription)")
+                if let dup, dup.targets.contains("grok"), !entry.targets.contains("grok") {
+                    entry.targets.append("grok")
+                }
+            }
+        }
+
         if useCPA {
             anyTarget = true
             if let cfg = prefs.resolvedCPAConfig() {
@@ -424,8 +482,27 @@ public final class Core {
             }
         }
 
+        // Remove an old Grok route only after at least one replacement target
+        // succeeded. This also covers CPA-only imports and --no-cc.
+        if resolvedAppType != "grok", anyOK,
+           let dup, dup.targets.contains("grok"),
+           let oldURL = dup.url, let oldKey = dup.key,
+           let oldPath = dup.grokConfigPath {
+            do {
+                _ = try GrokBuildWriter(configPath: oldPath).remove(
+                    baseURL: oldURL,
+                    key: oldKey,
+                    models: dup.models ?? (dup.model.map { [$0] } ?? [])
+                )
+                entry.targets.removeAll { $0 == "grok" }
+                lines.append("↺ 已移除旧 Grok Build 模型配置")
+            } catch {
+                lines.append("⚠ Grok Build 旧配置清理失败: \(error.localizedDescription)")
+            }
+        }
+
         if !anyTarget {
-            throw ParseError.io("没有选中的目标(cc-switch / CPA)")
+            throw ParseError.io("没有选中的目标(cc-switch / Grok Build / CPA)")
         }
 
         entry.status = anyOK ? "active" : "error"
@@ -469,6 +546,7 @@ public final class Core {
                         merged.targets.append(t)
                     }
                     if merged.cpaConfigPath == nil { merged.cpaConfigPath = entry.cpaConfigPath }
+                    if merged.grokConfigPath == nil { merged.grokConfigPath = entry.grokConfigPath }
                     try history.update(merged)
                     entry = merged
                     lines.append("↻ 检测到同 key 已被其他端导入,已合并到既有记录(\(survivor.id.prefix(8)))")
@@ -694,6 +772,15 @@ public final class Core {
         return l.contains("claude") || l.contains("sonnet") || l.contains("opus") || l.contains("haiku") || l.contains("fable")
     }
 
+    /// Grok Build family: accept ids such as `grok-4.6`, `grok-imagine-image`,
+    /// and namespaced ids such as `xai/grok-video`, without matching words like
+    /// `grokking` by accident.
+    public static func isGrokModel(_ m: String) -> Bool {
+        let l = m.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !l.isEmpty else { return false }
+        return l.range(of: #"(?:^|[^a-z0-9])grok(?:$|[-._:/0-9])"#, options: .regularExpression) != nil
+    }
+
     /// gpt 系模型判定(chat/responses 系 → codex)。
     /// 只认 gpt 后紧跟数字或 -oss 的家族(gpt-4o / gpt-5 / gpt-oss / openai/gpt-4.5 等);
     /// gpt-image / gpt-vision / gpt-realtime / gpt-ocr 等非 chat 模型不认。
@@ -707,9 +794,19 @@ public final class Core {
     }
 
     public static func routeAppType(selectedModels: [String], modelsOverride: [String]?, default appType: String, forced: Bool = false) -> String {
-        if forced { return appType }
         let list = (modelsOverride?.isEmpty == false ? modelsOverride! : selectedModels)
+        if forced {
+            // `--app grok` may select the Grok target explicitly, but it must
+            // not override the safety rule for a mixed model selection.
+            if appType == "grok" {
+                return !list.isEmpty && list.allSatisfy(isGrokModel) ? "grok" : "opencode"
+            }
+            return appType
+        }
         if list.isEmpty { return appType }
+        if list.allSatisfy(isGrokModel) { return "grok" }
+        // A mixed Grok list must stay in the general OpenCode route.
+        if list.contains(where: isGrokModel) { return "opencode" }
         if list.contains(where: { isClaudeModel($0) }) { return "claude" }
         if list.contains(where: { isGptModel($0) }) { return "codex" }
         return "opencode"
@@ -721,7 +818,7 @@ public final class Core {
     /// 它仍是对话模型,不含 image/embed 等纯非 chat 标记)。真实事故:fal-ai/gpt-image-2 被当 codex 默认模型。
     public static func isNonChatModel(_ m: String) -> Bool {
         let l = m.lowercased()
-        return l.range(of: #"(?:^|[-/._])(image|dall|dalle|flux|sora|whisper|tts|embed|embedding|rerank|reranker|moderation|realtime|ocr|speech|audio)\b"#, options: .regularExpression) != nil
+        return l.range(of: #"(?:^|[-/._])(image|dall|dalle|flux|sora|video|whisper|tts|embed|embedding|rerank|reranker|moderation|realtime|ocr|speech|audio)\b"#, options: .regularExpression) != nil
     }
 
     /// 已知 chat 家族(deepseek/qwen/kimi/glm/llama/mistral/minimax/mimo/longcat/grok/yi/phi 等)。
@@ -736,7 +833,7 @@ public final class Core {
     /// 调用方:opencode 写入的 firstModel。模型列表本身不变(用户勾选的仍可写入 models 字典),
     /// 仅「激活默认」不应落到图生模型上。
     public static func preferredChatModel(_ models: [String]) -> String? {
-        let chatFamily = models.first(where: { looksLikeChatFamily($0) })
+        let chatFamily = models.first(where: { looksLikeChatFamily($0) && !isNonChatModel($0) })
         if let chatFamily { return chatFamily }
         return models.first(where: { !isNonChatModel($0) && !$0.isEmpty })
     }
@@ -835,7 +932,8 @@ public final class Core {
         entry.health = quotaNote != nil ? "quota" : "ok"
         entry.healthDetail = quotaNote ?? test.detail
         entry.healthAt = Date().timeIntervalSince1970
-        let currentModels = Set(entry.models ?? (entry.model.map { [$0] } ?? []))
+        let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
+        let currentModels = Set(previousModels)
         let testModels = test.models.filter { Parser.looksLikeModel($0) }
 
         // ccswitch 同步/迁移闭包:统一处理「家族不变 → 原地 sync」与「家族变化 → 迁移」。
@@ -852,9 +950,36 @@ public final class Core {
             let oldTag = entry.targets.first(where: { $0.hasPrefix("ccswitch") }) ?? "ccswitch"
             let oldAppType = oldTag.hasPrefix("ccswitch-")
                 ? String(oldTag.dropFirst("ccswitch-".count)) : "claude"
-            let newAppType = Self.routeAppType(
+            let routedAppType = Self.routeAppType(
                 selectedModels: [], modelsOverride: models, default: oldAppType, forced: false
             )
+            // The Grok preference controls new imports. An existing Grok entry
+            // remains in Grok Build while it is being refreshed.
+            let newAppType = routedAppType
+            if newAppType == "grok" {
+                do {
+                    let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
+                    let msg = try writer.sync(
+                        baseURL: url,
+                        key: key,
+                        models: models,
+                        removing: previousModels
+                    )
+                    _ = try? cc.remove(providerID: oldPid, renamedFrom: entry.ccRenamedFrom,
+                                       renamedTo: entry.ccRenamedTo, appType: oldAppType)
+                    entry.targets.removeAll { $0.hasPrefix("ccswitch") }
+                    entry.targets.append("grok")
+                    entry.ccProviderID = nil
+                    entry.ccRenamedFrom = nil
+                    entry.ccRenamedTo = nil
+                    entry.grokConfigPath = writer.configPath
+                    entry.models = models
+                    entry.model = models.first
+                    return "已迁移: \(oldAppType) → Grok Build(\(msg))"
+                } catch {
+                    return "⚠ 迁移到 Grok Build 失败: \(error.localizedDescription)"
+                }
+            }
             // 家族不变:原地 sync models,不动 targets/pid
             if newAppType == oldAppType {
                 var p = ParsedKey()
@@ -888,9 +1013,63 @@ public final class Core {
             }
         }
 
+        func grokSyncOrMigrate(_ entry: inout HistoryEntry, models: [String]) -> String? {
+            guard entry.targets.contains("grok"),
+                  let url = entry.url, let key = entry.key, !key.isEmpty else { return nil }
+            let routedAppType = Self.routeAppType(
+                selectedModels: [], modelsOverride: models, default: "grok", forced: false
+            )
+            // The Grok preference controls new imports. An existing Grok entry
+            // remains in Grok Build while it is being refreshed.
+            let newAppType = routedAppType
+            if newAppType == "grok" {
+                do {
+                    let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
+                    let msg = try writer.sync(
+                        baseURL: url,
+                        key: key,
+                        models: models,
+                        removing: previousModels
+                    )
+                    entry.grokConfigPath = writer.configPath
+                    entry.models = models
+                    entry.model = models.first
+                    return "Grok Build 已同步(\(msg))"
+                } catch {
+                    return "⚠ Grok Build 同步失败: \(error.localizedDescription)"
+                }
+            }
+
+            var p = ParsedKey()
+            p.url = url
+            p.key = key
+            p.model = models.first
+            do {
+                let r = try cc.add(p, nameOverride: entry.name,
+                                   appType: newAppType, models: models, proxy: proxyForHealth())
+                if let path = entry.grokConfigPath {
+                    _ = try? GrokBuildWriter(configPath: path).remove(
+                        baseURL: url, key: key,
+                        models: entry.models ?? (entry.model.map { [$0] } ?? [])
+                    )
+                }
+                entry.targets.removeAll { $0 == "grok" }
+                entry.targets.append(newAppType == "claude" ? "ccswitch" : "ccswitch-\(newAppType)")
+                entry.ccProviderID = r.providerID
+                entry.ccRenamedFrom = r.renamedFrom
+                entry.ccRenamedTo = r.renamedTo
+                entry.models = models
+                entry.model = models.first
+                return "已迁移: Grok Build → \(newAppType)"
+            } catch {
+                return "⚠ Grok Build → \(newAppType) 迁移失败: \(error.localizedDescription)"
+            }
+        }
+
         if testModels.isEmpty {
             // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
-            let migrateNote = ccSyncOrMigrate(&entry, models: currentModels.sorted())
+            let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
+                ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
             // 必须在 ccSyncOrMigrate 之后再落盘:它可能就地修改 entry(targets/ccProviderID/models),
             // 提前落盘会把迁移结果丢掉,而旧 provider 已删 → 历史指向已删 provider 的孤儿态
             // (下面「模型无变化」分支即为此处的正确写法)
@@ -905,7 +1084,8 @@ public final class Core {
         if !modelsChanged {
             historyUpdateLogged(entry)
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
-            let migrateNote = ccSyncOrMigrate(&entry, models: currentModels.sorted())
+            let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
+                ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
             try history.update(entry)
             let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
@@ -934,7 +1114,8 @@ public final class Core {
 
         var syncWarn: String? = nil
         // 主分支:模型已变化,ccSyncOrMigrate 会按新模型列表决定原地 sync 还是迁移家族
-        syncWarn = ccSyncOrMigrate(&entry, models: filtered)
+        syncWarn = grokSyncOrMigrate(&entry, models: filtered)
+            ?? ccSyncOrMigrate(&entry, models: filtered)
 
         if entry.targets.contains("dsh") {
             _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: filtered)
@@ -962,7 +1143,8 @@ public final class Core {
         }
 
         var lines: [String] = []
-        var newModels = entry.models ?? (entry.model.map { [$0] } ?? [])
+        let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
+        var newModels = previousModels
 
         if let models, !models.isEmpty {
             var verified: [String] = []
@@ -997,6 +1179,77 @@ public final class Core {
 
         if newModels.isEmpty && name == nil {
             return "无变更"
+        }
+
+        let routedAppType = Self.routeAppType(
+            selectedModels: [], modelsOverride: newModels,
+            default: entry.targets.contains("grok") ? "grok" : "opencode"
+        )
+        // Editing an existing entry preserves its current target family. The
+        // preference is an import switch, not a destructive migration switch.
+        let desiredAppType = routedAppType
+
+        // Editing can change a provider family. Keep Grok Build and cc-switch
+        // mutually exclusive for the selected model set.
+        if desiredAppType == "grok",
+           entry.targets.contains(where: { $0.hasPrefix("ccswitch") }) {
+            do {
+                let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
+                let msg = try writer.sync(baseURL: url, key: key, models: newModels, removing: [])
+                if let pid = entry.ccProviderID {
+                    let oldTag = entry.targets.first(where: { $0.hasPrefix("ccswitch") }) ?? "ccswitch"
+                    let oldApp = oldTag.hasPrefix("ccswitch-")
+                        ? String(oldTag.dropFirst("ccswitch-".count)) : "claude"
+                    _ = try? cc.remove(providerID: pid, renamedFrom: entry.ccRenamedFrom,
+                                       renamedTo: entry.ccRenamedTo, appType: oldApp)
+                }
+                entry.targets.removeAll { $0.hasPrefix("ccswitch") }
+                if !entry.targets.contains("grok") { entry.targets.append("grok") }
+                entry.ccProviderID = nil
+                entry.ccRenamedFrom = nil
+                entry.ccRenamedTo = nil
+                entry.grokConfigPath = writer.configPath
+                lines.append("✓ Grok Build: \(msg)")
+            } catch {
+                lines.append("⚠ Grok Build 同步失败: \(error.localizedDescription)")
+            }
+        } else if desiredAppType == "grok", entry.targets.contains("grok") {
+            do {
+                let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
+                let msg = try writer.sync(
+                    baseURL: url,
+                    key: key,
+                    models: newModels,
+                    removing: previousModels
+                )
+                entry.grokConfigPath = writer.configPath
+                lines.append("✓ Grok Build: \(msg)")
+            } catch {
+                lines.append("⚠ Grok Build 同步失败: \(error.localizedDescription)")
+            }
+        } else if desiredAppType != "grok", entry.targets.contains("grok") {
+            var p = ParsedKey()
+            p.url = url
+            p.key = key
+            p.model = newModels.first
+            do {
+                let r = try cc.add(p, nameOverride: entry.name,
+                                   appType: desiredAppType, models: newModels, proxy: proxyForHealth())
+                if let path = entry.grokConfigPath {
+                    _ = try? GrokBuildWriter(configPath: path).remove(
+                        baseURL: url, key: key,
+                        models: previousModels
+                    )
+                }
+                entry.targets.removeAll { $0 == "grok" }
+                entry.targets.append(desiredAppType == "claude" ? "ccswitch" : "ccswitch-\(desiredAppType)")
+                entry.ccProviderID = r.providerID
+                entry.ccRenamedFrom = r.renamedFrom
+                entry.ccRenamedTo = r.renamedTo
+                lines.append("✓ 已迁移: Grok Build → \(desiredAppType)")
+            } catch {
+                lines.append("⚠ Grok Build → \(desiredAppType) 迁移失败: \(error.localizedDescription)")
+            }
         }
 
         // 同步 cc-switch
@@ -1044,7 +1297,11 @@ public final class Core {
         }
 
         let models = entry.models ?? (entry.model.map { [$0] } ?? [])
-        let appType = Self.routeAppType(selectedModels: models, modelsOverride: nil, default: "claude")
+        // CPA can aggregate multiple keys and Grok Build stores one key per
+        // model table. A CPA activation therefore falls back to OpenCode for
+        // pure Grok model lists instead of attempting an unsupported app type.
+        let routedAppType = Self.routeAppType(selectedModels: models, modelsOverride: nil, default: "claude")
+        let appType = routedAppType == "grok" ? "opencode" : routedAppType
 
         var p = ParsedKey()
         p.url = ep.baseURL
@@ -1147,6 +1404,26 @@ public final class Core {
             } else {
                 // 旧条目没有 clashFile、文件已不在、或删除失败:如实告知
                 lines.append("✓ Clash: 已从 KeyDrop 目标列表移除(订阅 yaml 仍保留在 profiles 目录,可手动删除)")
+            }
+        }
+
+        if entry.targets.contains("grok") {
+            if let path = entry.grokConfigPath,
+               let url = entry.url,
+               let key = entry.key, !key.isEmpty {
+                do {
+                    let msg = try GrokBuildWriter(configPath: path).remove(
+                        baseURL: url,
+                        key: key,
+                        models: entry.models ?? (entry.model.map { [$0] } ?? [])
+                    )
+                    lines.append("✓ Grok Build: \(msg)")
+                    remaining.removeAll { $0 == "grok" }
+                } catch {
+                    failures.append("Grok Build: \(error.localizedDescription)")
+                }
+            } else {
+                failures.append("Grok Build: 历史记录缺少配置路径、URL 或 key")
             }
         }
 

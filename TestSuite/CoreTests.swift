@@ -23,6 +23,85 @@ enum CoreTests {
             t.equal(Core.routeAppType(selectedModels: ["gpt-5.6-sol"], modelsOverride: nil, default: "opencode", forced: true), "opencode", "forced 覆盖规则")
             // 空列表 → 默认
             t.equal(Core.routeAppType(selectedModels: [], modelsOverride: nil, default: "claude"), "claude", "空列表回退默认")
+            // Grok Build:纯 Grok 才路由 Grok,混入其他家族必须回 OpenCode
+            t.expect(Core.isGrokModel("grok-4.6"), "识别 grok-4.6")
+            t.expect(Core.isGrokModel("xai/grok-video"), "识别命名空间 Grok 视频模型")
+            t.expect(!Core.isGrokModel("grokking-helper"), "不误判 grokking")
+            t.equal(Core.routeAppType(selectedModels: ["grok-4.6"], modelsOverride: nil, default: "opencode"), "grok", "纯 Grok → Grok Build")
+            t.equal(Core.routeAppType(selectedModels: ["grok-4.6", "grok-imagine-image"], modelsOverride: nil, default: "opencode"), "grok", "多种 Grok → Grok Build")
+            t.equal(Core.routeAppType(selectedModels: ["grok-4.6", "deepseek-v4"], modelsOverride: nil, default: "opencode"), "opencode", "Grok+其他 → OpenCode")
+            t.equal(Core.routeAppType(selectedModels: ["grok-4.6", "gpt-5"], modelsOverride: nil, default: "opencode"), "opencode", "Grok+GPT → OpenCode")
+            t.equal(Core.routeAppType(selectedModels: ["grok-4.6"], modelsOverride: nil, default: "grok", forced: true), "grok", "显式 Grok + 纯 Grok → Grok Build")
+            t.equal(Core.routeAppType(selectedModels: ["deepseek-v4"], modelsOverride: nil, default: "grok", forced: true), "opencode", "显式 Grok + 非 Grok → OpenCode")
+            t.equal(Core.routeAppType(selectedModels: ["grok-4.6", "deepseek-v4"], modelsOverride: nil, default: "grok", forced: true), "opencode", "显式 Grok + 混合 → OpenCode")
+            t.expect(Core.isNonChatModel("grok-video"), "Grok 视频模型不作为文本默认模型")
+            t.equal(Core.preferredChatModel(["grok-video", "deepseek-v4"]), "deepseek-v4", "混合时跳过 Grok 视频默认模型")
+        }
+
+        h.runSuite("Core.Grok Build 导入路由") { t in
+            let env = try! TestEnv("core-grok")
+            defer { env.cleanup() }
+            let core = Core()
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """)
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """)
+            let pure = try! core.add(
+                raw: "https://grok.example.org/v1 sk-grok-route-1111111111",
+                ccOverride: true, grokOverride: true, cpaOverride: false, dshOverride: false,
+                models: ["grok-4.6", "xai/grok-video"], force: true,
+                appType: "opencode", appTypeForced: false
+            )
+            t.equal(pure.entry.targets, ["grok"], "纯 Grok 不写 cc-switch")
+            t.equal(pure.entry.grokConfigPath, env.dir + "/grok-config.toml", "记录 Grok 配置路径")
+            let config = env.read("grok-config.toml")
+            t.contains(config, "[model.\"grok-4.6\"]", "写入 Grok 文本模型")
+            t.contains(config, "[model.\"xai/grok-video\"]", "写入 Grok 视频模型")
+
+            let refreshed = try! core.add(
+                raw: "https://grok.example.org/v1 sk-grok-route-1111111111",
+                ccOverride: true, grokOverride: true, cpaOverride: false, dshOverride: false,
+                models: ["grok-4.6"], force: true,
+                appType: "opencode", appTypeForced: false
+            )
+            let updated = env.read("grok-config.toml")
+            t.expect(!updated.contains("xai/grok-video"), "幂等更新移除旧 Grok 模型")
+            t.contains(updated, "grok-4.6", "幂等更新保留新 Grok 模型")
+            t.equal(refreshed.entry.targets, ["grok"], "幂等更新仍归属 Grok Build")
+
+            let deleted = try! core.delete(entryIDPrefix: refreshed.entry.id)
+            t.contains(deleted, "Grok Build", "删除提示 Grok Build")
+            t.expect(!env.read("grok-config.toml").contains("grok-4.6"), "删除清理 Grok 模型段")
+
+            let mixed = try! core.add(
+                raw: "https://grok.example.org/v1 sk-grok-mixed-2222222222",
+                ccOverride: true, grokOverride: true, cpaOverride: false, dshOverride: false,
+                models: ["grok-4.6", "deepseek-v4"], force: true,
+                appType: "opencode", appTypeForced: false
+            )
+            t.equal(mixed.entry.targets, ["ccswitch-opencode"], "混合模型走 OpenCode")
+            t.expect(!env.read("grok-config.toml").contains("sk-grok-mixed-2222222222"), "混合模型不写 Grok Build")
+
+            // 回归:显式 --app grok 但 --no-grok(grokOverride=false)必须降级 OpenCode 走 cc-switch。
+            // 旧 explicitGrok 豁免让路由保持 grok:grok 块(useGrok=false)与 cc 块
+            // (resolvedAppType=="grok")双双跳过,CPA/DSH 也关时直接抛「没有选中的目标」死路
+            let noGrok = try! core.add(
+                raw: "https://grok.example.org/v1 sk-grok-disabled-3333333333",
+                ccOverride: true, grokOverride: false, cpaOverride: false, dshOverride: false,
+                models: ["grok-4.6"], force: true,
+                appType: "grok", appTypeForced: true
+            )
+            t.equal(noGrok.entry.targets, ["ccswitch-opencode"], "--app grok + --no-grok 降级 OpenCode 写 cc-switch")
+            t.expect(!env.read("grok-config.toml").contains("sk-grok-disabled-3333333333"), "降级后不写 Grok Build 配置")
         }
 
         h.runSuite("Core.healthFor") { t in

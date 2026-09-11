@@ -19,3 +19,6 @@ data/
 *.log
 *.tmp
 *.bak
+
+# 本地临时实验产物(grok CLI 手测残留)
+.tmp-*

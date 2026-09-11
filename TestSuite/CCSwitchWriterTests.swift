@@ -48,6 +48,8 @@ enum CCSwitchWriterTests {
             // is_current=1 + 其他 codex provider 归零
             let cur = try! db.scalar("SELECT is_current FROM providers WHERE id=?", [r.providerID])
             t.equal(cur, "1", "新 provider 激活")
+            let firstSort = try! db.scalar("SELECT sort_index FROM providers WHERE id=?", [r.providerID])
+            t.equal(firstSort, "0", "新 provider 排序置顶")
 
             // endpoint 写入
             let ep = try! db.scalar("SELECT url FROM provider_endpoints WHERE provider_id=?", [r.providerID])
@@ -122,6 +124,29 @@ enum CCSwitchWriterTests {
             // endpoint 归属不变,无孤儿
             let epAfter = try! dbc.scalar("SELECT provider_id FROM provider_endpoints WHERE url='https://gwy.example.org'")
             t.equal(epAfter, r3.providerID, "endpoint 归属保持,无孤儿")
+
+            // 新导入必须位于列表首位,不能只靠 is_current 激活:
+            // cc-switch 对 NULL sort_index 使用 999999 兜底,旧实现会把最新 provider 放到末尾。
+            let env4 = try! TestEnv("cc-sort")
+            defer { env4.cleanup() }
+            try! createSchema(env4)
+            let w4 = CCSwitchWriter()
+            var old = ParsedKey()
+            old.key = "sk-sort-old-111111"
+            old.url = "https://old.example.org/v1"
+            _ = try! w4.add(old, appType: "opencode", models: ["glm-5.2"], proxy: nil)
+            var newest = ParsedKey()
+            newest.key = "sk-sort-new-222222"
+            newest.url = "https://new.example.org/v1"
+            let newestResult = try! w4.add(newest, appType: "opencode", models: ["glm-5.2"], proxy: nil)
+            let firstBySort = try! DB(path: env4.dir + "/cc-switch.db").scalar(
+                "SELECT id FROM providers WHERE app_type='opencode' ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC LIMIT 1"
+            )
+            t.equal(firstBySort, newestResult.providerID, "连续导入时最新 provider 位于列表顶部")
+            let oldSort = try! DB(path: env4.dir + "/cc-switch.db").scalar(
+                "SELECT sort_index FROM providers WHERE name LIKE 'old.example.org%'"
+            )
+            t.equal(oldSort, "1", "旧 provider 顺序整体后移")
 
             // repairMissingProvider:不崩,补 provider
             var healed = try! writer.repairMissingProvider(entry: HistoryEntry(

@@ -229,6 +229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         ccItem.state = Prefs.shared.useCC ? .on : .off
         menu.addItem(ccItem)
 
+        let grokItem = NSMenuItem(title: "写入 Grok Build", action: #selector(toggleGrok), keyEquivalent: "")
+        grokItem.target = self
+        grokItem.state = Prefs.shared.useGrok ? .on : .off
+        menu.addItem(grokItem)
+
         let cpaItem = NSMenuItem(title: "写入 CPA", action: #selector(toggleCPA), keyEquivalent: "")
         cpaItem.target = self
         cpaItem.state = Prefs.shared.useCPA ? .on : .off
@@ -348,6 +353,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         state.toggleUseCC()
     }
 
+    @objc func toggleGrok() {
+        state.toggleUseGrok()
+    }
+
     @objc func toggleCPA() {
         state.toggleUseCPA()
     }
@@ -405,6 +414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             panel = p
         }
         state.useCC = Prefs.shared.useCC
+        state.useGrok = Prefs.shared.useGrok
         state.useCPA = Prefs.shared.useCPA
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

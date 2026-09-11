@@ -21,6 +21,7 @@ final class MockHTTPServer {
         case chatOK      // /models → 200 空列表;POST chat → 200(网关无模型列表但 chat 可用)
         case claudeModels // /models → 200,纯 claude 系(测 codex→claude 反向迁移)
         case nonChatModels // /models → 200,图生在前 + chat 家族在后(测激活模型不落图生)
+        case selectiveAuth // Authorization 含 invalid 的 key 返回 401,其余正常
     }
     let mode: Mode
 
@@ -48,6 +49,14 @@ final class MockHTTPServer {
         guard parts.count >= 2 else { return }
         let method = parts[0]
         let target = parts[1]
+        let authorization = req.components(separatedBy: "\r\n")
+            .first { $0.lowercased().hasPrefix("authorization:") } ?? ""
+        let apiKey = req.components(separatedBy: "\r\n")
+            .first { $0.lowercased().hasPrefix("x-api-key:") } ?? ""
+        // Both OpenAI and Anthropic probes carry the same credential in
+        // different headers; selectiveAuth must model invalid credentials for
+        // either protocol so a fallback probe cannot mask a 401.
+        let invalidKey = authorization.contains("invalid") || apiKey.contains("invalid")
 
         if method == "GET" && target.hasPrefix("http://") {
             // HTTP 代理模式:绝对 URI,转发到目标
@@ -72,7 +81,11 @@ final class MockHTTPServer {
         }
 
         var body = ""
-        if mode == .openAI {
+        if mode == .selectiveAuth && invalidKey {
+            body = "{\"error\":{\"message\":\"Unauthorized\"}}"
+        } else if mode == .selectiveAuth {
+            body = "{\"data\":[{\"id\":\"grok-4.6\",\"object\":\"model\"}]}"
+        } else if mode == .openAI {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"},{\"id\":\"glm-5.2\",\"object\":\"model\"}]}"
         } else if mode == .gateway404, method == "POST" {
             body = "{\"error\":{\"code\":\"UnsupportedModel\",\"message\":\"model does not support the agent plan feature\"}}"
@@ -131,7 +144,9 @@ final class MockHTTPServer {
             body = "{\"data\":[{\"id\":\"dall-e-3\",\"object\":\"model\"},{\"id\":\"deepseek-v4-flash-0731\",\"object\":\"model\"}]}"
         }
         let status: String
-        if mode == .html200 && target.hasSuffix("/v1/models") {
+        if mode == .selectiveAuth && invalidKey {
+            status = "401 Unauthorized"
+        } else if mode == .html200 && target.hasSuffix("/v1/models") {
             status = "401 Unauthorized"
         } else if mode == .quota429 && target.contains("/chat/completions") {
             status = "429 Too Many Requests"
@@ -139,7 +154,7 @@ final class MockHTTPServer {
             status = "401 Unauthorized"
         } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
             status = "424 Failed Dependency"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .selectiveAuth || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"

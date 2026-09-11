@@ -3,7 +3,7 @@ import Foundation
 public struct HistoryEntry: Codable {
     private enum CodingKeys: String, CodingKey {
         case id, ts, raw, format, name, url, model, models, key, keyMasked, targets
-        case ccProviderID, ccRenamedFrom, ccRenamedTo, cpaConfigPath, status, note
+        case ccProviderID, ccRenamedFrom, ccRenamedTo, cpaConfigPath, grokConfigPath, status, note
         case health, healthDetail, healthAt
         case ccMissing
         case clashFile
@@ -24,6 +24,8 @@ public struct HistoryEntry: Codable {
     public var ccRenamedFrom: String?
     public var ccRenamedTo: String?
     public var cpaConfigPath: String?
+    /// Grok Build config used by this entry, so delete/reimport never guesses a path.
+    public var grokConfigPath: String?
     public var status: String
     public var note: String?
     public var health: String?
@@ -59,6 +61,7 @@ public struct HistoryEntry: Codable {
         ccRenamedFrom: String?,
         ccRenamedTo: String?,
         cpaConfigPath: String?,
+        grokConfigPath: String? = nil,
         status: String,
         note: String? = nil,
         health: String? = nil,
@@ -82,6 +85,7 @@ public struct HistoryEntry: Codable {
         self.ccRenamedFrom = ccRenamedFrom
         self.ccRenamedTo = ccRenamedTo
         self.cpaConfigPath = cpaConfigPath
+        self.grokConfigPath = grokConfigPath
         self.status = status
         self.note = note
         self.health = health
@@ -108,6 +112,7 @@ public struct HistoryEntry: Codable {
         ccRenamedFrom = try c.decodeIfPresent(String.self, forKey: .ccRenamedFrom)
         ccRenamedTo = try c.decodeIfPresent(String.self, forKey: .ccRenamedTo)
         cpaConfigPath = try c.decodeIfPresent(String.self, forKey: .cpaConfigPath)
+        grokConfigPath = try c.decodeIfPresent(String.self, forKey: .grokConfigPath)
         status = try c.decode(String.self, forKey: .status)
         note = try c.decodeIfPresent(String.self, forKey: .note)
         health = try c.decodeIfPresent(String.self, forKey: .health)
@@ -134,6 +139,7 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(ccRenamedFrom, forKey: .ccRenamedFrom)
         try c.encodeIfPresent(ccRenamedTo, forKey: .ccRenamedTo)
         try c.encodeIfPresent(cpaConfigPath, forKey: .cpaConfigPath)
+        try c.encodeIfPresent(grokConfigPath, forKey: .grokConfigPath)
         try c.encode(status, forKey: .status)
         try c.encodeIfPresent(note, forKey: .note)
         try c.encodeIfPresent(health, forKey: .health)
@@ -438,6 +444,7 @@ public final class Prefs {
 
     private let lock = NSLock()
     private var _useCC = true
+    private var _useGrok = true
     private var _useCPA = false
     private var _useDSH = true
     private var _cpaConfigPath: String? = nil
@@ -446,6 +453,10 @@ public final class Prefs {
     public var useCC: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _useCC }
         set { lock.lock(); _useCC = newValue; lock.unlock() }
+    }
+    public var useGrok: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _useGrok }
+        set { lock.lock(); _useGrok = newValue; lock.unlock() }
     }
     public var useCPA: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _useCPA }
@@ -472,6 +483,7 @@ public final class Prefs {
         if let data = try? Data(contentsOf: fileURL),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let v = obj["useCC"] as? Bool { _useCC = v }
+            if let v = obj["useGrok"] as? Bool { _useGrok = v }
             if let v = obj["useCPA"] as? Bool { _useCPA = v }
             if let v = obj["useDSH"] as? Bool { _useDSH = v }
             _cpaConfigPath = obj["cpaConfigPath"] as? String
@@ -496,6 +508,7 @@ public final class Prefs {
     public func save() throws {
         lock.lock()
         let cc = _useCC
+        let grok = _useGrok
         let cpa = _useCPA
         let dsh = _useDSH
         let path = _cpaConfigPath
@@ -504,7 +517,7 @@ public final class Prefs {
         // flock 串行化跨进程写:app 与 CLI 并发 save 时,固定 tmp 路径会被对方
         // replaceItemAt 拽走导致写失败,并发覆盖也会丢掉对方的设置变更
         try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
-            var obj: [String: Any] = ["useCC": cc, "useCPA": cpa, "useDSH": dsh, "proxy": proxy]
+            var obj: [String: Any] = ["useCC": cc, "useGrok": grok, "useCPA": cpa, "useDSH": dsh, "proxy": proxy]
             if let path, !path.isEmpty { obj["cpaConfigPath"] = path }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),

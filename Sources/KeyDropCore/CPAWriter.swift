@@ -109,19 +109,57 @@ final class CPAWriter {
     /// 共享一组 models 列表。CPA 加载后会在此组内轮询所有 api-key。
     /// 模型列表自动探测:探测失败写入空 models 段,后续可手动刷新。
     func addMulti(baseURL: String, keys: [String], proxy: String? = nil) throws -> String {
-        guard !keys.isEmpty else {
+        var seen = Set<String>()
+        let uniqueKeys = keys.compactMap { raw -> String? in
+            let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty, seen.insert(key).inserted else { return nil }
+            return key
+        }
+        guard !uniqueKeys.isEmpty else {
             throw WriterError.file("addMulti 收到空 keys 列表")
         }
-        // 探测模型列表(失败不阻断,写入空 models 段供后续刷新);必须在加锁前完成
+        // 每把 key 都做一次认证探测。只有明确 401/403 的失效 key 自动剔除；
+        // 超时、429、5xx 等非认证错误保留，避免暂时性网关故障导致凭据丢失。
+        // 并发上限 4(与 scanHealth 同口径):串行时网关抽风每 key 最坏 24s,
+        // 批量上百把 key 会卡死整个导入;按原顺序合并结果保证确定性
+        var results = [APITestResult?](repeating: nil, count: uniqueKeys.count)
+        let resultLock = NSLock()
+        let sem = DispatchSemaphore(value: 4)
+        let group = DispatchGroup()
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        for (i, key) in uniqueKeys.enumerated() {
+            sem.wait()
+            group.enter()
+            queue.async {
+                defer { sem.signal(); group.leave() }
+                let test = APITester.test(url: baseURL, key: key, proxy: proxy)
+                resultLock.lock()
+                results[i] = test
+                resultLock.unlock()
+            }
+        }
+        group.wait()
+        var rejected = 0
+        var accepted: [String] = []
         var probedModels: [String] = []
-        if let firstKey = keys.first {
-            let test = APITester.test(url: baseURL, key: firstKey, proxy: proxy)
-            if test.ok { probedModels = test.models.filter { Parser.looksLikeModel($0) } }
+        for (key, test) in zip(uniqueKeys, results.compactMap { $0 }) {
+            if test.authFailed {
+                rejected += 1
+                continue
+            }
+            accepted.append(key)
+            if probedModels.isEmpty, test.ok {
+                probedModels = test.models.filter { Parser.looksLikeModel($0) }
+            }
         }
-        try FileLock.withLock(FileLock.lockPath(for: configPath)) {
-            try addMultiLocked(baseURL: baseURL, keys: keys, models: probedModels, proxy: proxy)
+        guard !accepted.isEmpty else {
+            throw WriterError.file("多 key 中没有可用 key,已剔除 \(rejected) 个失效 key")
         }
-        return "已写入 CPA 配置(\(configPath));CPA 运行时会自动热重载"
+        _ = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels, proxy: proxy)
+        }
+        let suffix = rejected > 0 ? ",自动剔除 \(rejected) 个失效 key" : ""
+        return "已写入 CPA 配置(\(configPath))\(suffix);CPA 运行时会自动热重载"
     }
 
     /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,

@@ -15,6 +15,14 @@ enum ParserTests {
             let b = try! Parser.parseWithFallback("sk-OhbVrpoiVgRV5IfLBcbfnoGMbJmTPSIAoCLrZ3aWZkSBvrjn https://x.com/v1")
             t.equal(b.url!, "https://x.com/v1", "URL 在 key 后")
 
+            // 单行多个冒号字段:URL 的冒号不能把后面的 key 字段吞掉,
+            // base64 key 仍需走统一解码路径
+            let labeled = try! Parser.parseWithFallback(
+                "baseurl: https://sub.tidalrelay.com/ key:c2stOThiMTZiOTFjMjQ0ZDlkOThmMTExZDA0NDUyM2MxN2NkNTI5NjRiMzEwYTg3NWVhYmY3MzAxNjM4Zjc3NGM3NA=="
+            )
+            t.equal(labeled.url, "https://sub.tidalrelay.com", "单行 baseurl 字段提取并去尾斜杠")
+            t.equal(labeled.key, "sk-98b16b91c244d9d98f111d044523c17cd52964b310a875eabf7301638f774c74", "单行 key 字段 base64 解码")
+
             // 多行多 provider
             let multi = try! Parser.parseWithFallback(
                 "https://a.com sk-aaa111222333444555\nhttps://b.com/v1 sk-bbb222333444555"

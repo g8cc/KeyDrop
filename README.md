@@ -11,7 +11,9 @@
 - **模型选择**:网关返回模型列表时弹出勾选,也可手动输入(同样逐一验证)
 - **多目标写入**:
   - **cc-switch**(Claude Code / Codex / opencode):写入 cc-switch 数据库并激活,opencode 直接合并配置文件
+  - **Grok Build**:纯 Grok 模型自动写入 `~/.grok/config.toml`;混合其他家族时仍走 OpenCode
   - **CPA**(cliproxy-api):写入 config.yaml
+    - 多 key 逐一认证探测,明确失效的 401/403 key 自动剔除;网络/限流错误不会误删
   - **DeepSeek Harness**:所选模型含 deepseek 时同步写入 `~/.dsh/settings.yaml` 与 `.credentials.yaml`
   - **Clash**:代理订阅直接合并
 - **健康扫描**:自动定时检测 key 状态(ok / dead),与 cc-switch 对账
@@ -95,6 +97,7 @@ KeyDrop reimport <ID前缀>
 | `KEYDROP_CC_SETTINGS` | cc-switch switch settings 路径 |
 | `KEYDROP_CLAUDE_SETTINGS` / `KEYDROP_CODEX_CONFIG` / `KEYDROP_OPENCODE_CONFIG` | 各工具配置文件路径 |
 | `KEYDROP_DSH_SETTINGS` / `KEYDROP_DSH_CREDENTIALS` | DeepSeek Harness 配置路径 |
+| `KEYDROP_GROK_CONFIG` / `GROK_HOME` | Grok Build 配置路径覆盖 / 配置目录 |
 | `KEYDROP_PROXY` | 默认代理 |
 
 ## 隐私

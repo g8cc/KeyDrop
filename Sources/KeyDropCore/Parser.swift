@@ -214,6 +214,38 @@ public enum Parser {
         return Cand(value: stripQuotes(t), lhs: nil)
     }
 
+    /// Split a single line containing several labeled fields, for example:
+    /// `baseurl: https://example.com/ key:<base64>`.
+    /// The generic line parser cannot split on every colon because URLs contain
+    /// colons too, so only recognized field labels at token boundaries are used.
+    private static func inlineLabeledFields(_ line: String) -> [Cand]? {
+        let pattern = #"(?i)(?:^|[\s,;])((?:anthropic[_-](?:auth[_-]?token|api[_-]?key|base[_-]?url|model)|base[_-]?url|baseurl|url|endpoint|host|api[_-]?key|apikey|api-key|auth[_-]?token|access[_-]?token|token|secret|key|default[_-]?model|claude[_-]?model|model|provider[_-]?name|provider|name|label|title))\s*[:=]\s*"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let ns = line as NSString
+        let fullRange = NSRange(location: 0, length: ns.length)
+        let matches = re.matches(in: line, range: fullRange)
+        guard !matches.isEmpty else { return nil }
+
+        var fields: [Cand] = []
+        for (index, match) in matches.enumerated() {
+            let label = ns.substring(with: match.range(at: 1)).lowercased()
+            let valueStart = match.range.location + match.range.length
+            let nextStart = index + 1 < matches.count
+                ? matches[index + 1].range.location
+                : ns.length
+            guard valueStart <= nextStart else { continue }
+            var value = ns.substring(with: NSRange(location: valueStart, length: nextStart - valueStart))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: ",;"))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            value = stripQuotes(value)
+            if !value.isEmpty {
+                fields.append(Cand(value: value, lhs: label))
+            }
+        }
+        return fields.isEmpty ? nil : fields
+    }
+
     static func parseMultiline(_ text: String) throws -> ParsedKey {
         if text.hasPrefix("curl") {
             if let r = parseCurl(text) { return r }
@@ -228,6 +260,9 @@ public enum Parser {
         var cands: [Cand] = []
 
         if lines.count == 1 {
+            if let labeled = inlineLabeledFields(lines[0]) {
+                return try classify(labeled, separator: separator)
+            }
             let tokens = lines[0]
                 .components(separatedBy: CharacterSet(charactersIn: " \t,;"))
                 .map { $0.trimmingCharacters(in: .whitespaces) }

@@ -118,12 +118,20 @@ public final class CCSwitchWriter {
                     dedupReplacedID = id
                 }
             }
+            // cc-switch sorts by COALESCE(sort_index, 999999), then created_at ASC.
+            // NULL therefore goes to the end regardless of is_current. Shift the
+            // existing explicit order in this transaction and reserve index 0 for
+            // the newly imported provider.
+            try db.run(
+                "UPDATE providers SET sort_index = sort_index + 1 WHERE app_type = ? AND sort_index IS NOT NULL",
+                [appType]
+            )
             try db.run(
                 """
                 INSERT INTO providers
                 (id, app_type, name, settings_config, website_url, category,
                  created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue)
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, NULL, NULL, NULL, ?, 1, 0)
+                VALUES (?, ?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, 1, 0)
                 """,
                 [id, appType, name, settingsConfig, now, meta]
             )

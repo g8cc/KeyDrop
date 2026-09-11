@@ -67,6 +67,7 @@ final class TestEnv {
         setenv("KEYDROP_CLAUDE_SETTINGS", dir + "/claude.json", 1)
         setenv("KEYDROP_CODEX_CONFIG", dir + "/codex.toml", 1)
         setenv("KEYDROP_CODEX_AUTH", dir + "/codex-auth.json", 1)
+        setenv("KEYDROP_GROK_CONFIG", dir + "/grok-config.toml", 1)
         setenv("KEYDROP_DSH_SETTINGS", dir + "/dsh.yaml", 1)
         setenv("KEYDROP_DSH_CREDENTIALS", dir + "/dsh-creds.yaml", 1)
         // override=0:不覆盖测试内已显式 setenv 的值(如 live 门控测试切 FAKE_CC_RUNNING=0);

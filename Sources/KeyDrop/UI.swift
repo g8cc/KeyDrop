@@ -25,6 +25,7 @@ final class AppState: ObservableObject {
     @Published var clashPreviewShown = false
     @Published var clashPreviewProxies: [ClashProxy] = []
     @Published var useCC: Bool
+    @Published var useGrok: Bool
     @Published var useCPA: Bool
     @Published var useDSH: Bool
     @Published var proxyText: String
@@ -42,6 +43,7 @@ final class AppState: ObservableObject {
 
     init() {
         useCC = Prefs.shared.useCC
+        useGrok = Prefs.shared.useGrok
         useCPA = Prefs.shared.useCPA
         useDSH = Prefs.shared.useDSH
         proxyText = Prefs.shared.proxy
@@ -123,8 +125,8 @@ final class AppState: ObservableObject {
 
     @MainActor
     private func continueAddKey(raw: String) async {
-        if !useCC && !useCPA && !useDSH {
-            setStatus("请先开启 cc-switch、CPA 或 DeepSeek Harness 写入目标", ok: false)
+        if !useCC && !useGrok && !useCPA && !useDSH {
+            setStatus("请先开启 cc-switch、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
             return
         }
         guard !isBusy else { return }
@@ -140,6 +142,7 @@ final class AppState: ObservableObject {
                 try Core.shared.add(
                     raw: raw,
                     ccOverride: Prefs.shared.useCC,
+                    grokOverride: Prefs.shared.useGrok,
                     cpaOverride: Prefs.shared.useCPA,
                     dshOverride: Prefs.shared.useDSH
                 ) { options in
@@ -420,6 +423,7 @@ final class AppState: ObservableObject {
         let entry = core.history.find(idPrefix: entryID)
         let needsActivate = entry?.targets.contains("cpa") == true
             && entry?.targets.contains(where: { $0.hasPrefix("ccswitch") }) != true
+            && entry?.targets.contains("grok") != true
 
         if needsActivate {
             isBusy = true
@@ -448,7 +452,7 @@ final class AppState: ObservableObject {
     static func openTerminal(_ cmd: String) {
         // 白名单校验:命令经 osascript 拼接写入终端 shell,一旦未来把用户数据
         // (条目名/URL 等)拼进 cmd 就是注入漏洞。此处只允许三种启动目标。
-        guard ["opencode", "codex", "claude"].contains(cmd) else {
+        guard ["opencode", "codex", "claude", "grok"].contains(cmd) else {
             AppLog.error("openTerminal 拒绝非白名单命令: \(cmd)")
             return
         }
@@ -584,6 +588,12 @@ final class AppState: ObservableObject {
         try? prefs.save()
     }
 
+    func toggleUseGrok() {
+        useGrok.toggle()
+        prefs.useGrok = useGrok
+        try? prefs.save()
+    }
+
     func toggleUseCPA() {
         useCPA.toggle()
         prefs.useCPA = useCPA
@@ -642,6 +652,7 @@ struct HistoryRow: View {
     @State private var flashOpacity: Double = 1
 
     private var appLaunch: (cmd: String, icon: String, color: Color)? {
+        if entry.targets.contains("grok") { return ("grok", "sparkles", Color(red: 0.35, green: 0.45, blue: 0.85)) }
         if entry.targets.contains("ccswitch-opencode") { return ("opencode", "chevron.left.forwardslash.chevron.right", Color(red: 0.25, green: 0.48, blue: 0.85)) }
         if entry.targets.contains("ccswitch-codex") { return ("codex", "c.circle.fill", Color(red: 0.22, green: 0.62, blue: 0.40)) }
         if entry.targets.contains("ccswitch") { return ("claude", "star.fill", Color(red: 0.85, green: 0.48, blue: 0.18)) }
@@ -1386,6 +1397,9 @@ struct PanelView: View {
             Spacer()
             targetChip("cc-switch", on: state.useCC, color: Color(red: 0.22, green: 0.58, blue: 0.40)) {
                 state.toggleUseCC()
+            }
+            targetChip("Grok", on: state.useGrok, color: Color(red: 0.35, green: 0.45, blue: 0.85)) {
+                state.toggleUseGrok()
             }
             targetChip("CPA", on: state.useCPA, color: Color(red: 0.28, green: 0.48, blue: 0.82)) {
                 state.toggleUseCPA()

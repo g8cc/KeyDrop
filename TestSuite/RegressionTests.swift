@@ -475,6 +475,25 @@ enum RegressionTests {
             t.expect(!after.contains("sk-multikeyb222222222"), "key b 已移除(修复前残留)")
         }
 
+        h.runSuite("Regression.CPA 多 key 自动剔除失效 key") { t in
+            let env = try! TestEnv("reg-cpa-multi-prune")
+            defer { env.cleanup() }
+            let core = Core()
+            env.write("cpa-config.yaml", "port: 18317\n")
+            guard let srv = try? MockHTTPServer(mode: .selectiveAuth) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            let raw = "\(base) sk-invalid-multi-1111111111 sk-valid-multi-2222222222"
+            let outcome = try! core.add(raw: raw, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
+            t.expect(outcome.ok, "有效 key 存在时多 key 导入成功")
+            let cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "sk-valid-multi-2222222222", "保留有效 key")
+            t.expect(!cfg.contains("sk-invalid-multi-1111111111"), "自动剔除明确 401 的失效 key")
+            t.contains(outcome.lines.joined(separator: "\n"), "自动剔除 1 个失效 key", "结果提示剔除数量")
+        }
+
         h.runSuite("Regression.CPA nvapi 多 key 全链路") { t in
             let env = try! TestEnv("reg-cpa-nvapi")
             defer { env.cleanup() }
