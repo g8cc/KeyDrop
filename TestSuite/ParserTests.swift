@@ -77,6 +77,13 @@ enum ParserTests {
             let keys = Parser.extractAllKeys("sk-aaa111222333444555 sk-bbb222333444555 sk-ccc222333444555")
             t.equal(keys.count, 3, "提取全部 key")
 
+            // 回归:家族词+数字的模型命名(qwen3.8-flash)曾被「带点像域名」规则误杀,
+            // /models 返回 3 个模型导入后只剩 2 个(真实事故:s2api.top)
+            t.expect(Parser.looksLikeModel("qwen3.8-flash"), "家族词+数字命名是模型")
+            t.expect(Parser.looksLikeModel("gpt5.2-mini"), "gpt+数字命名是模型")
+            t.expect(!Parser.looksLikeModel("sub.example.com"), "裸域名仍被排除")
+            t.expect(!Parser.looksLikeModel("qwen.example.com"), "家族词开头的域名仍被排除")
+
             // 回归:nvapi-(NVIDIA)等厂商前缀不在旧白名单(cwk-/sk-/ak-/pk-)里,
             // 批量 nvapi key 提取为 0,多 key CPA 导入路径不触发,只导入第一把
             let nv = Parser.extractAllKeys(

@@ -1123,7 +1123,7 @@ public enum Parser {
         return false
     }
 
-    static func looksLikeModel(_ s: String) -> Bool {
+    public static func looksLikeModel(_ s: String) -> Bool {
         if s.contains(where: { $0.isWhitespace }) { return false }
         if s.unicodeScalars.contains(where: { (0x4E00...0x9FFF).contains($0.value) }) { return false }
         if s.count < 2 || s.count > 80 { return false }
@@ -1131,8 +1131,11 @@ public enum Parser {
         if s.contains(where: { $0 == "$" || $0 == "！" || $0 == "？" || $0 == "!" || $0 == "?" }) { return false }
         let l = s.lowercased()
         if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
+        // 带点的「纯主机名字符」默认当域名排除,但家族模型名(qwen3.8-flash /
+        // gpt5.2-mini 等「家族词+数字」新版命名)必须放行:前缀放宽为 词+[-或数字],
+        // 词后紧跟点的真域名(qwen.example.com)仍被排除
         if s.contains("."), s.range(of: #"^[a-z0-9][a-z0-9.-]*$"#, options: [.regularExpression, .caseInsensitive]) != nil,
-           s.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])-"#, options: .regularExpression) == nil
+           s.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
         { return false }
         let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
         if l.range(of: families, options: .regularExpression) != nil { return true }
