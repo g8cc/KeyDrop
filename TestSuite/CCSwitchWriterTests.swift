@@ -148,6 +148,34 @@ enum CCSwitchWriterTests {
             )
             t.equal(oldSort, "1", "旧 provider 顺序整体后移")
 
+            // 回归:同 URL 不同 key 必须共存。旧去重只按 URL 匹配,第二个 key 的导入
+            // 会 DELETE 旧 provider 重建 → 旧凭据被静默覆盖,历史旧 entry 变孤儿
+            // (真实事故:同一中转站两把 key,后导入的把先导入的覆盖,cc-switch 只剩一个)
+            let env5 = try! TestEnv("cc-key-coexist")
+            defer { env5.cleanup() }
+            try! createSchema(env5)
+            let w5 = CCSwitchWriter()
+            var keyA = ParsedKey()
+            keyA.key = "sk-coexist-a-11111111"
+            keyA.url = "https://coexist.example.org/v1"
+            let ra = try! w5.add(keyA, appType: "opencode", models: ["glm-5.2"], proxy: nil)
+            var keyB = ParsedKey()
+            keyB.key = "sk-coexist-b-22222222"
+            keyB.url = "https://coexist.example.org/v1"
+            let rb = try! w5.add(keyB, appType: "opencode", models: ["glm-5.2"], proxy: nil)
+            t.expect(ra.providerID != rb.providerID, "不同 key 得到独立 provider")
+            let db5 = try! DB(path: env5.dir + "/cc-switch.db")
+            let cnt5 = try! db5.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
+            t.equal(cnt5, "2", "同 URL 两把 key 的 provider 共存(修复前被覆盖只剩 1)")
+            let cfgA = try! db5.scalar("SELECT settings_config FROM providers WHERE id=?", [ra.providerID]) ?? ""
+            t.contains(cfgA, "sk-coexist-a-11111111", "第一把 key 的配置完好")
+            let cfgB = try! db5.scalar("SELECT settings_config FROM providers WHERE id=?", [rb.providerID]) ?? ""
+            t.contains(cfgB, "sk-coexist-b-22222222", "第二把 key 的配置已写入")
+            // 同 URL 同 key 仍是幂等替换,不无限累积
+            _ = try! w5.add(keyB, appType: "opencode", models: ["glm-5.2"], proxy: nil)
+            let cnt6 = try! db5.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
+            t.equal(cnt6, "2", "同 key 同 URL 幂等替换不累积")
+
             // repairMissingProvider:不崩,补 provider
             var healed = try! writer.repairMissingProvider(entry: HistoryEntry(
                 id: "repair1-1111-2222-3333-444444444444", ts: 1, raw: "x", format: "test",

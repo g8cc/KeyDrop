@@ -104,6 +104,34 @@ enum CoreTests {
             t.expect(!env.read("grok-config.toml").contains("sk-grok-disabled-3333333333"), "降级后不写 Grok Build 配置")
         }
 
+        h.runSuite("Core.同 URL 不同 key 共存") { t in
+            let env = try! TestEnv("core-key-coexist")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let core = Core()
+            let out1 = try! core.add(
+                raw: "https://hiyo.example.org/v1 sk-hiyo-a-1111111111",
+                ccOverride: true, cpaOverride: false, dshOverride: false,
+                models: ["glm-5.2"], force: true
+            )
+            t.expect(out1.entry.name?.contains("#") != true, "首个条目名字无后缀")
+            let out2 = try! core.add(
+                raw: "https://hiyo.example.org/v1 sk-hiyo-b-2222222222",
+                ccOverride: true, cpaOverride: false, dshOverride: false,
+                models: ["glm-5.2"], force: true
+            )
+            t.expect(out1.entry.ccProviderID != out2.entry.ccProviderID, "两条目指向不同 provider(修复前旧 provider 被覆盖删除)")
+            t.contains(out2.entry.name ?? "", "#", "同 URL 第二把 key 的条目名带尾号后缀")
+            let ccw = CCSwitchWriter()
+            t.expect(ccw.providerExists(id: out1.entry.ccProviderID!, appType: "opencode"), "第一把 key 的 provider 仍在")
+            t.expect(ccw.providerExists(id: out2.entry.ccProviderID!, appType: "opencode"), "第二把 key 的 provider 仍在")
+            // 删除第二条目:只删自己的 provider,第一条目不受牵连
+            _ = try! core.delete(entryIDPrefix: out2.entry.id)
+            t.expect(ccw.providerExists(id: out1.entry.ccProviderID!, appType: "opencode"), "删除第二条目后第一条目的 provider 仍在")
+            let remaining = core.history.snapshot().first { $0.id == out1.entry.id }
+            t.equal(remaining?.status, "active", "第一条目保持 active")
+        }
+
         h.runSuite("Core.healthFor") { t in
             let ok = APITestResult(ok: true, style: "openai", models: [], detail: "200", authFailed: false, needsProxy: false)
             t.equal(Core.healthFor(ok).health, "ok", "ok 映射")

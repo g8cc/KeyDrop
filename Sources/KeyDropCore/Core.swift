@@ -187,7 +187,7 @@ public final class Core {
             return AddOutcome(entry: entry, lines: [msg], ok: true)
         }
 
-        let name = parsed.name?.isEmpty == false ? parsed.name! : cc.defaultName(for: url)
+        var name = parsed.name?.isEmpty == false ? parsed.name! : cc.defaultName(for: url)
         parsed.name = name
 
         var selectedModels: [String] = []
@@ -285,6 +285,25 @@ public final class Core {
         let useCC = ccOverride ?? prefs.useCC
         let useCPA = cpaOverride ?? prefs.useCPA
         let useDSH = dshOverride ?? prefs.useDSH
+
+        // 同 URL 不同 key 的兄弟条目:名字追加 key 尾号后缀区分。
+        // 多把 key 共用一个网关是常态,不加后缀时 cc-switch 与 KeyDrop 历史
+        // 会出现两个同名 provider,无法辨认哪把 key 对应哪个条目
+        if useCC && resolvedAppType != "grok" {
+            let appTag = resolvedAppType == "claude" ? "ccswitch" : "ccswitch-\(resolvedAppType)"
+            let siblingExists = history.snapshot().contains { e in
+                guard e.status == "active", e.id != dup?.id,
+                      let k = e.key, k != key,
+                      let u = e.url,
+                      Parser.normalizeURL(u) == Parser.normalizeURL(url),
+                      e.targets.contains(appTag) else { return false }
+                return true
+            }
+            if siblingExists {
+                name = "\(name)#\(key.suffix(4))"
+                parsed.name = name
+            }
+        }
 
         var entry = HistoryEntry(
             id: dup?.id ?? UUID().uuidString.lowercased(),

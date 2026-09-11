@@ -105,12 +105,20 @@ public final class CCSwitchWriter {
                 let normURL = appType == "opencode" ? opencodeBaseURL(url) : normalizeEndpointURL(url)
                 // endpoint url 可能带或不带 /v1/尾部斜杠,规范化后比较
                 let candidates = try db.query(
-                    "SELECT p.id, e.url FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
+                    "SELECT p.id, e.url, p.settings_config FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
                     [appType]
                 )
-                let existing = candidates.first { row in
+                let sameURL = candidates.filter { row in
                     guard row.count > 1, let u = row[1] else { return false }
                     return normalizeEndpointURL(u) == normURL
+                }
+                // 同 URL 同 key 才是同一凭据的重复导入 → 删除重建(幂等)。
+                // 同 URL 不同 key 是多凭据共存:绝不能删旧 provider,否则
+                // ① 旧 key 的可用凭据被新导入静默覆盖,② 历史里旧 entry 的
+                // ccProviderID 指向已删 provider,变成 delete/reconcile 认领不了的孤儿
+                let existing = sameURL.first { row in
+                    guard row.count > 2 else { return false }
+                    return Self.providerAPIKey(from: row[2] ?? "", appType: appType) == key
                 }
                 if let id = existing?[0] {
                     try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [id])
@@ -619,6 +627,23 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         if u.hasSuffix("/chat/completions") { return String(u.dropLast("/chat/completions".count)) + "/v1" }
         if u.hasSuffix("/v1") || u.hasSuffix("/api") { return u }
         return u + "/v1"
+    }
+
+    /// 从 cc-switch providers.settings_config 提取该 provider 的 API key,
+    /// 供「同 URL 不同 key 共存」去重判定。解析失败(用户手工改过的非常规结构)
+    /// 返回 nil:与任何 key 都不相等 → 视为不同凭据 → 保留旧 provider,不误删
+    static func providerAPIKey(from settingsConfig: String, appType: String) -> String? {
+        guard let data = settingsConfig.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        switch appType {
+        case "opencode":
+            return (obj["options"] as? [String: Any])?["apiKey"] as? String
+        case "codex":
+            return (obj["auth"] as? [String: Any])?["OPENAI_API_KEY"] as? String
+        default:
+            return nil
+        }
     }
 
     func mergeOpencodeProvider(_ p: ParsedKey, providerID: String, modelDict: [String: Any], firstModel: String?) throws {
