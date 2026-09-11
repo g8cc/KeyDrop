@@ -73,6 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         registerHotKey()
 
+        // 立即挂更新回调、只把首次自动检查延后 3s:旧实现整体延后,
+        // 若用户在这 3s 内手动点「检查更新」,结果回来时 onStateChange 还是 nil,
+        // 新版本弹窗会被吞掉,且随后的自动检查命中 12h 冷却不再触发。
+        updater.onStateChange = { [weak self] state in
+            self?.handleUpdateState(state)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             self?.setupUpdater()
         }
@@ -246,9 +252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var updater = Updater.shared
 
     private func setupUpdater() {
-        updater.onStateChange = { [weak self] state in
-            self?.handleUpdateState(state)
-        }
+        // 回调已在 applicationDidFinishLaunching 里立即挂好,这里只触发首次自动检查
         updater.checkForUpdates()
     }
 

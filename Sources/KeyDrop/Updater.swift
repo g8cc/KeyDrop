@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import CryptoKit
 import KeyDropCore
 
 enum UpdateError: LocalizedError {
@@ -43,6 +44,8 @@ final class Updater {
     private(set) var state: State = .idle
     var onStateChange: ((State) -> Void)?
     private var downloadTask: URLSessionDownloadTask?
+    /// 发布资产声明的 sha256(GitHub asset.digest)。若存在,安装前校验下载包完整性
+    private var pendingDigest: String?
     private let lastCheckKey = "updateLastCheckAt"
     private let promptedVersionKey = "updatePromptedVersion"
 
@@ -51,11 +54,17 @@ final class Updater {
     /// 启动时检查:同一天只查一次,避免频繁打 GitHub API
     func checkForUpdates(force: Bool = false) {
         guard let apiURL else { return }
+        // 重入保护:正在检查/下载/安装时,「检查更新」不得把状态覆盖回 .checking
+        switch state {
+        case .checking, .downloading, .installing: return
+        default: break
+        }
         if !force {
             let last = defaults.double(forKey: lastCheckKey)
             if Date().timeIntervalSince1970 - last < 12 * 3600 { return }
         }
-        defaults.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
+        // 注意:不在发起请求前写 lastCheckKey。旧实现先写时间戳,
+        // 网络瞬时失败也会进入 12h 冷却,用户从此收不到自动更新提示。
         state = .checking
 
         var req = URLRequest(url: apiURL)
@@ -73,12 +82,15 @@ final class Updater {
             }
             guard http.statusCode == 200 else {
                 if http.statusCode == 404 {
+                    self.defaults.set(Date().timeIntervalSince1970, forKey: self.lastCheckKey)
                     self.setState(.upToDate)
                     return
                 }
                 self.setState(.failed("检查更新失败: HTTP \(http.statusCode)"))
                 return
             }
+            // 服务端已应答:记录检查时间,避免重复轮询(失败路径不写,留给下次启动重试)
+            self.defaults.set(Date().timeIntervalSince1970, forKey: self.lastCheckKey)
             do {
                 let info = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let tag = info?["tag_name"] as? String else {
@@ -99,6 +111,11 @@ final class Updater {
                     return
                 }
                 let notes = (info?["body"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if let digest = asset["digest"] as? String, digest.lowercased().hasPrefix("sha256:") {
+                    self.pendingDigest = String(digest.dropFirst("sha256:".count)).lowercased()
+                } else {
+                    self.pendingDigest = nil
+                }
                 self.setState(.available(version: version, url: url, notes: notes))
             } catch {
                 self.setState(.failed("检查更新失败: 解析错误"))
@@ -123,6 +140,7 @@ final class Updater {
         req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
         let task = URLSession.shared.downloadTask(with: req) { [weak self] fileURL, resp, err in
             guard let self else { return }
+            self.downloadTask = nil
             if let err {
                 self.setState(.failed("下载失败: \(err.localizedDescription)"))
                 return
@@ -152,6 +170,8 @@ final class Updater {
     func cancelDownload() {
         downloadTask?.cancel()
         downloadTask = nil
+        // 取消后必须把状态清掉,否则 UI 永远停在「下载中」
+        setState(.idle)
     }
 
     private func install(archive: URL, version: String) {
@@ -159,8 +179,18 @@ final class Updater {
         let tmp = NSTemporaryDirectory() + "KeyDropUpdate-\(UUID().uuidString.prefix(8))"
         do {
             try fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
-            let zipPath = tmp + "/KeyDrop-\(version).zip"
+            // version 来自 GitHub tag,可能含 / 等路径字符 → 先净化再拼路径
+            let zipPath = tmp + "/KeyDrop-\(Self.sanitizePathComponent(version)).zip"
             try fm.copyItem(atPath: archive.path, toPath: zipPath)
+
+            // ① 若 GitHub 资产带 sha256,先校验下载包完整性(能挡住被替包的 zip)
+            if let expected = pendingDigest {
+                guard let actual = Self.sha256Hex(zipPath), actual.caseInsensitiveCompare(expected) == .orderedSame else {
+                    pendingDigest = nil
+                    throw UpdateError.downloadFailed("更新包 sha256 校验失败,已拒绝安装")
+                }
+            }
+            pendingDigest = nil
 
             // 本函数运行在 URLSession 回调线程,state 更新必须走 main(setState)
             setState(.installing)
@@ -169,13 +199,17 @@ final class Updater {
             let ditto = Process()
             ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
             ditto.arguments = ["-x", "-k", zipPath, extractDir]
+            // ditto 输出必须被消费:只建 Pipe 不读,输出超管道缓冲会让子进程阻塞在 write,
+            // waitUntilExit() 就永久卡死。先读完(到 EOF)再 wait。
             let pipe = Pipe()
             ditto.standardOutput = pipe
             ditto.standardError = pipe
             try ditto.run()
+            let dittoOut = pipe.fileHandleForReading.readDataToEndOfFile()
             ditto.waitUntilExit()
             guard ditto.terminationStatus == 0 else {
-                throw UpdateError.extractFailed("ditto exit \(ditto.terminationStatus)")
+                let tail = String(data: dittoOut, encoding: .utf8)?.suffix(200) ?? ""
+                throw UpdateError.extractFailed("ditto exit \(ditto.terminationStatus) \(tail)")
             }
 
             let newBundle = extractDir + "/KeyDrop.app"
@@ -187,39 +221,36 @@ final class Updater {
                 throw UpdateError.installFailed("无法定位当前应用路径")
             }
             // 仅允许 .app 形态自更新:裸二进制(如 .build/release/KeyDrop)的 bundlePath
-            // 是普通目录,rm -rf 会连带删掉目录里的其他文件,且无法自替换
+            // 是普通目录,替换会连带删掉目录里的其他文件,且无法自替换
             guard runningPath.hasSuffix(".app") else {
                 throw UpdateError.installFailed("当前不是 .app 运行形态,请手动更新")
             }
 
-            // 杀自己用精确 PID,pkill -f 全串匹配是 ERE 正则,路径含 + 等元字符时
-            // 会杀不掉或误杀其他进程。
-            // 替换采用「先改名利旧 → 挪入新包 → 失败即回滚」:先 rm -rf 的话,
-            // 后续 mv 一旦失败(磁盘满/占用),应用就彻底没了。
-            let myPID = ProcessInfo.processInfo.processIdentifier
+            // ② 包身份/版本/签名校验:必须同一 bundle id、版本与发布一致、ad-hoc 签名未破坏
+            try Self.verifyNewBundle(at: newBundle, expectedVersion: version)
+
+            // ③ 先替换、后杀进程。替换(改名旧包→挪入新包)是唯一可能失败的可逆步骤,
+            //    放在杀进程之前:失败可回滚且应用仍在运行。
+            //    旧实现先 kill -9 再 mv,mv 失败时应用已死、无回滚、用户无感知。
             let backupPath = runningPath + ".keydrop-old"
-            func shellEscape(_ s: String) -> String {
-                "'" + s.replacingOccurrences(of: "'", with: "'\\''" ) + "'"
+            try? fm.removeItem(atPath: backupPath)
+            try fm.moveItem(atPath: runningPath, toPath: backupPath)
+            do {
+                try fm.moveItem(atPath: newBundle, toPath: runningPath)
+            } catch {
+                try? fm.moveItem(atPath: backupPath, toPath: runningPath)
+                throw UpdateError.installFailed("替换失败,已回滚: \(error.localizedDescription)")
             }
+
+            // ④ 替换成功后才重启。必须 kill 在 open 之前:同 bundle id 已有实例在跑时,
+            //    open 只会激活旧实例而不会启动新包。
+            let myPID = ProcessInfo.processInfo.processIdentifier
             let script = """
-            sleep 2
             kill -9 \(myPID) 2>/dev/null || true
             sleep 1
-            if mv \(shellEscape(runningPath)) \(shellEscape(backupPath)); then
-              if mv \(shellEscape(newBundle)) \(shellEscape(runningPath)); then
-                open \(shellEscape(runningPath))
-                # 更新成功后清理临时目录(含下载的 zip 与 extract),
-                # 否则每次成功更新都在 /tmp 泄漏一份完整安装包
-                (sleep 6 && rm -rf \(shellEscape(tmp))) &
-                (sleep 5 && rm -rf \(shellEscape(backupPath))) &
-              else
-                # 新包挪入失败,立即回滚,保证本机始终有一份可用的 KeyDrop
-                mv \(shellEscape(backupPath)) \(shellEscape(runningPath))
-                exit 1
-              fi
-            else
-              exit 1
-            fi
+            open \(Self.shellEscape(runningPath))
+            (sleep 8 && rm -rf \(Self.shellEscape(tmp))) &
+            (sleep 6 && rm -rf \(Self.shellEscape(backupPath))) &
             """
             let sh = Process()
             sh.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -229,9 +260,63 @@ final class Updater {
                 NSApp.terminate(nil)
             }
         } catch {
+            // 任何失败都清掉临时目录,不泄漏下载的 zip 与解压内容
             try? fm.removeItem(atPath: tmp)
             setState(.failed(error.localizedDescription))
         }
+    }
+
+    // MARK: - 更新包校验
+
+    /// 校验下载解压出的 KeyDrop.app:身份、版本、可执行文件与 ad-hoc 签名完整性
+    private static func verifyNewBundle(at path: String, expectedVersion: String) throws {
+        let fm = FileManager.default
+        guard let dict = NSDictionary(contentsOfFile: path + "/Contents/Info.plist") as? [String: Any] else {
+            throw UpdateError.installFailed("更新包缺少 Info.plist")
+        }
+        guard (dict["CFBundleIdentifier"] as? String) == "com.keydrop.app" else {
+            throw UpdateError.installFailed("更新包 bundle id 不匹配,已拒绝安装")
+        }
+        let bundleVersion = (dict["CFBundleShortVersionString"] as? String) ?? ""
+        guard bundleVersion == expectedVersion else {
+            throw UpdateError.installFailed("更新包版本(\(bundleVersion))与发布版本(\(expectedVersion))不一致,已拒绝安装")
+        }
+        guard fm.isExecutableFile(atPath: path + "/Contents/MacOS/KeyDrop") else {
+            throw UpdateError.installFailed("更新包缺少可执行文件")
+        }
+        // ad-hoc 签名完整性:包被篡改会使签名失效,--verify 返回非 0
+        let codesign = Process()
+        codesign.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        codesign.arguments = ["--verify", "--deep", "--strict", path]
+        codesign.standardOutput = FileHandle.nullDevice
+        codesign.standardError = FileHandle.nullDevice
+        try codesign.run()
+        codesign.waitUntilExit()
+        guard codesign.terminationStatus == 0 else {
+            throw UpdateError.installFailed("更新包签名校验失败,已拒绝安装")
+        }
+    }
+
+    /// 流式计算 sha256,避免把上百 MB 的 zip 整体读进内存
+    private static func sha256Hex(_ path: String) -> String? {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        var hasher = SHA256()
+        while true {
+            let chunk = fh.readData(ofLength: 1 << 20)
+            if chunk.isEmpty { break }
+            hasher.update(data: chunk)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func sanitizePathComponent(_ s: String) -> String {
+        let allowed = s.replacingOccurrences(of: #"[^A-Za-z0-9._-]"#, with: "_", options: .regularExpression)
+        return allowed.isEmpty ? "unknown" : String(allowed.prefix(64))
+    }
+
+    private static func shellEscape(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private func setState(_ s: State) {
