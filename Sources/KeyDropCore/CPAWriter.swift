@@ -142,7 +142,13 @@ final class CPAWriter {
         var rejected = 0
         var accepted: [String] = []
         var probedModels: [String] = []
-        for (key, test) in zip(uniqueKeys, results.compactMap { $0 }) {
+        // 必须按索引对齐收集:compactMap+zip 会在任一结果缺失时让后续 key 整体错位,
+        // 把好 key 对到别处的探测结果上误剔除。结果缺失(理论不可达)按非认证错误保留
+        for (i, key) in uniqueKeys.enumerated() {
+            guard let test = results[i] else {
+                accepted.append(key)
+                continue
+            }
             if test.authFailed {
                 rejected += 1
                 continue
