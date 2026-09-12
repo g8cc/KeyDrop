@@ -17,6 +17,9 @@ final class CPAWriter {
             return fromPrefs
         }
         if let fromProc = runningProcessConfig() { return fromProc }
+        // Docker 部署:容器进程宿主机 ps 不可见,prefs 路径易失效。
+        // 用 docker inspect 找挂载了 CLIProxyAPI config.yaml 的容器,返回其宿主机源路径。
+        if let fromDocker = dockerMountedConfig() { return fromDocker }
         let candidates = [
             NSHomeDirectory() + "/cliproxyapi/config.yaml",
             NSHomeDirectory() + "/.cli-proxy-api/config.yaml",
@@ -26,6 +29,61 @@ final class CPAWriter {
             if FileManager.default.fileExists(atPath: c) { return c }
         }
         return nil
+    }
+
+    /// 扫描 docker 容器,找挂载了 CLIProxyAPI config.yaml 的那个,返回宿主机路径。
+    /// 容器镜像名含 cli-proxy / cliproxy 且挂载 destination 或 source basename 命中
+    /// config.yaml 才算。docker 不可用/无匹配返回 nil,不打扰主流程
+    private static func dockerMountedConfig() -> String? {
+        // GUI app 经 open 启动时 PATH 不含 /usr/local/bin,不能依赖 `env docker`;
+        // KEYDROP_DOCKER_BIN 显式指定优先,否则逐个候选绝对路径找可执行的 docker
+        let candidates: [String]
+        if let env = ProcessInfo.processInfo.environment["KEYDROP_DOCKER_BIN"], !env.isEmpty {
+            candidates = [env]
+        } else {
+            candidates = ["/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/usr/bin/docker"]
+        }
+        guard let docker = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+        else { return nil }
+        guard let ids = runCapture(docker, ["ps", "--format", "{{.ID}} {{.Image}}"]) else { return nil }
+        var best: String? = nil
+        for line in ids.split(whereSeparator: \.isNewline) {
+            let cols = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard cols.count == 2 else { continue }
+            let (cid, image) = (cols[0], cols[1])
+            let img = image.lowercased()
+            guard img.contains("cli-proxy") || img.contains("cliproxy") || img.contains("cliproxyapi") else { continue }
+            guard let mounts = runCapture(docker, ["inspect", cid, "--format",
+                "{{range .Mounts}}{{.Source}}|{{.Destination}}\n{{end}}"]) else { continue }
+            for m in mounts.split(whereSeparator: \.isNewline) {
+                let parts = m.split(separator: "|", maxSplits: 1).map(String.init)
+                guard parts.count == 2 else { continue }
+                let (src, dst) = (parts[0], parts[1])
+                // 目标或源是 config.yaml 文件(非目录),宿主机真实存在
+                let dstIsConfig = (dst as NSString).lastPathComponent == "config.yaml"
+                let srcIsConfig = (src as NSString).lastPathComponent == "config.yaml"
+                guard dstIsConfig || srcIsConfig else { continue }
+                guard FileManager.default.fileExists(atPath: src) else { continue }
+                if best == nil { best = src }
+            }
+        }
+        return best
+    }
+
+    /// 运行命令捕获 stdout;命令不存在/失败返回 nil。绝不抛错:探测性质
+    private static func runCapture(_ exe: String, _ args: [String]) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: exe) else { return nil }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: exe)
+        proc.arguments = args
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch { return nil }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 
     private static func runningProcessConfig() -> String? {
