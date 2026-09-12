@@ -984,16 +984,19 @@ public enum Parser {
         return Data(base64Encoded: t, options: [.ignoreUnknownCharacters])
     }
 
-    static func looksLikeURL(_ s: String) -> Bool {
+    public static func looksLikeURL(_ s: String) -> Bool {
         let l = stripCJK(s).lowercased()
         guard !l.contains(where: { $0.isWhitespace }) else { return false }
         if l.hasPrefix("https://") || l.hasPrefix("http://") {
             return URL(string: l)?.host?.isEmpty == false
         }
-        // 裸域名(如 sub.relay-test.example.com):无协议、形如 hostname 且至少一个点
+        // 裸域名(如 sub.relay-test.example.com):无协议、形如 hostname 且至少一个点。
+        // 家族排除用「词+[-或数字]」:qwen3.8-flash / gpt5.2-mini 这类带点模型名
+        // 形如 hostname,若只排除「词-」会被当 URL 抢走,classify 里 URL 优先于模型,
+        // 手贴模型名就丢了(真实事故:s2api.top 的 qwen3.8-flash)
         guard l.range(of: #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#, options: .regularExpression) != nil,
               !l.contains(".."),
-              l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])-"#, options: .regularExpression) == nil
+              l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
         else { return false }
         return URL(string: "https://" + l)?.host?.isEmpty == false
     }

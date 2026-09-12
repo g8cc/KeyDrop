@@ -38,11 +38,15 @@ public final class GrokBuildWriter {
             var lines = try readLines()
             let stale = uniqueModels(oldModels).filter { !selected.contains($0) }
             _ = removeModelSections(&lines, models: stale, baseURL: normalizedURL, key: normalizedKey)
+            var namespaced = 0
             for model in selected {
-                upsertModel(&lines, model: model, baseURL: normalizedURL, key: normalizedKey)
+                if upsertModel(&lines, model: model, baseURL: normalizedURL, key: normalizedKey) {
+                    namespaced += 1
+                }
             }
             try write(lines: lines)
-            return "已写入 Grok Build(\(configPath)): \(selected.count) 个模型"
+            let coexist = namespaced > 0 ? ",\(namespaced) 个同名模型已加 #尾号 与既有 key 共存" : ""
+            return "已写入 Grok Build(\(configPath)): \(selected.count) 个模型\(coexist)"
         }
     }
 
@@ -136,20 +140,53 @@ public final class GrokBuildWriter {
         return decodeTomlString(raw)
     }
 
-    private func sectionRange(in lines: [String], model: String) -> Range<Int>? {
-        guard let start = lines.firstIndex(where: { modelID(from: $0) == model }) else { return nil }
-        var end = lines.count
-        for i in (start + 1)..<lines.count {
-            let t = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
-            if t.hasPrefix("[") && t.hasSuffix("]") {
-                end = i
-                break
-            }
-        }
-        return start..<end
+    /// 一个已解析的 `[model.*]` 段:内容身份 = model 字段 + base_url + api_key。
+    /// 定位必须按内容而非 table id:同名模型被第二把 key 导入时 table id 会带
+    /// `#尾号` 后缀共存,按 id 找会漏;按内容找则写/删都精确到自己的凭据
+    private struct ModelSection {
+        let range: Range<Int>
+        let id: String        // table key 原文(可能带 #尾号)
+        let model: String     // `model = ` 字段(上游模型名)
+        let baseURL: String?
+        let apiKey: String?
     }
 
-    private func upsertModel(_ lines: inout [String], model: String, baseURL: String, key: String) {
+    private func scanModelSections(in lines: [String]) -> [ModelSection] {
+        var out: [ModelSection] = []
+        var i = 0
+        while i < lines.count {
+            guard let id = modelID(from: lines[i]) else { i += 1; continue }
+            var end = lines.count
+            for j in (i + 1)..<lines.count {
+                let t = lines[j].trimmingCharacters(in: .whitespacesAndNewlines)
+                if t.hasPrefix("[") && t.hasSuffix("]") { end = j; break }
+            }
+            var model = id
+            var baseURL: String?
+            var apiKey: String?
+            for line in lines[(i + 1)..<end] {
+                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                for field in ["model", "base_url", "api_key"] {
+                    guard t.hasPrefix(field) else { continue }
+                    let rest = t.dropFirst(field.count).trimmingCharacters(in: .whitespaces)
+                    guard rest.first == "=" else { continue }
+                    let value = decodeTomlString(String(rest.dropFirst()))
+                    if field == "model" { model = value }
+                    else if field == "base_url" { baseURL = value }
+                    else { apiKey = value }
+                }
+            }
+            out.append(ModelSection(range: i..<end, id: id, model: model, baseURL: baseURL, apiKey: apiKey))
+            i = end
+        }
+        return out
+    }
+
+    /// 同模型同 key → 原地更新(base_url 修正也走这里);
+    /// 同模型不同 key → 新 table id 用「模型#key尾4」共存,绝不覆盖他人凭据。
+    /// 返回 true 表示本次因冲突启用了后缀 id
+    @discardableResult
+    private func upsertModel(_ lines: inout [String], model: String, baseURL: String, key: String) -> Bool {
         let values: [(String, String)] = [
             ("model", model),
             ("base_url", baseURL),
@@ -157,17 +194,32 @@ public final class GrokBuildWriter {
             ("name", model),
             ("api_backend", "chat_completions")
         ]
-        if let range = sectionRange(in: lines, model: model) {
-            var block = Array(lines[range])
+        let sections = scanModelSections(in: lines)
+        if let own = sections.first(where: { $0.model == model && $0.apiKey == key }) {
+            var block = Array(lines[own.range])
             for (name, value) in values { upsertKey(&block, name: name, value: value) }
-            lines.replaceSubrange(range, with: block)
-        } else {
-            if let last = lines.last, !last.isEmpty { lines.append("") }
-            lines.append(modelHeader(model))
-            for (name, value) in values {
-                lines.append("\(name) = \(tomlString(value))")
-            }
+            lines.replaceSubrange(own.range, with: block)
+            return false
         }
+        var newID = model
+        let ids = Set(sections.map(\.id))
+        var namespaced = false
+        if ids.contains(newID) {
+            namespaced = true
+            var candidate = "\(model)#\(key.suffix(4))"
+            var n = 2
+            while ids.contains(candidate) {
+                candidate = "\(model)#\(key.suffix(4))-\(n)"
+                n += 1
+            }
+            newID = candidate
+        }
+        if let last = lines.last, !last.isEmpty { lines.append("") }
+        lines.append(modelHeader(newID))
+        for (name, value) in values {
+            lines.append("\(name) = \(tomlString(value))")
+        }
+        return namespaced
     }
 
     private func upsertKey(_ block: inout [String], name: String, value: String) {
@@ -185,39 +237,21 @@ public final class GrokBuildWriter {
         }
     }
 
+    /// 删除条件 = model 字段命中 ∧ api_key 相同 ∧ base_url 相同。
+    /// 按 table id 删除在「#尾号共存」后会漏删/误删,必须按内容
     private func removeModelSections(
         _ lines: inout [String],
         models: [String],
         baseURL: String,
         key: String
     ) -> Int {
-        var ranges: [Range<Int>] = []
-        for model in models {
-            guard let range = sectionRange(in: lines, model: model),
-                  sectionMatches(lines, range: range, baseURL: baseURL, key: key) else { continue }
-            ranges.append(range)
-        }
+        let targets = Set(models)
+        let ranges = scanModelSections(in: lines)
+            .filter { targets.contains($0.model) && $0.apiKey == key && normalizeURL($0.baseURL ?? "") == baseURL }
+            .map(\.range)
         for range in ranges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
             lines.removeSubrange(range)
         }
         return ranges.count
-    }
-
-    private func sectionMatches(_ lines: [String], range: Range<Int>, baseURL: String, key: String) -> Bool {
-        var foundURL: String?
-        var foundKey: String?
-        for line in lines[range] {
-            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            for field in ["base_url", "api_key"] {
-                let prefix = "\(field)"
-                guard t.hasPrefix(prefix) else { continue }
-                let rest = t.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
-                guard rest.first == "=" else { continue }
-                let value = decodeTomlString(String(rest.dropFirst()))
-                if field == "base_url" { foundURL = value }
-                else { foundKey = value }
-            }
-        }
-        return foundKey == key && normalizeURL(foundURL ?? "") == baseURL
     }
 }

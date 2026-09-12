@@ -62,6 +62,34 @@ enum GrokBuildWriterTests {
             )
             t.contains(removedMsg, "移除 2 个模型", "remove 文案带真实数量: \(removedMsg)")
             t.expect(!removedMsg.contains("(removed)"), "无字面量占位残留")
+
+            // 回归:同模型不同 key 曾按 table id 定位直接覆盖 api_key(凭据劫持)。
+            // 现在:第二把 key 以「模型#key尾4」table id 共存,各凭据互不覆盖
+            let coexistEnv = try! TestEnv("grok-coexist")
+            defer { coexistEnv.cleanup() }
+            let w2 = GrokBuildWriter(configPath: coexistEnv.dir + "/grok.toml")
+            _ = try! w2.sync(baseURL: "https://relay.example.org/v1", key: "sk-grok-key-one-111111111",
+                             models: ["grok-4.6"], removing: [])
+            let coexistMsg = try! w2.sync(baseURL: "https://relay.example.org/v1", key: "sk-grok-key-two-222222222",
+                                          models: ["grok-4.6"], removing: [])
+            t.contains(coexistMsg, "#尾号", "共存时消息说明后缀: \(coexistMsg)")
+            let co = coexistEnv.read("grok.toml")
+            t.contains(co, "api_key = \"sk-grok-key-one-111111111\"", "第一把 key 的凭据未被覆盖")
+            t.contains(co, "[model.\"grok-4.6\"]", "第一把 key 保留原名 table")
+            t.contains(co, "[model.\"grok-4.6#2222\"]", "第二把 key 用 #尾号 table 共存")
+            // 删除第一把:按内容定位,只删自己的段
+            _ = try! w2.remove(baseURL: "https://relay.example.org/v1", key: "sk-grok-key-one-111111111",
+                               models: ["grok-4.6"])
+            let afterDel = coexistEnv.read("grok.toml")
+            t.expect(!afterDel.contains("sk-grok-key-one-111111111"), "第一把 key 的段已删")
+            t.contains(afterDel, "sk-grok-key-two-222222222", "第二把 key 的段不受影响")
+
+            // 同 key 改 URL 重导入:原地更新 base_url,不产生重复段
+            _ = try! w2.sync(baseURL: "https://relay2.example.org/v1", key: "sk-grok-key-two-222222222",
+                             models: ["grok-4.6"], removing: [])
+            let urlFixed = coexistEnv.read("grok.toml")
+            t.contains(urlFixed, "base_url = \"https://relay2.example.org/v1\"", "base_url 原地更新")
+            t.equal(urlFixed.components(separatedBy: "[model.").count - 1, 1, "同 key 重导入不产生重复段")
         }
     }
 }

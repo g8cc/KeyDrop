@@ -84,6 +84,16 @@ enum ParserTests {
             t.expect(!Parser.looksLikeModel("sub.example.com"), "裸域名仍被排除")
             t.expect(!Parser.looksLikeModel("qwen.example.com"), "家族词开头的域名仍被排除")
 
+            // 回归:looksLikeURL 曾把 qwen3.8-flash 判为裸域名,classify 里 URL 优先,
+            // 手贴模型名被抢成 https://qwen3.8-flash 且模型丢失
+            t.expect(!Parser.looksLikeURL("qwen3.8-flash"), "带点模型名不是 URL")
+            t.expect(Parser.looksLikeURL("sub.example.com"), "真裸域名仍是 URL")
+            let pastedDotted = try! Parser.parseWithFallback(
+                "https://s2api.example.top sk-abc123def456ghi789jkl qwen3.8-flash"
+            )
+            t.equal(pastedDotted.url, "https://s2api.example.top", "手贴带点模型名时 URL 不被抢占")
+            t.equal(pastedDotted.model, "qwen3.8-flash", "带点模型名正确进模型")
+
             // 回归:nvapi-(NVIDIA)等厂商前缀不在旧白名单(cwk-/sk-/ak-/pk-)里,
             // 批量 nvapi key 提取为 0,多 key CPA 导入路径不触发,只导入第一把
             let nv = Parser.extractAllKeys(
