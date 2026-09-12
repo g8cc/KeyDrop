@@ -139,6 +139,52 @@ enum CLI {
             print(Core.shared.list(limit: 50))
             return 0
 
+        case "scan":
+            // 全量强制健康探测:staleAfter=0 让所有 active 条目都重测,
+            // 结果落盘后 UI 的可用/无余额/待删除区随之归位
+            let before = Core.shared.history.snapshot()
+                .filter { $0.status == "active" }
+                .reduce(into: [String: String]()) { $0[$1.id] = $1.health ?? "未测" }
+            print("全量健康探测中(并发 4,最长约 1 分钟/批)...")
+            let sem = DispatchSemaphore(value: 0)
+            Core.shared.scanHealth(staleAfter: 0) { _ in sem.signal() }
+            sem.wait()
+            let entries = Core.shared.history.snapshot()
+                .filter { $0.status == "active" && $0.key != nil && $0.url != nil }
+            let skipped = Core.shared.history.snapshot()
+                .filter { $0.status == "active" && ($0.key == nil || $0.url == nil) }.count
+            var dead: [String] = [], quota: [String] = [], err: [String] = [], ok = 0, demoted: [String] = []
+            for e in entries {
+                let prev = before[e.id] ?? "未测"
+                let label = "\(e.id.prefix(8)) \(e.name ?? "") \(e.url ?? "")"
+                let detail = e.healthDetail.map { String($0.prefix(100)) } ?? ""
+                switch e.health {
+                case "dead":
+                    dead.append("✗ 失效(→待删除区) \(label)\n    原状态:\(prev) | \(detail)")
+                case "quota":
+                    quota.append("¥ 无余额(→无余额区) \(label)\n    原状态:\(prev) | \(detail)")
+                case "proxy-ok":
+                    ok += 1
+                    demoted.append("△ 可用但需代理 \(label)")
+                case "ok":
+                    if prev != "ok" && prev != "proxy-ok" {
+                        demoted.append("↑ 恢复可用 \(label)(原状态:\(prev))")
+                    }
+                    ok += 1
+                default:
+                    err.append("! 异常(留在列表,不自动归类) \(label)\n    原状态:\(prev) | \(detail)")
+                }
+            }
+            var out: [String] = []
+            out.append("═══ 探测结果(\(entries.count) 条可测,另有 \(skipped) 条无 key 条目跳过)═══")
+            if !dead.isEmpty { out.append("── 已失效 \(dead.count) 条(已移入待删除区)──"); out.append(dead.joined(separator: "\n")) }
+            if !quota.isEmpty { out.append("── 无余额 \(quota.count) 条(已移入无余额区)──"); out.append(quota.joined(separator: "\n")) }
+            if !err.isEmpty { out.append("── 异常 \(err.count) 条 ──"); out.append(err.joined(separator: "\n")) }
+            if !demoted.isEmpty { out.append("── 状态变化 ──"); out.append(demoted.joined(separator: "\n")) }
+            out.append("═══ 统计:可用 \(ok) / 无余额 \(quota.count) / 异常 \(err.count) / 失效 \(dead.count) ═══")
+            print(out.joined(separator: "\n"))
+            return 0
+
         case "delete", "rm":
             guard let target = remaining.first else {
                 print("用法: KeyDrop --delete <历史ID前缀或内容片段>")
@@ -357,6 +403,7 @@ enum CLI {
                                        [--proxy http://127.0.0.1:7890] (或环境变量 KEYDROP_PROXY)
       KeyDrop --parse "<内容>"       只看解析结果,不写入
       KeyDrop --list                 历史记录
+      KeyDrop scan                   全量强制健康探测,刷新可用/无余额/待删除区
       KeyDrop --delete <ID前缀|片段> 删除该条(自动还原/回退)
       KeyDrop --refresh <ID前缀>     重新测试并更新模型列表
       KeyDrop --status               查看当前状态
