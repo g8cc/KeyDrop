@@ -658,7 +658,10 @@ struct HistoryRow: View {
         if entry.targets.contains("ccswitch") { return ("claude", "star.fill", Color(red: 0.85, green: 0.48, blue: 0.18)) }
         if entry.targets.contains("cpa") {
             let models = entry.models ?? (entry.model.map { [$0] } ?? [])
-            let appType = Core.routeAppType(selectedModels: models, modelsOverride: nil, default: "claude")
+            // 空模型列表(未探测/探测失败的多 key 条目)不得默认 claude:
+            // CPA 聚合的中转 key 大多是通用 chat 模型,误标 claude 会把
+            // 「打开应用」激活到 Claude Code(真实事故:nvapi 批量导入被显示为 claude)
+            let appType = Core.routeAppType(selectedModels: models, modelsOverride: nil, default: "opencode")
             switch appType {
             case "claude": return ("claude", "star.fill", Color(red: 0.85, green: 0.48, blue: 0.18))
             case "codex": return ("codex", "c.circle.fill", Color(red: 0.22, green: 0.62, blue: 0.40))

@@ -165,8 +165,10 @@ final class CPAWriter {
 
     /// 多 key 写聚合条目到 `openai-compatibility:` 段下,同 baseURL 的 key 归一组,
     /// 共享一组 models 列表。CPA 加载后会在此组内轮询所有 api-key。
-    /// 模型列表自动探测:探测失败写入空 models 段,后续可手动刷新。
-    func addMulti(baseURL: String, keys: [String], proxy: String? = nil) throws -> String {
+    /// 模型列表自动探测:探测失败返回空 models,条目可后续刷新。
+    /// 返回 (提示消息, 探测到的模型) —— 模型回传给历史条目,
+    /// UI 才能按真实家族路由「打开应用」(曾因 models 空被误标 claude)
+    func addMulti(baseURL: String, keys: [String], proxy: String? = nil) throws -> (String, [String]) {
         var seen = Set<String>()
         let uniqueKeys = keys.compactMap { raw -> String? in
             let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -223,7 +225,7 @@ final class CPAWriter {
             try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels, proxy: proxy)
         }
         let suffix = rejected > 0 ? ",自动剔除 \(rejected) 个失效 key" : ""
-        return "已写入 CPA 配置(\(configPath))\(suffix);CPA 运行时会自动热重载"
+        return ("已写入 CPA 配置(\(configPath))\(suffix);CPA 运行时会自动热重载", probedModels)
     }
 
     /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,

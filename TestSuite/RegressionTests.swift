@@ -514,6 +514,9 @@ enum RegressionTests {
             t.contains(cfg, "nvapi-aaa111bbb222ccc333ddd111", "key 1 写入")
             t.contains(cfg, "nvapi-eee444fff555ggg666hhh222", "key 2 写入")
             t.contains(cfg, "nvapi-ooo777ppp888qqq999rrr333", "key 3 写入")
+            // 回归:多 key 条目必须回传并保存探测模型。models 为空时
+            // UI「打开应用」路由 default:"claude",nvapi 批量导入被误标成 Claude Code
+            t.equal(outcome.entry.models, ["gpt-5.6-sol", "glm-5.2"], "多 key 条目保存探测到的模型")
 
             // 第二批同 host 导入:合并进既有聚合条目(大量 key 分次导入的常态)
             let raw2 = "\(base)\nnvapi-sss444ttt555uuu666vvv777\nnvapi-www888xxx999yyy000zzz111"

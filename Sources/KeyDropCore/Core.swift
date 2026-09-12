@@ -164,7 +164,7 @@ public final class Core {
                 throw ParseError.io("检测到多 key,需要写入 CPA 但未找到 config.yaml")
             }
             prefs.cpaConfigPath = cfg
-            let msg = try CPAWriter(configPath: cfg).addMulti(baseURL: url, keys: allKeys, proxy: proxyURL)
+            let (msg, probedModels) = try CPAWriter(configPath: cfg).addMulti(baseURL: url, keys: allKeys, proxy: proxyURL)
             let entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
                 ts: Date().timeIntervalSince1970,
@@ -172,7 +172,8 @@ public final class Core {
                 format: "cpa-multikey",
                 name: parsed.name,
                 url: url,
-                model: parsed.model,
+                model: probedModels.first ?? parsed.model,
+                models: probedModels.isEmpty ? nil : probedModels,
                 key: nil,
                 keyMasked: "\(allKeys.count) 个 key",
                 targets: ["cpa"],
@@ -1319,7 +1320,9 @@ public final class Core {
         // CPA can aggregate multiple keys and Grok Build stores one key per
         // model table. A CPA activation therefore falls back to OpenCode for
         // pure Grok model lists instead of attempting an unsupported app type.
-        let routedAppType = Self.routeAppType(selectedModels: models, modelsOverride: nil, default: "claude")
+        // 空模型列表同样默认 opencode:未探测/多 key 条目误默认 claude 会把
+        // CPA 端点激活到 Claude Code(nvapi 批量导入被显示为 claude 的事故面)
+        let routedAppType = Self.routeAppType(selectedModels: models, modelsOverride: nil, default: "opencode")
         let appType = routedAppType == "grok" ? "opencode" : routedAppType
 
         var p = ParsedKey()
