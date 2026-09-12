@@ -299,8 +299,8 @@ public final class HistoryStore {
             for e in w.items where !loadedIDs.contains(e.id) { loadedIDs.insert(e.id) }
             merged.sort { $0.ts > $1.ts }
         }
-        // 合并可能带回文件独有的旧条目,重新执行 500 条上限(丢最旧)
-        if merged.count > 500 { merged = Array(merged.prefix(500)) }
+            // 合并可能带回文件独有的旧条目,重新执行上限(丢最旧)
+            merged = Self.applyCap(merged)
         try FileManager.default.createDirectory(at: storeDir, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: storeDir.path)
         let data = try JSONEncoder().encode(Wrapper(items: merged))
@@ -327,8 +327,28 @@ public final class HistoryStore {
         lock.lock()
         defer { lock.unlock() }
         _items.insert(e, at: 0)
-        if _items.count > 500 { _items = Array(_items.prefix(500)) }
+        _items = Self.applyCap(_items)
         try saveLocked(dirtyIDs: [e.id])
+    }
+
+    /// 历史上限 500,但绝不丢弃仍持有外部产物写入凭据的 active 条目:
+    /// 账本不变量要求每个 cc-switch provider / CPA key / Grok route 至少有一条历史指向它,
+    /// 静默裁剪 active 条目会让这些外部产物变孤儿 —— 删不掉、对账不认领。
+    /// 输入按 ts desc:优先从尾部丢弃 deleted / 无 target 条目,凑不够额就保留 active
+    /// (宁可软超限也不制造孤儿)。结果保持 ts desc,不改变 list/snapshot 顺序
+    public static func applyCap(_ items: [HistoryEntry]) -> [HistoryEntry] {
+        guard items.count > 500 else { return items }
+        var keep = items
+        // 从最旧(尾部)开始,丢弃可回收条目直到不超限
+        var idx = keep.count - 1
+        while keep.count > 500, idx >= 0 {
+            let e = keep[idx]
+            let reclaimable = e.status != "active" || e.targets.isEmpty
+            if reclaimable { keep.remove(at: idx) }
+            idx -= 1
+        }
+        // 全部是 active 仍超限时:接受超限而非丢 active(软上限)
+        return keep
     }
 
     public func update(_ e: HistoryEntry) throws {

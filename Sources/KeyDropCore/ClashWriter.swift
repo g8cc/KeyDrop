@@ -123,6 +123,7 @@ final class ClashWriter {
     private static func yamlQuote(_ s: String) -> String {
         let escaped = s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\t", with: "\\t")
         return "\"\(escaped)\""

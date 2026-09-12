@@ -125,11 +125,24 @@ public final class GrokBuildWriter {
         let t = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard t.count >= 2, t.first == "\"", t.last == "\"" else { return t }
         let inner = String(t.dropFirst().dropLast())
-        return inner
-            .replacingOccurrences(of: "\\\"", with: "\"")
-            .replacingOccurrences(of: "\\\\", with: "\\")
-            .replacingOccurrences(of: "\\n", with: "\n")
-            .replacingOccurrences(of: "\\r", with: "\r")
+        // 必须单遍扫描解码:链式 replacingOccurrences 会把「转义的反斜杠 + n」
+        // (原值含字面 \n 两字符 → 编码为 \\n)二次解码成真实换行,
+        // 使含反斜杠的 model/key 读回不相等 → 去重失效、每次导入重复追加段、
+        // 且 remove 的凭据匹配永不命中(删不掉)。
+        var out = ""
+        var it = inner.makeIterator()
+        while let ch = it.next() {
+            guard ch == "\\", let nxt = it.next() else { out.append(ch); continue }
+            switch nxt {
+            case "n": out.append("\n")
+            case "r": out.append("\r")
+            case "t": out.append("\t")
+            case "\"": out.append("\"")
+            case "\\": out.append("\\")
+            default: out.append("\\"); out.append(nxt)   // 非法转义按原文保留
+            }
+        }
+        return out
     }
 
     private func modelID(from line: String) -> String? {

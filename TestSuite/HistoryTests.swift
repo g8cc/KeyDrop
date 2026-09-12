@@ -82,5 +82,39 @@ enum HistoryTests {
             try! extData.write(to: URL(fileURLWithPath: env.dir + "/home/history.json"))
             t.expect(live.snapshot().contains { $0.id.hasPrefix("eeee") }, "外部写入后 snapshot 立即可见(mtime 重载)")
         }
+
+        h.runSuite("History.applyCap 不裁 active 孤儿") { t in
+            // 回归:旧实现 prefix(500) 无差别丢最旧,会把仍持有 cc-switch/CPA/Grok 产物的
+            // active 条目裁掉 → 外部产物瞬间无人认领(删不掉、对账不认领的孤儿)。
+            // 构造 501 条:500 active(带 target)+ 1 deleted(最旧)。
+            var items: [HistoryEntry] = []
+            for i in 0..<500 {
+                var e = entry(String(format: "act-%03d-1111-2222-333344444444", i), ts: TimeInterval(1000 + i))
+                e.targets = ["ccswitch-opencode"]
+                items.append(e)
+            }
+            var dead = entry("del-000-1111-2222-333344444444", ts: 1)   // 最旧且 deleted
+            dead.status = "deleted"
+            dead.targets = []
+            items.append(dead)
+            items.sort { $0.ts > $1.ts }
+            let capped = HistoryStore.applyCap(items)
+            t.equal(capped.count, 500, "501→500 裁掉一条")
+            t.expect(!capped.contains { $0.id.hasPrefix("del-000") }, "优先裁 deleted 条目,active 全保")
+            t.expect(capped.allSatisfy { $0.status == "active" }, "500 条全为 active")
+            // 结果必须仍按 ts 降序(不破坏 list/snapshot/UI 顺序)
+            t.expect(capped.first!.id.hasPrefix("act-499"), "保序:最新在首")
+            t.expect(capped.last!.ts < capped.first!.ts, "ts 严格降序未被 active 优先打乱")
+            // 全 active 超限时软超限(不制造孤儿),而不是硬裁到 500
+            var allActive: [HistoryEntry] = []
+            for i in 0..<505 {
+                var e = entry(String(format: "aa-%04d-1111-2222-333344444444", i), ts: TimeInterval(2000 + i))
+                e.targets = ["cpa"]
+                allActive.append(e)
+            }
+            allActive.sort { $0.ts > $1.ts }
+            let soft = HistoryStore.applyCap(allActive)
+            t.equal(soft.count, 505, "全 active 时宁可软超限也不裁(不制造孤儿)")
+        }
     }
 }

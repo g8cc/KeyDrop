@@ -88,6 +88,18 @@ enum ParserTests {
             // 手贴模型名被抢成 https://qwen3.8-flash 且模型丢失
             t.expect(!Parser.looksLikeURL("qwen3.8-flash"), "带点模型名不是 URL")
             t.expect(Parser.looksLikeURL("sub.example.com"), "真裸域名仍是 URL")
+
+            // 回归:家族词已吃掉首位数字的「点分版本名」o3.5 / k2.5 —— 前缀判别不命中,
+            // 曾被 looksLikeURL 当裸域名抢走、looksLikeModel 又排除,两头不认两头丢。
+            // 通用判别:恰好一点 + 末段全数字(真域名末段 TLD 恒为字母)
+            t.expect(!Parser.looksLikeURL("o3.5"), "o3.5 不是 URL")
+            t.expect(Parser.looksLikeModel("o3.5"), "o3.5 是模型")
+            t.expect(!Parser.looksLikeURL("k2.5"), "k2.5 不是 URL")
+            t.expect(Parser.looksLikeModel("k2.5"), "k2.5 是模型")
+            // IPv4 多段点分仍是 URL(末段数字判别只作用于「恰好一点」形态,不受多段影响)
+            t.expect(Parser.looksLikeURL("1.2.3.4"), "IPv4 仍是 URL")
+            // 真域名末段是字母(TLD),不会被误判成点分版本模型
+            t.expect(Parser.looksLikeURL("qwen.ai"), "家族词+.ai 域名仍是 URL")
             let pastedDotted = try! Parser.parseWithFallback(
                 "https://s2api.example.top sk-abc123def456ghi789jkl qwen3.8-flash"
             )

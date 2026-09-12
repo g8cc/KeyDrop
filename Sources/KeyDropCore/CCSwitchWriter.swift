@@ -732,15 +732,30 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         let meta = appType == "codex"
             ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
             : "{}"
-        try db.run(
-            "INSERT INTO providers (id, app_type, name, settings_config, created_at, meta, is_current) VALUES (?,?,?,?,?,?,?)",
-            [pid, appType, name, settingsConfig, now, meta, promote ? 1 : 0]
-        )
-        // endpoint 行与 add() 对齐:cc-switch 界面展示 URL、后续按 URL 去重都依赖它
-        try db.run(
-            "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at) VALUES (?, ?, ?, ?)",
-            [pid, appType, appType == "opencode" ? opencodeBaseURL(url) : url, now]
-        )
+        // 事务包住两条 INSERT + 可选 demote:repair 此前是无事务裸写,provider 插成功、
+        // endpoint 插失败会留下「无 endpoint 行的 provider」——URL 去重查不到它,
+        // 且重试在 existing!=nil 处短路,永远补不上。
+        // promote 时还必须像 add() 一样把他行 is_current 归零:settings 指针失效但
+        // DB 里另一 provider 仍标 current 的场景下,不 demote 会造出双 current
+        try db.exec("BEGIN IMMEDIATE")
+        do {
+            if promote {
+                try db.run("UPDATE providers SET is_current = 0 WHERE app_type = ? AND id != ?", [appType, pid])
+            }
+            try db.run(
+                "INSERT INTO providers (id, app_type, name, settings_config, created_at, meta, is_current) VALUES (?,?,?,?,?,?,?)",
+                [pid, appType, name, settingsConfig, now, meta, promote ? 1 : 0]
+            )
+            // endpoint 行与 add() 对齐:cc-switch 界面展示 URL、后续按 URL 去重都依赖它
+            try db.run(
+                "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at) VALUES (?, ?, ?, ?)",
+                [pid, appType, appType == "opencode" ? opencodeBaseURL(url) : url, now]
+            )
+            try db.exec("COMMIT")
+        } catch {
+            try? db.exec("ROLLBACK")
+            throw error
+        }
         if promote {
             try updateSwitchSettings(pid, for: appType)
         }

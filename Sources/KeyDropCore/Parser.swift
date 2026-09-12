@@ -984,6 +984,16 @@ public enum Parser {
         return Data(base64Encoded: t, options: [.ignoreUnknownCharacters])
     }
 
+    /// 带点模型名(o3.5 / k2.5 / glm-5.2):恰好一个点、末段全数字、首段含字母。
+    /// 真域名的末段(TLD)永远是字母(com/ai/net),IPv4 是多段点分——两者都不满足本式,
+    /// 故可作「家族词外的点分模型名」的通用判别,不依赖家族白名单。
+    static func isDottedVersionModel(_ s: String) -> Bool {
+        let segs = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard segs.count == 2, let last = segs.last, !last.isEmpty else { return false }
+        guard last.allSatisfy({ $0.isNumber }) else { return false }
+        return segs[0].contains(where: { $0.isLetter })
+    }
+
     public static func looksLikeURL(_ s: String) -> Bool {
         let l = stripCJK(s).lowercased()
         guard !l.contains(where: { $0.isWhitespace }) else { return false }
@@ -993,9 +1003,12 @@ public enum Parser {
         // 裸域名(如 sub.relay-test.example.com):无协议、形如 hostname 且至少一个点。
         // 家族排除用「词+[-或数字]」:qwen3.8-flash / gpt5.2-mini 这类带点模型名
         // 形如 hostname,若只排除「词-」会被当 URL 抢走,classify 里 URL 优先于模型,
-        // 手贴模型名就丢了(真实事故:s2api.top 的 qwen3.8-flash)
+        // 手贴模型名就丢了(真实事故:s2api.top 的 qwen3.8-flash)。
+        // 再用 isDottedVersionModel 兜住 o3.5/k2.5:家族词(o3/k2)已吃掉首位数字,
+        // 「词+[-\d]」不命中其后紧跟的点,靠末段全数字判回模型,否则 URL 抢占丢模型
         guard l.range(of: #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#, options: .regularExpression) != nil,
               !l.contains(".."),
+              !isDottedVersionModel(l),
               l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
         else { return false }
         return URL(string: "https://" + l)?.host?.isEmpty == false
@@ -1135,9 +1148,11 @@ public enum Parser {
         let l = s.lowercased()
         if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
         // 带点的「纯主机名字符」默认当域名排除,但家族模型名(qwen3.8-flash /
-        // gpt5.2-mini 等「家族词+数字」新版命名)必须放行:前缀放宽为 词+[-或数字],
+        // gpt5.2-mini 等「家族词+数字」新版命名)与点分版本名(o3.5 / k2.5)必须放行:
+        // 前者靠「词+[-或数字]」前缀,后者末段全数字、真域名末段(TLD)恒为字母。
         // 词后紧跟点的真域名(qwen.example.com)仍被排除
         if s.contains("."), s.range(of: #"^[a-z0-9][a-z0-9.-]*$"#, options: [.regularExpression, .caseInsensitive]) != nil,
+           !isDottedVersionModel(l),
            s.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
         { return false }
         let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"

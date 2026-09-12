@@ -90,6 +90,23 @@ enum GrokBuildWriterTests {
             let urlFixed = coexistEnv.read("grok.toml")
             t.contains(urlFixed, "base_url = \"https://relay2.example.org/v1\"", "base_url 原地更新")
             t.equal(urlFixed.components(separatedBy: "[model.").count - 1, 1, "同 key 重导入不产生重复段")
+
+            // 回归:decodeTomlString 曾用链式 replace,「字面反斜杠+n」编码为 \\n 后
+            // 被二遍解码成真实换行 → 模型名读回不相等,重导入不去重、remove 删不掉
+            let bsEnv = try! TestEnv("grok-backslash")
+            defer { bsEnv.cleanup() }
+            let w3 = GrokBuildWriter(configPath: bsEnv.dir + "/grok.toml")
+            let bsModel = "path\\name\\v2"   // 含字面反斜杠的模型名
+            _ = try! w3.sync(baseURL: "https://bs.example.org/v1", key: "sk-bs-key-1111111111",
+                             models: [bsModel], removing: [])
+            _ = try! w3.sync(baseURL: "https://bs.example.org/v1", key: "sk-bs-key-1111111111",
+                             models: [bsModel], removing: [])
+            let bsCfg = bsEnv.read("grok.toml")
+            t.equal(bsCfg.components(separatedBy: "[model.").count - 1, 1, "反斜杠模型重导入仍只一段(修复前每导一次多一段)")
+            let rmMsg = try! w3.remove(baseURL: "https://bs.example.org/v1", key: "sk-bs-key-1111111111",
+                                       models: [bsModel])
+            t.contains(rmMsg, "移除 1", "反斜杠模型可按凭据删除: \(rmMsg)")
+            t.expect(!bsEnv.read("grok.toml").contains("sk-bs-key-1111111111"), "删除后配置无残留")
         }
     }
 }

@@ -84,8 +84,12 @@ public enum AppLog {
             }
         }
         try? FileManager.default.removeItem(at: dir.appendingPathComponent("keydrop.log.1"))
-        try? FileManager.default.moveItem(at: file, to: dir.appendingPathComponent("keydrop.log.1"))
-        FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        // 只有搬走成功才能截断当前日志:move 失败(跨卷/权限)时若仍 createFile(nil),
+        // 等于把刚"轮转失败"的日志直接清空 —— 静默丢失。失败则保留原文件下次再轮转
+        let rotateOK = (try? FileManager.default.moveItem(at: file, to: dir.appendingPathComponent("keydrop.log.1"))) != nil
+        if rotateOK {
+            FileManager.default.createFile(atPath: file.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
     }
 
     private static func fileSize() -> Int64 {

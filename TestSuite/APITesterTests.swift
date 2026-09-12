@@ -310,6 +310,25 @@ enum APITesterTests {
                 proxy: "http://127.0.0.1:1"
             )
             t.expect(!deadProxy.ok, "代理也不可用 → 失败")
+
+            // proxyDictionary:socks5 必须走 SOCKS 键(曾按 HTTP 代理建 session,
+            // 对 SOCKS 端口发 CONNECT → 每 key 误判 err/dead → 小时级扫描清库)
+            if let d = APITester.proxyDictionary(for: "socks5://127.0.0.1:7890") {
+                t.expect(d[kCFNetworkProxiesSOCKSEnable as String] != nil, "socks5 用 SOCKS 键")
+                t.expect(d[kCFNetworkProxiesHTTPEnable as String] == nil, "socks5 不得塞 HTTP 键")
+            } else { t.expect(false, "socks5:// 应解析出字典") }
+            // 裸 host:port 补全为 http 代理(曾 URL(string:) 返回 nil 静默回落直连)
+            if let d = APITester.proxyDictionary(for: "127.0.0.1:7890") {
+                t.expect(d[kCFNetworkProxiesHTTPEnable as String] != nil, "裸 host:port 按 http 代理")
+            } else { t.expect(false, "裸 host:port 应解析出字典") }
+            // 标准 http 代理键齐全,host/port 正确
+            if let d = APITester.proxyDictionary(for: "http://127.0.0.1:7890") {
+                t.equal(d[kCFNetworkProxiesHTTPProxy as String] as? String, "127.0.0.1", "http 代理 host")
+                t.equal(d[kCFNetworkProxiesHTTPPort as String] as? Int, 7890, "http 代理 port")
+            } else { t.expect(false, "http:// 应解析出字典") }
+            // 空/无法识别 → nil(直连,而非用错字典把探测全打挂)
+            t.expect(APITester.proxyDictionary(for: "") == nil, "空代理 = 直连")
+            t.expect(APITester.proxyDictionary(for: "not a proxy") == nil, "非法形态 = 直连")
         }
     }
 }

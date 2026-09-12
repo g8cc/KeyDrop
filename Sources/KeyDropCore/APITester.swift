@@ -52,12 +52,51 @@ public enum APITester {
     private static let proxySessionLock = NSLock()
     private static var proxySessions: [String: URLSession] = [:]
 
+    /// 解析代理字符串为 connectionProxyDictionary;nil = 视为直连。
+    /// 修三类输入误配置(真实事故:用户填 socks5:// 或裸 host:port):
+    /// - socks5:// 填了却按 HTTP 代理建 session → 每次探测对 SOCKS 端口发 HTTP CONNECT,
+    ///   握手必败 → 所有 key 被误标 err/dead,小时级扫描还可能连带 clearDead 删掉
+    /// - 裸 `127.0.0.1:7890` URL(string:) 返回 nil → 静默回落直连,用户以为走了代理
+    /// 纯函数便于测试;scheme 缺省按 http 代理补全
+    public static func proxyDictionary(for raw: String) -> [String: Any]? {
+        let p = raw.trimmingCharacters(in: .whitespaces)
+        guard !p.isEmpty else { return nil }
+        let spec: String
+        let isSocks: Bool
+        if p.lowercased().hasPrefix("socks5://") || p.lowercased().hasPrefix("socks5h://") {
+            spec = p; isSocks = true
+        } else if p.lowercased().hasPrefix("http://") || p.lowercased().hasPrefix("https://") {
+            spec = p; isSocks = false
+        } else if p.range(of: #"^[A-Za-z0-9.\-]+:\d+$"#, options: .regularExpression) != nil {
+            spec = "http://" + p; isSocks = false   // 裸 host:port 按 http 代理补全
+        } else {
+            return nil   // 无法识别的形态:直连,而不是用错字典把探测全打挂
+        }
+        guard let url = URL(string: spec), let host = url.host, !host.isEmpty else { return nil }
+        let port = url.port ?? (isSocks ? 1080 : (spec.hasPrefix("https") ? 443 : 80))
+        if isSocks {
+            return [
+                kCFNetworkProxiesSOCKSEnable as String: true,
+                kCFNetworkProxiesSOCKSProxy as String: host,
+                kCFNetworkProxiesSOCKSPort as String: port,
+            ]
+        }
+        return [
+            kCFNetworkProxiesHTTPEnable as String: true,
+            kCFNetworkProxiesHTTPProxy as String: host,
+            kCFNetworkProxiesHTTPPort as String: port,
+            kCFNetworkProxiesHTTPSEnable as String: true,
+            kCFNetworkProxiesHTTPSProxy as String: host,
+            kCFNetworkProxiesHTTPSPort as String: port,
+        ]
+    }
+
     /// 代理非空时创建带 connectionProxyDictionary 的 session;否则复用默认。
     /// 创建也在锁内:URLSession(configuration:) 构造很轻(不动网络),锁外 check-then-create
     /// 会让两个线程同时 miss 各建一个,被弃用的那个永不 invalidate → 常驻泄漏。
     private static func session(for proxy: String?) -> URLSession {
         let p = proxy?.trimmingCharacters(in: .whitespaces) ?? ""
-        guard !p.isEmpty, let url = URL(string: p) else { return session }
+        guard let dict = proxyDictionary(for: p) else { return session }
         proxySessionLock.lock()
         defer { proxySessionLock.unlock() }
         if let cached = proxySessions[p] { return cached }
@@ -76,14 +115,7 @@ public enum APITester {
         c.timeoutIntervalForRequest = 12
         c.timeoutIntervalForResource = 20
         c.httpMaximumConnectionsPerHost = 2
-        c.connectionProxyDictionary = [
-            kCFNetworkProxiesHTTPEnable: true,
-            kCFNetworkProxiesHTTPProxy: url.host ?? "",
-            kCFNetworkProxiesHTTPPort: url.port ?? (url.scheme == "https" ? 443 : 80),
-            kCFNetworkProxiesHTTPSEnable: true,
-            kCFNetworkProxiesHTTPSProxy: url.host ?? "",
-            kCFNetworkProxiesHTTPSPort: url.port ?? (url.scheme == "https" ? 443 : 80),
-        ]
+        c.connectionProxyDictionary = dict
         let s = URLSession(configuration: c)
         proxySessions[p] = s
         return s
@@ -274,9 +306,12 @@ public enum APITester {
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
-            // HTML 盾页(CF 挑战)≠ 认证失败,与 /models 探测口径一致
-            if status == 401 || (status == 403 && !isHTMLBody(body)) {
-                return (nil, nil, status)
+            // HTML 盾页(CF 挑战/basic-auth realm)≠ 认证失败,与 /models 探测口径一致:
+            // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
+            // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
+            if status == 401 || status == 403 {
+                if !isHTMLBody(body) { return (nil, nil, status) }
+                continue   // 盾页:跳过本候选,不误判 authFailed
             }
             if status == 429 || status == 402 {
                 let low = body.lowercased()

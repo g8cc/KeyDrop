@@ -985,17 +985,25 @@ public final class Core {
                         models: models,
                         removing: previousModels
                     )
-                    _ = try? cc.remove(providerID: oldPid, renamedFrom: entry.ccRenamedFrom,
-                                       renamedTo: entry.ccRenamedTo, appType: oldAppType)
-                    entry.targets.removeAll { $0.hasPrefix("ccswitch") }
                     entry.targets.append("grok")
-                    entry.ccProviderID = nil
-                    entry.ccRenamedFrom = nil
-                    entry.ccRenamedTo = nil
                     entry.grokConfigPath = writer.configPath
                     entry.models = models
                     entry.model = models.first
-                    return "已迁移: \(oldAppType) → Grok Build(\(msg))"
+                    // 旧 cc provider 删除成功才解除认领:try? 失败时 provider 仍活在
+                    // cc-switch,若照旧摘掉 ccswitch 标签+pid,它就成 delete/reconcile
+                    // 都不认领的孤儿(与 add() 的「删成功才摘牌」守卫口径一致)。
+                    // 失败则 grok/cc 标签并存,后续 delete 会继续清 cc 侧
+                    do {
+                        _ = try cc.remove(providerID: oldPid, renamedFrom: entry.ccRenamedFrom,
+                                          renamedTo: entry.ccRenamedTo, appType: oldAppType)
+                        entry.targets.removeAll { $0.hasPrefix("ccswitch") }
+                        entry.ccProviderID = nil
+                        entry.ccRenamedFrom = nil
+                        entry.ccRenamedTo = nil
+                        return "已迁移: \(oldAppType) → Grok Build(\(msg))"
+                    } catch {
+                        return "已迁移 Grok Build(\(msg)),但旧 \(oldAppType) provider 清理失败,账本仍认领它可再删: \(error.localizedDescription)"
+                    }
                 } catch {
                     return "⚠ 迁移到 Grok Build 失败: \(error.localizedDescription)"
                 }
@@ -1067,20 +1075,30 @@ public final class Core {
             do {
                 let r = try cc.add(p, nameOverride: entry.name,
                                    appType: newAppType, models: models, proxy: proxyForHealth())
-                if let path = entry.grokConfigPath {
-                    _ = try? GrokBuildWriter(configPath: path).remove(
-                        baseURL: url, key: key,
-                        models: entry.models ?? (entry.model.map { [$0] } ?? [])
-                    )
-                }
-                entry.targets.removeAll { $0 == "grok" }
+                // 新 cc provider 已建;删旧 grok route 成功才摘 grok 牌。
+                // 删除失败(锁/IO)时旧 [model.*] 表仍在,若照旧 removeAll("grok")
+                // 会留下无人认领的 grok 段 —— 保留 grok 标签让 delete 继续负责清理
                 entry.targets.append(newAppType == "claude" ? "ccswitch" : "ccswitch-\(newAppType)")
                 entry.ccProviderID = r.providerID
                 entry.ccRenamedFrom = r.renamedFrom
                 entry.ccRenamedTo = r.renamedTo
                 entry.models = models
                 entry.model = models.first
-                return "已迁移: Grok Build → \(newAppType)"
+                var grokNote = ""
+                if let path = entry.grokConfigPath {
+                    do {
+                        _ = try GrokBuildWriter(configPath: path).remove(
+                            baseURL: url, key: key,
+                            models: entry.models ?? (entry.model.map { [$0] } ?? [])
+                        )
+                        entry.targets.removeAll { $0 == "grok" }
+                    } catch {
+                        grokNote = "(旧 grok 段清理失败,账本仍认领:\(error.localizedDescription))"
+                    }
+                } else {
+                    entry.targets.removeAll { $0 == "grok" }
+                }
+                return "已迁移: Grok Build → \(newAppType)\(grokNote)"
             } catch {
                 return "⚠ Grok Build → \(newAppType) 迁移失败: \(error.localizedDescription)"
             }

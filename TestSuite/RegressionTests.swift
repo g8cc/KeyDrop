@@ -539,74 +539,194 @@ enum RegressionTests {
             t.expect(!cfg4.contains("nvapi-ooo777ppp888qqq999rrr333"), "key 3 已移除")
         }
 
+        h.runSuite("Regression.CPA 合并:models 段在前不丢 key") { t in
+            let env = try! TestEnv("reg-cpa-order")
+            defer { env.cleanup() }
+            let core = Core()
+            guard let srv = try? MockHTTPServer(mode: .openAI) else { t.expect(false, "mock 启动失败"); return }
+            let host = "127.0.0.1"
+            // 手写/CPA 工具回写的合法字段序:models: 排在 api-key-entries: 之前。
+            // 修复前:merge 时先插 models 使行号位移,再用失效 range 扫 api-key-entries,
+            // 新 key 静默丢弃却报告成功(账本谎报)。
+            env.write("cpa-config.yaml",
+"""
+port: 18317
+
+openai-compatibility:
+  - name: \(host):\(srv.port)
+    base-url: "http://\(host):\(srv.port)/v1"
+    models:
+      - name: zzz-existing
+        alias: ""
+    api-key-entries:
+      - api-key: sk-ordered-existing-111111
+""")
+            let base = "http://\(host):\(srv.port)/v1"
+            let outcome = try! core.add(raw: "\(base) sk-brand-new-key-222222 sk-another-new-333333",
+                                        ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
+            t.expect(outcome.ok, "合并导入成功")
+            let cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "sk-brand-new-key-222222", "新 key 1 落盘(修复前静默丢失)")
+            t.contains(cfg, "sk-another-new-333333", "新 key 2 落盘(修复前静默丢失)")
+            t.contains(cfg, "sk-ordered-existing-111111", "既有 key 保留")
+            // 新 key 必须缩进在 api-key-entries 之下,不能顶格损坏 YAML
+            for ln in cfg.components(separatedBy: "\n") {
+                if ln.contains("sk-brand-new-key-222222") {
+                    t.expect(ln.hasPrefix("      - api-key:"), "新 key 正确缩进: \(ln)")
+                }
+            }
+            // YAML 仍合法(顶格会触发校验回滚)
+            let y = Process()
+            y.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            y.arguments = ["-c", "import yaml,sys; yaml.safe_load(open('\(env.dir)/cpa-config.yaml'))"]
+            try? y.run(); y.waitUntilExit()
+            t.expect(y.terminationStatus == 0, "合并后 YAML 合法")
+        }
+
+        h.runSuite("Regression.CPA 删除:跨段 key 两处都清") { t in
+            let env = try! TestEnv("reg-cpa-crossdel")
+            defer { env.cleanup() }
+            let core = Core()
+            // 同一把 key 同时存在于平铺段与聚合段(先单 key 导入再多 key 导入的现实结果)。
+            // 修复前:删平铺段就 pending.remove,聚合段副本存活却报告「已移除」→ 僵尸凭据
+            env.write("cpa-config.yaml",
+"""
+port: 18317
+
+claude-api-key:
+  - api-key: sk-dual-home-999999
+    base-url: https://dual.example.org/v1
+
+openai-compatibility:
+  - name: dual.example.org
+    base-url: "https://dual.example.org/v1"
+    api-key-entries:
+      - api-key: sk-dual-home-999999
+""")
+            // 通过 Core.delete 走真实用户路径:构造一条指向该 key 的 cpa 历史条目,
+            // delete() 会从 raw 提取 key 再调 CPAWriter.remove(apiKeys:)
+            let seeded = HistoryEntry(
+                id: "crossdel-1111-2222-3333-444444444444", ts: 1,
+                raw: "https://dual.example.org/v1\nsk-dual-home-999999", format: "multiline",
+                name: "dual", url: "https://dual.example.org/v1", model: nil, models: nil,
+                key: "sk-dual-home-999999", keyMasked: "sk-d…", targets: ["cpa"],
+                ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: env.dir + "/cpa-config.yaml", status: "active"
+            )
+            try! core.history.append(seeded)
+            let msg = try! core.delete(entryIDPrefix: "crossdel")
+            let cfg = env.read("cpa-config.yaml")
+            t.expect(!cfg.contains("sk-dual-home-999999"), "两段副本全部清除")
+            t.contains(msg, "移除", "报告移除: \(msg)")
+            // 聚合条目内 key 清空后整条目移除,不留空 api-key-entries:
+            t.expect(!cfg.contains("api-key-entries"), "无残留空 api-key-entries 头")
+            let y = Process()
+            y.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            y.arguments = ["-c", "import yaml; yaml.safe_load(open('\(env.dir)/cpa-config.yaml'))"]
+            try? y.run(); y.waitUntilExit()
+            t.expect(y.terminationStatus == 0, "删除后 YAML 合法")
+        }
+
         h.runSuite("Regression.CPA 多 key 合并追加模型") { t in
             let env = try! TestEnv("reg-cpa-nvmodels")
             defer { env.cleanup() }
             let core = Core()
-            env.write("cpa-config.yaml", "port: 18317\n")
-            guard let srvA = try? MockHTTPServer(mode: .openAI),
-                  let srvB = try? MockHTTPServer(mode: .manyModels) else {
-                t.expect(false, "mock 启动失败")
-                return
+            guard let srv = try? MockHTTPServer(mode: .manyModels) else {
+                t.expect(false, "mock 启动失败"); return
             }
-            // 同 host 不同端口:聚合条目 name 都是主机名,必然走合并路径,
-            // 且第二批探测到的模型列表与第一批不同(追加而非重复)
-            let rawA = "http://127.0.0.1:\(srvA.port)/v1 nvapi-aaa111bbb222ccc333ddd111 nvapi-eee444fff555ggg666hhh222"
-            let outcomeA = try! core.add(raw: rawA, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
-            t.expect(outcomeA.ok, "第一批导入成功")
-            let rawB = "http://127.0.0.1:\(srvB.port)/v1 nvapi-sss444ttt555uuu666vvv777 nvapi-www888xxx999yyy000zzz111"
-            let outcomeB = try! core.add(raw: rawB, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
-            t.expect(outcomeB.ok, "第二批导入成功(修复前重复 models 键导致 YAML 校验回滚)")
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            // 预置聚合条目(含既有 key 与既有 models 段),导入探测到 manyModels 的
+            // 8 个模型 + 新 key 必须合并进同一条目:key 追加、模型追加去重、models 段唯一。
+            // (曾用「同 host 不同端口两批导入」触发合并,那依赖旧的丢端口 bug;
+            //  现在聚合名含端口,改用预置同端点配置确定性地走合并路径。)
+            env.write("cpa-config.yaml",
+"""
+port: 18317
+
+openai-compatibility:
+  - name: 127.0.0.1:\(srv.port)
+    base-url: "\(base)"
+    models:
+      - name: seedmodel1
+        alias: ""
+    api-key-entries:
+      - api-key: nvapi-seed-1111111111
+""")
+            let outcome = try! core.add(
+                raw: "\(base) nvapi-aaa111bbb222ccc333ddd111 nvapi-eee444fff555ggg666hhh222",
+                ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
+            t.expect(outcome.ok, "合并导入成功(修复前重复 models 键导致 YAML 校验回滚)")
             let cfg = env.read("cpa-config.yaml")
-            t.contains(cfg, "nvapi-aaa111bbb222ccc333ddd111", "第一批 key 保留")
-            t.contains(cfg, "nvapi-sss444ttt555uuu666vvv777", "第二批 key 合并写入")
+            t.contains(cfg, "nvapi-seed-1111111111", "既有 key 保留")
+            t.contains(cfg, "nvapi-aaa111bbb222ccc333ddd111", "新 key 合并写入")
+            t.contains(cfg, "seedmodel1", "既有模型保留")
             t.contains(cfg, "model-1-sample", "新模型已追加")
             t.equal(cfg.components(separatedBy: "models:").count - 1, 1, "models 段唯一(修复前重复键)")
-            t.contains(cfg, "glm-5.2", "第一批模型保留")
+            t.equal(cfg.components(separatedBy: "  - name: 127.0.0.1:").count - 1, 1, "仍是一个聚合条目")
         }
 
-        // 修复:mergeIntoAggregatedEntry 曾在插 keys 后再用失效 range 合并一次 models,
-        // 导致模型被追加两遍;条目原本无 models 段时会写出重复 `models:` 键触发 YAML 校验回滚。
+        // 修复:mergeIntoAggregatedEntry 合并 models 必须幂等去重。
+        // 曾两处踩坑:(a) 插 keys 后再用失效 range 合并一次 models → 模型追加两遍;
+        // (b) 条目无 models 段时写出重复 `models:` 键 → YAML 校验回滚、整批失败。
         h.runSuite("Regression.CPA 合并模型不重复") { t in
-            // 场景 A:第一批已有 models,第二批追加不同 models
+            // 场景 A:预置聚合条目已含 model-1-sample,导入 manyModels(含同名)→ 去重不重复
             let env = try! TestEnv("reg-cpa-dedup-a")
             defer { env.cleanup() }
             let core = Core()
-            env.write("cpa-config.yaml", "port: 18317\n")
-            guard let srvA = try? MockHTTPServer(mode: .openAI),
-                  let srvB = try? MockHTTPServer(mode: .manyModels) else {
+            guard let srv = try? MockHTTPServer(mode: .manyModels) else {
                 t.expect(false, "mock 启动失败"); return
             }
-            let rawA = "http://127.0.0.1:\(srvA.port)/v1 nvapi-aaa111bbb222ccc333ddd111 nvapi-eee444fff555ggg666hhh222"
-            _ = try! core.add(raw: rawA, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
-            let rawB = "http://127.0.0.1:\(srvB.port)/v1 nvapi-sss444ttt555uuu666vvv777 nvapi-www888xxx999yyy000zzz111"
-            _ = try! core.add(raw: rawB, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            env.write("cpa-config.yaml",
+"""
+port: 18317
+
+openai-compatibility:
+  - name: 127.0.0.1:\(srv.port)
+    base-url: "\(base)"
+    models:
+      - name: model-1-sample
+        alias: ""
+    api-key-entries:
+      - api-key: nvapi-seed-1111111111
+""")
+            _ = try! core.add(
+                raw: "\(base) nvapi-aaa111bbb222ccc333ddd111 nvapi-eee444fff555ggg666hhh222",
+                ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
             let cfg = env.read("cpa-config.yaml")
             for n in 1...8 {
                 t.equal(cfg.components(separatedBy: "- name: model-\(n)-sample").count - 1, 1,
                         "模型 model-\(n)-sample 只出现一次(修复前被追加两遍)")
             }
             t.equal(cfg.components(separatedBy: "models:").count - 1, 1, "models 段唯一")
+            t.contains(cfg, "nvapi-aaa111bbb222ccc333ddd111", "新 key 合并进既有条目")
 
-            // 场景 B:第一批无 models(chatOK 空列表),第二批有 models
-            // 修复前第二次合并会追加重复 `models:` 键 → YAML 校验回滚,整批导入失败
+            // 场景 B:预置聚合条目无 models 段,导入有 models → 新建唯一 models 段(不重复键)
             let env2 = try! TestEnv("reg-cpa-dedup-b")
             defer { env2.cleanup() }
             let core2 = Core()
-            env2.write("cpa-config.yaml", "port: 18317\n")
-            guard let srvC = try? MockHTTPServer(mode: .chatOK),
-                  let srvD = try? MockHTTPServer(mode: .manyModels) else {
+            guard let srv2 = try? MockHTTPServer(mode: .manyModels) else {
                 t.expect(false, "mock 启动失败"); return
             }
-            let rawC = "http://127.0.0.1:\(srvC.port)/v1 nvapi-aaa111bbb222ccc333ddd111 nvapi-bbb111bbb222ccc333ddd111"
-            _ = try! core2.add(raw: rawC, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
-            let rawD = "http://127.0.0.1:\(srvD.port)/v1 nvapi-sss444ttt555uuu666vvv777 nvapi-www888xxx999yyy000zzz111"
-            let outD = try? core2.add(raw: rawD, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
-            t.expect(outD?.ok == true, "第一批无 models、第二批有 models 时导入成功(修复前重复键回滚)")
+            let base2 = "http://127.0.0.1:\(srv2.port)/v1"
+            env2.write("cpa-config.yaml",
+"""
+port: 18317
+
+openai-compatibility:
+  - name: 127.0.0.1:\(srv2.port)
+    base-url: "\(base2)"
+    api-key-entries:
+      - api-key: nvapi-seed-cccccccc
+""")
+            let outD = try? core2.add(
+                raw: "\(base2) nvapi-sss444ttt555uuu666vvv777 nvapi-www888xxx999yyy000zzz111",
+                ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
+            t.expect(outD?.ok == true, "无 models 段的条目导入有 models 时成功(修复前重复键回滚)")
             let cfg2 = env2.read("cpa-config.yaml")
             t.equal(cfg2.components(separatedBy: "models:").count - 1, 1, "models 段唯一(无重复键)")
             t.contains(cfg2, "nvapi-sss444ttt555uuu666vvv777", "第二批 key 写入")
-            t.contains(cfg2, "- name: model-1-sample", "第二批模型写入")
+            t.contains(cfg2, "- name: model-1-sample", "模型写入")
         }
 
         // 修复:同 key 同 URL 但模型家族变化的重导入,旧的跨 app_type provider 必须清理,

@@ -240,7 +240,7 @@ final class CPAWriter {
         // 定位 openai-compatibility 段下同 name 的现有条目
         if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
             // 已有同 name 条目:合并新 key 进 api-key-entries,合并 models
-            try mergeIntoAggregatedEntry(&lines, range: entryRange, keys: keys, models: models)
+            try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: models)
         } else {
             // 新建条目
             try appendAggregatedEntry(&lines, providerName: providerName, baseURL: baseURL,
@@ -251,11 +251,14 @@ final class CPAWriter {
         return "已写入 \(keys.count) 个 key 到 CPA 聚合条目「\(providerName)」\(modelPart)"
     }
 
-    /// 聚合条目 name 取 baseURL 主机名(去端口);失败回退完整 URL
+    /// 聚合条目 name 取 baseURL 的 host[:port]。端口必须计入:同一 host 的不同端口
+    /// 是不同上游端点,只取 host 会把 8317 和 9090 两批 key 并进同一条目,
+    /// 后一批 key 被挂到先一批的 base-url 上轮询(静默路由错端点)。
+    /// 无端口 URL 的 name 与历史一致(host),存量条目不受影响
     private func aggregatedName(for baseURL: String) -> String {
         let trimmed = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        if let host = URL(string: trimmed)?.host ?? URL(string: "https://\(trimmed)")?.host,
-           !host.isEmpty {
+        if let u = URL(string: trimmed) ?? URL(string: "https://\(trimmed)"), let host = u.host, !host.isEmpty {
+            if let port = u.port { return "\(host):\(port)" }
             return host
         }
         return trimmed
@@ -367,20 +370,23 @@ final class CPAWriter {
     // MARK: - aggregated write helpers
 
     /// 合并 keys 和 models 进现有聚合条目;keys 去重(已有的跳过),models 同样。
-    /// 必须先合并 models 再插 keys:models 的插入点在 api-key-entries 之后,
-    /// 先插 keys 会使 models 段的整体行号后移,按插入前行号扫描会漏掉部分已有模型。
-    /// 注意:models 只能在这里合并一次。曾经在插 keys 之后再合并一次(用已失效的
-    /// range),导致重复追加模型,条目无 models 段时更会写出重复的 `models:` 键,
-    /// 触发 YAML 重复键校验回滚、第二批导入整体失败。
-    private func mergeIntoAggregatedEntry(_ lines: inout [String], range: Range<Int>, keys: [String], models: [String]) throws {
-        // models 合并(去重):必须在插 keys 之前完成,且只做一次
+    /// models 与 keys 的插入都会使后续行号整体位移,所以每次插入后必须重新定位条目范围
+    /// 再扫描/插入下一项。曾两次踩这个坑:先用失效 range 合并 models(重复 `models:` 键、
+    /// 第二批整体回滚),后又用「models 插入后失效的 range」扫描 api-key-entries ——
+    /// 当配置里 models: 排在 api-key-entries: 之前(手写或 CPA 工具回写的合法字段序),
+    /// 新 key 会被静默丢弃却报告成功。现在 models 合并完重新 findAggregatedEntry 取新 range。
+    private func mergeIntoAggregatedEntry(_ lines: inout [String], range: Range<Int>, providerName: String, keys: [String], models: [String]) throws {
+        // models 合并(去重)
         if !models.isEmpty {
             try mergeAggregatedModels(&lines, entryRange: range, newModels: models)
         }
 
+        // models 插入可能已使原 range 失效:重新定位条目范围再处理 keys
+        let keyRange = models.isEmpty ? range : (findAggregatedEntry(in: lines, providerName: providerName) ?? range)
+
         // 提取已有 keys
         var existingKeys = Set<String>()
-        if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: range) {
+        if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: keyRange) {
             for i in entriesRange {
                 let t = lines[i].trimmingCharacters(in: .whitespaces)
                 if t.hasPrefix("- api-key:") {
@@ -393,15 +399,18 @@ final class CPAWriter {
         guard !newKeys.isEmpty else { return }
 
         // 在 api-key-entries 末尾追加新 key
-        if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: range) {
-            // 计算 entries 缩进(从首行推断)
+        if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: keyRange) {
+            // 计算 entries 缩进:从第一条非空行推断(api-key-entries: 后紧跟空行时,
+            // 首行 lowerBound 是空行,若据其取缩进会得到 "" → key 插到顶格损坏 YAML)
             let indent: String = {
-                if entriesRange.isEmpty { return "      " }
-                let firstLine = lines[entriesRange.lowerBound]
-                let pre = firstLine.prefix(while: { $0 == " " || $0 == "\t" })
-                return String(pre)
+                for i in entriesRange {
+                    let l = lines[i]
+                    if l.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+                    return String(l.prefix(while: { $0 == " " || $0 == "\t" }))
+                }
+                return "      "
             }()
-            // 插入位置:entries 段尾部前一行(跳过空行)
+            // 插入位置:最后一条非空 entry 之后(跳过尾随空行)
             var insertAt = entriesRange.upperBound
             while insertAt > entriesRange.lowerBound, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty {
                 insertAt -= 1
@@ -529,19 +538,21 @@ final class CPAWriter {
         try Self.validateYAML(path: configPath)
         let content = try String(contentsOfFile: configPath, encoding: .utf8)
         var lines = content.components(separatedBy: "\n")
-        var removed = 0
-        var pending = Set(apiKeys)
+        let targets = Set(apiKeys)
+        var removed = Set<String>()   // 至少删掉一处 occurrence 的目标 key
 
-        // 多轮扫描:删一行后行号变化,重新扫直到无命中
-        var changed = true
-        while changed {
-            changed = false
-            // 1. claude-api-key 平铺段
+        // 每轮删一个命中(平铺段优先),直到两个段都不再含任何目标 key。
+        // 同一个 key 可能同时存在于 claude-api-key 与 openai-compatibility 两处,
+        // 必须两处都删净才算移除 —— 曾在删完平铺段就 pending.remove,聚合段副本存活
+        // 却报告「已移除」,key 仍被 CPA 轮询(账本不一致,删不掉的僵尸凭据)。
+        var did = true
+        while did {
+            did = false
+            // 1. claude-api-key 平铺段:命中即删整条目
             if let section = findSection(in: lines) {
                 let items = splitItems(lines: lines, section: section)
                 for item in items {
-                    let hitKey = pending.first { itemContainsAPIKey(item, in: lines, key: $0) }
-                    guard let k = hitKey else { continue }
+                    guard let k = targets.first(where: { itemContainsAPIKey(item, in: lines, key: $0) }) else { continue }
                     var newSectionLines: [String] = [lines[section.start]]
                     var emitted = Set<Int>()
                     for it in items where it.range.lowerBound != item.range.lowerBound {
@@ -558,41 +569,45 @@ final class CPAWriter {
                     } else {
                         lines.replaceSubrange(section.start..<section.end, with: newSectionLines)
                     }
-                    pending.remove(k)
-                    removed += 1
-                    changed = true
+                    removed.insert(k)
+                    did = true
                     break
                 }
             }
-            if changed { continue }
-            // 2. openai-compatibility 聚合段:定位条目→api-key-entries→删命中行
+            if did { continue }
+            // 2. openai-compatibility 聚合段:删命中的单条 api-key,条目内真实 key 清零则删整条目
             if let section = findNamedSection(in: lines, key: "openai-compatibility:") {
                 let entries = aggregatedEntries(in: lines, section: section)
                 for entry in entries {
                     guard let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entry.range),
-                          let hitLine = findAPIKeyLine(in: lines, range: entriesRange, keys: Array(pending)) else { continue }
-                    // 找到的具体 key 用于扣减计数
+                          let hitLine = findAPIKeyLine(in: lines, range: entriesRange, keys: Array(targets)) else { continue }
                     let t = lines[hitLine].trimmingCharacters(in: .whitespaces)
                     let scalar = String(t.dropFirst("- api-key:".count)).trimmingCharacters(in: .whitespaces)
                     let matchedKey = decodeYAMLScalar(scalar)
-                    let remainingInEntry = (entriesRange.lowerBound..<entriesRange.upperBound).filter { $0 != hitLine }.count
-                    if remainingInEntry == 0 {
-                        // 整条目移除
-                        lines.removeSubrange(entry.range)
+                    // 删除后统计条目内「剩余真实 api-key 行」:只数 `- api-key:` 行,
+                    // 不能把空行/注释/别的字段算进来(否则删掉最后一把 key 会留下
+                    // 无子项的空 `api-key-entries:`,CPA 的 Go 解析器可能判 null 序列拒启)
+                    var remainingRealKeys = 0
+                    for i in entriesRange where i != hitLine {
+                        if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("- api-key:") { remainingRealKeys += 1 }
+                    }
+                    if remainingRealKeys == 0 {
+                        lines.removeSubrange(entry.range)   // 整条目移除,不留空头
                     } else {
                         lines.remove(at: hitLine)
                     }
-                    if pending.contains(matchedKey) { pending.remove(matchedKey); removed += 1 }
-                    changed = true
+                    removed.insert(matchedKey)
+                    did = true
                     break
                 }
             }
         }
-        if removed == 0 { return "未在 CPA 配置中找到 \(pending.count) 个 key" }
+        if removed.isEmpty { return "未在 CPA 配置中找到 \(targets.count) 个 key" }
         try atomicWrite(lines.joined(separator: "\n"))
-        return pending.isEmpty
-            ? "已从 CPA 配置移除 \(removed) 个 key"
-            : "已从 CPA 配置移除 \(removed) 个 key,余 \(pending.count) 个未找到"
+        let notFound = targets.count - removed.count
+        return notFound > 0
+            ? "已从 CPA 配置移除 \(removed.count) 个 key,余 \(notFound) 个未找到"
+            : "已从 CPA 配置移除 \(removed.count) 个 key"
     }
 
     func remove(apiKey: String) throws -> String {
