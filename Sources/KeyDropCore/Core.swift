@@ -166,7 +166,9 @@ public final class Core {
             prefs.cpaConfigPath = cfg
             let (msg, probedModels) = try CPAWriter(configPath: cfg).addMulti(baseURL: url, keys: allKeys, proxy: proxyURL)
             var multiLines = [msg]
-            multiLines.append(contentsOf: syncCPAResidentEntries())
+            // 常驻模型来源 = 条目最终 models(已有精选时即精选列表);
+            // 空(探测失败且无既有列表)传 nil 回退收集其它条目的精选
+            multiLines.append(contentsOf: syncCPAResidentEntries(models: probedModels.isEmpty ? nil : probedModels))
             let entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
                 ts: Date().timeIntervalSince1970,
@@ -472,7 +474,9 @@ public final class Core {
                     entry.cpaConfigPath = cfg
                     anyOK = true
                     lines.append("✓ CPA: \(msg)")
-                    lines.append(contentsOf: syncCPAResidentEntries())
+                    // 单 key 走平铺段,其精选模型就是本次 selectedModels(用户为该网关挑的几个);
+                    // 空则传 nil 回退收集其它 cpa 条目精选,绝不拉 CPA 聚合全量
+                    lines.append(contentsOf: syncCPAResidentEntries(models: selectedModels.isEmpty ? nil : selectedModels))
                 } catch {
                     lines.append("✗ CPA 失败: \(error.localizedDescription)")
                 }
@@ -588,17 +592,21 @@ public final class Core {
     /// upsert 进 cc-switch 三个 app_type,模型列表从 CPA /v1/models 实时拉。
     /// 全程 best-effort:CPA 没在跑/拉不到列表/cc-switch 缺失都只记一行提示,绝不让导入失败。
     /// 幂等:重复导入命中同一 provider 原地更新模型;绝不抢激活(用户当前用谁就用谁)。
-    /// 公开供 CLI `cpa-sync` 手动触发(首次建立 / 改了 CPA 配置后立刻刷新)
+    /// 公开供 CLI `cpa-sync` 手动触发(首次建立 / 改了 CPA 配置后立刻刷新)。
+    /// 模型列表来源 = config 中该条目的精选 models,**绝不**用 CPA 聚合 /v1/models
+    /// (真实反馈:聚合把 22 家上游混成 100+ 模型,用户只维护精选的 SOTA 几个)
+    /// - Parameter override: 导入路径传本次条目最终模型;手动 cpa-sync 传 nil,
+    ///   从历史里所有带 cpa 目标的条目收集精选列表
     @discardableResult
-    public func syncCPAResidentEntries() -> [String] {
+    public func syncCPAResidentEntries(models override: [String]? = nil) -> [String] {
         guard prefs.cpaResident,
               ProcessInfo.processInfo.environment["KEYDROP_CPA_RESIDENT"] != "0" else { return [] }
         guard let ep = CPAWriter.endpointInfo() else {
             return ["– CPA 常驻入口: 未找到 CPA 客户端 key(config.yaml 无 api-keys),跳过"]
         }
-        let test = APITester.test(url: ep.baseURL, key: ep.clientKey, timeout: 8, proxy: proxyForHealth())
-        guard test.ok, !test.models.isEmpty else {
-            return ["– CPA 常驻入口: CPA 未响应或无模型列表(\(test.detail.prefix(60))),下次导入自动重试"]
+        let models = override ?? collectCuratedModels()
+        guard !models.isEmpty else {
+            return ["– CPA 常驻入口: 未发现精选模型列表(条目 models 为空),跳过;在 config.yaml 里选好模型后再 cpa-sync"]
         }
         var out: [String] = []
         for appType in CCSwitchWriter.supportedAppTypes() {
@@ -606,10 +614,24 @@ public final class Core {
                 // 与 activateCPA 口径一致传裸 baseURL:claude 的 ANTHROPIC_BASE_URL 用根路径,
                 // opencode/codex 的 baseURL 由各自 writer 补 /v1,多带会双路径
                 let r = try cc.syncCPAResident(appType: appType, baseURL: ep.baseURL,
-                                               clientKey: ep.clientKey, models: test.models)
-                out.append("✓ CPA 常驻入口(cc-switch-\(appType)): \(r)(\(test.models.count) 个模型)")
+                                               clientKey: ep.clientKey, models: models)
+                out.append("✓ CPA 常驻入口(cc-switch-\(appType)): \(r)(\(models.count) 个精选模型)")
             } catch {
                 out.append("⚠ CPA 常驻入口 cc-switch-\(appType) 同步失败: \(error.localizedDescription)")
+            }
+        }
+        return out
+    }
+
+    /// 手动同步的模型来源:遍历 active 历史中所有 CPA 条目,读其聚合条目当前精选 models 求并集
+    private func collectCuratedModels() -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for e in history.snapshot() where e.status == "active" && e.targets.contains("cpa") {
+            guard let cfg = e.cpaConfigPath, let url = e.url,
+                  FileManager.default.fileExists(atPath: cfg) else { continue }
+            for m in CPAWriter(configPath: cfg).entryModels(baseURL: url) where seen.insert(m).inserted {
+                out.append(m)
             }
         }
         return out

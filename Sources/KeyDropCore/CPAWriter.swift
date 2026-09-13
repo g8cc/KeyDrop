@@ -221,34 +221,79 @@ final class CPAWriter {
         guard !accepted.isEmpty else {
             throw WriterError.file("多 key 中没有可用 key,已剔除 \(rejected) 个失效 key")
         }
-        _ = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+        let writeMsg = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
             try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels, proxy: proxy)
         }
+        // 回传条目最终 models(已有精选时=精选原列表,新建/补写时=探测结果):
+        // 历史/UI/常驻入口与配置文件同源,绝不把探测全量当精选
         let suffix = rejected > 0 ? ",自动剔除 \(rejected) 个失效 key" : ""
-        return ("已写入 CPA 配置(\(configPath))\(suffix);CPA 运行时会自动热重载", probedModels)
+        return ("已写入 CPA 配置(\(configPath))\(suffix);\(writeMsg.0);CPA 运行时会自动热重载", writeMsg.1)
     }
 
     /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,
     /// 不能在 flock 临界区内做 —— 否则 CLI 与菜单栏并发写时互相串行排队到对方超时
-    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy: String? = nil) throws -> String {
+    /// 返回 (消息, 条目最终模型列表)。已有非空 models 的条目视为用户精选:
+    /// 再导入只合并 key,绝不追加探测模型(真实反馈:CPA 聚合 /models 混入 22 家
+    /// 上游共 100+ 模型,用户只要 SOTA 四件套,KeyDrop 不得把一大堆回填)
+    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy: String? = nil) throws -> (String, [String]) {
         try Self.validateYAML(path: configPath)
         let content = try String(contentsOfFile: configPath, encoding: .utf8)
         var lines = content.components(separatedBy: "\n")
         let providerName = aggregatedName(for: baseURL)
-        let models = probedModels
+        var finalModels = probedModels
+        var preservedNote = ""
 
         // 定位 openai-compatibility 段下同 name 的现有条目
         if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
-            // 已有同 name 条目:合并新 key 进 api-key-entries,合并 models
-            try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: models)
+            let existingModels = Self.entryModels(in: lines, entryRange: entryRange)
+            if existingModels.isEmpty {
+                // 条目无模型列表(上次探测失败):补写本次探测结果
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: probedModels)
+            } else {
+                // 已有精选列表:只合 key,保留 models 原样
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: [])
+                finalModels = existingModels
+                preservedNote = ",保留条目现有 \(existingModels.count) 个模型"
+            }
         } else {
             // 新建条目
             try appendAggregatedEntry(&lines, providerName: providerName, baseURL: baseURL,
-                                      keys: keys, models: models, proxy: proxy)
+                                      keys: keys, models: probedModels, proxy: proxy)
         }
         try atomicWrite(lines.joined(separator: "\n"))
-        let modelPart = models.isEmpty ? "" : ", 探测到 \(models.count) 个模型"
-        return "已写入 \(keys.count) 个 key 到 CPA 聚合条目「\(providerName)」\(modelPart)"
+        let modelPart = finalModels.isEmpty ? "" : ", 模型 \(finalModels.count) 个"
+        return ("已写入 \(keys.count) 个 key 到 CPA 聚合条目「\(providerName)」\(modelPart)\(preservedNote)", finalModels)
+    }
+
+    /// 从给定条目范围解析 models: 段的模型名(按条目内容缩进判定,与 merge 同一口径)
+    static func entryModels(in lines: [String], entryRange: Range<Int>) -> [String] {
+        guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" })
+        else { return [] }
+        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
+        var out: [String] = []
+        for j in (header + 1)..<entryRange.upperBound {
+            let line = lines[j]
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            if line.prefix(while: { $0 == " " || $0 == "\t" }).count <= headerIndent { break }
+            if trimmed.hasPrefix("- name:") {
+                let nm = trimmed.dropFirst("- name:".count).trimmingCharacters(in: .whitespaces)
+                if !nm.isEmpty { out.append(nm) }
+            }
+        }
+        return out
+    }
+
+    /// 读取指定 baseURL 聚合条目当前精选的模型列表(锁内读,与写者互斥)。
+    /// 条目/段不存在返回 []
+    public func entryModels(baseURL: String) -> [String] {
+        guard FileManager.default.fileExists(atPath: configPath) else { return [] }
+        return (try? FileLock.withLock(FileLock.lockPath(for: configPath)) { () -> [String] in
+            guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else { return [] }
+            let lines = content.components(separatedBy: "\n")
+            guard let range = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL)) else { return [] }
+            return Self.entryModels(in: lines, entryRange: range)
+        }) ?? []
     }
 
     /// 聚合条目 name 取 baseURL 的 host[:port]。端口必须计入:同一 host 的不同端口
