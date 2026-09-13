@@ -9,7 +9,7 @@ enum AppDelegateRef {
 
 let args = Array(CommandLine.arguments.dropFirst())
 
-let cliCommands = ["add", "list", "scan", "delete", "rm", "parse", "status", "refresh",
+let cliCommands = ["add", "list", "scan", "cpa-sync", "delete", "rm", "parse", "status", "refresh",
                    "reimport", "edit", "self-heal", "picker-test", "help", "h",
                    "image-add", "image", "mcp-image"]
 if let first = args.first {

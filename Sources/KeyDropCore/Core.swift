@@ -587,8 +587,10 @@ public final class Core {
     /// CPA 写入成功后的常驻入口同步:把 CPA 固定端点(http://host:port + CPA 客户端 key)
     /// upsert 进 cc-switch 三个 app_type,模型列表从 CPA /v1/models 实时拉。
     /// 全程 best-effort:CPA 没在跑/拉不到列表/cc-switch 缺失都只记一行提示,绝不让导入失败。
-    /// 幂等:重复导入命中同一 provider 原地更新模型;绝不抢激活(用户当前用谁就用谁)
-    private func syncCPAResidentEntries() -> [String] {
+    /// 幂等:重复导入命中同一 provider 原地更新模型;绝不抢激活(用户当前用谁就用谁)。
+    /// 公开供 CLI `cpa-sync` 手动触发(首次建立 / 改了 CPA 配置后立刻刷新)
+    @discardableResult
+    public func syncCPAResidentEntries() -> [String] {
         guard prefs.cpaResident,
               ProcessInfo.processInfo.environment["KEYDROP_CPA_RESIDENT"] != "0" else { return [] }
         guard let ep = CPAWriter.endpointInfo() else {
