@@ -165,6 +165,8 @@ public final class Core {
             }
             prefs.cpaConfigPath = cfg
             let (msg, probedModels) = try CPAWriter(configPath: cfg).addMulti(baseURL: url, keys: allKeys, proxy: proxyURL)
+            var multiLines = [msg]
+            multiLines.append(contentsOf: syncCPAResidentEntries())
             let entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
                 ts: Date().timeIntervalSince1970,
@@ -185,7 +187,7 @@ public final class Core {
             )
             try history.append(entry)
             try prefs.save()
-            return AddOutcome(entry: entry, lines: [msg], ok: true)
+            return AddOutcome(entry: entry, lines: multiLines, ok: true)
         }
 
         var name = parsed.name?.isEmpty == false ? parsed.name! : cc.defaultName(for: url)
@@ -470,6 +472,7 @@ public final class Core {
                     entry.cpaConfigPath = cfg
                     anyOK = true
                     lines.append("✓ CPA: \(msg)")
+                    lines.append(contentsOf: syncCPAResidentEntries())
                 } catch {
                     lines.append("✗ CPA 失败: \(error.localizedDescription)")
                 }
@@ -581,8 +584,36 @@ public final class Core {
         return AddOutcome(entry: entry, lines: lines, ok: anyOK)
     }
 
-    public static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {
-        if test.needsProxy {
+    /// CPA 写入成功后的常驻入口同步:把 CPA 固定端点(http://host:port + CPA 客户端 key)
+    /// upsert 进 cc-switch 三个 app_type,模型列表从 CPA /v1/models 实时拉。
+    /// 全程 best-effort:CPA 没在跑/拉不到列表/cc-switch 缺失都只记一行提示,绝不让导入失败。
+    /// 幂等:重复导入命中同一 provider 原地更新模型;绝不抢激活(用户当前用谁就用谁)
+    private func syncCPAResidentEntries() -> [String] {
+        guard prefs.cpaResident,
+              ProcessInfo.processInfo.environment["KEYDROP_CPA_RESIDENT"] != "0" else { return [] }
+        guard let ep = CPAWriter.endpointInfo() else {
+            return ["– CPA 常驻入口: 未找到 CPA 客户端 key(config.yaml 无 api-keys),跳过"]
+        }
+        let test = APITester.test(url: ep.baseURL, key: ep.clientKey, timeout: 8, proxy: proxyForHealth())
+        guard test.ok, !test.models.isEmpty else {
+            return ["– CPA 常驻入口: CPA 未响应或无模型列表(\(test.detail.prefix(60))),下次导入自动重试"]
+        }
+        var out: [String] = []
+        for appType in CCSwitchWriter.supportedAppTypes() {
+            do {
+                // 与 activateCPA 口径一致传裸 baseURL:claude 的 ANTHROPIC_BASE_URL 用根路径,
+                // opencode/codex 的 baseURL 由各自 writer 补 /v1,多带会双路径
+                let r = try cc.syncCPAResident(appType: appType, baseURL: ep.baseURL,
+                                               clientKey: ep.clientKey, models: test.models)
+                out.append("✓ CPA 常驻入口(cc-switch-\(appType)): \(r)(\(test.models.count) 个模型)")
+            } catch {
+                out.append("⚠ CPA 常驻入口 cc-switch-\(appType) 同步失败: \(error.localizedDescription)")
+            }
+        }
+        return out
+    }
+
+    public static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {        if test.needsProxy {
             return ("proxy-ok", test.detail + " ⚠ 该网关直连不可用,需代理;无代理的工具(dsh 等)需自行配置 HTTPS_PROXY 才可用")
         }
         if test.quotaExhausted { return ("quota", test.detail) }

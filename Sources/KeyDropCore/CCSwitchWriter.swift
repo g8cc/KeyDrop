@@ -642,7 +642,8 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         case "codex":
             return (obj["auth"] as? [String: Any])?["OPENAI_API_KEY"] as? String
         default:
-            return nil
+            let env = obj["env"] as? [String: Any]
+            return env?["ANTHROPIC_AUTH_TOKEN"] as? String
         }
     }
 
@@ -949,6 +950,118 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             [id, appType]
         )
         return found != nil
+    }
+
+    // MARK: - CPA 常驻入口(被动同步)
+
+    /// 把 CPA 固定端点被动 upsert 到指定 app_type 的 cc-switch DB:
+    /// 匹配「endpoint 规范化 URL + settings_config 内 key」的既有 provider → 原地更新
+    /// settings_config(不重复建);没有则新建 is_current=0。
+    /// 绝不:改 is_current / 动 switch settings / claude-codex 未激活时写 live 单文件
+    /// (那两类是单 provider 环境,覆盖会把用户当前配置的网关悄悄换成 CPA)。
+    /// opencode 是共享文件:未激活也同步 provider+models,用户在 /model 直接选新模型,
+    /// firstModel 仅当该 provider 恰好当前激活时才设(不抢激活)。
+    /// models 为空视为「CPA 未响应,未获取」,直接跳过,绝不把已有列表清空。
+    @discardableResult
+    public func syncCPAResident(appType: String, baseURL: String, clientKey: String, models: [String]) throws -> String {
+        guard !models.isEmpty else { return "跳过(CPA 模型列表未获取)" }
+        try Self.ensureDB()
+        let db = try DB(path: Self.dbPath)
+        let normURL = normalizeEndpointURL(baseURL)
+        var p = ParsedKey()
+        p.url = baseURL
+        p.key = clientKey
+
+        // 既有匹配:所有候选里找 URL+key 双一致的第一个
+        let rows = try db.query(
+            "SELECT p.id, e.url, p.settings_config FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
+            [appType]
+        )
+        var existingID: String? = nil
+        for row in rows {
+            guard row.count > 2, let pid = row[0], let u = row[1],
+                  normalizeEndpointURL(u) == normURL,
+                  Self.providerAPIKey(from: row[2] ?? "", appType: appType) == clientKey
+            else { continue }
+            existingID = pid
+            break
+        }
+
+        let id = existingID ?? UUID().uuidString.lowercased()
+        let opencodeDict = opencodeModelDict(providerID: id, baseURL: baseURL, models: models)
+        let settingsConfig: String
+        if appType == "opencode" {
+            settingsConfig = try opencodeSettingsConfig(p, modelDict: opencodeDict)
+        } else if appType == "codex" {
+            settingsConfig = try codexSettingsConfig(p, models: models, wireApi: "responses")
+        } else {
+            settingsConfig = try jsonString(["env": claudeEnv(for: p, models: models)])
+        }
+
+        if let existing = existingID {
+            try db.run(
+                "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                [settingsConfig, existing, appType]
+            )
+            let isCurrent = (try? db.scalar(
+                "SELECT is_current FROM providers WHERE id = ? AND app_type = ?",
+                [existing, appType]
+            )) == "1"
+            if appType == "opencode" {
+                try mergeOpencodeProvider(p, providerID: existing, modelDict: opencodeDict,
+                                          firstModel: isCurrent ? Core.preferredChatModel(models) : nil)
+            } else if isCurrent {
+                try syncResidentLive(appType: appType, p: p, models: models)
+            }
+            return "已更新"
+        }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let meta = appType == "codex"
+            ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"openai_responses\"}"
+            : "{}"
+        try db.exec("BEGIN IMMEDIATE")
+        do {
+            // is_current=0:被动入口不抢激活;sort_index NULL:不打扰用户在 cc-switch 里的手动排序
+            try db.run(
+                "INSERT INTO providers (id, app_type, name, settings_config, created_at, meta, is_current) VALUES (?,?,?,?,?,?,0)",
+                [id, appType, residentName(for: baseURL), settingsConfig, now, meta]
+            )
+            try db.run(
+                "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at) VALUES (?, ?, ?, ?)",
+                [id, appType, appType == "opencode" ? opencodeBaseURL(baseURL) : baseURL, now]
+            )
+            try db.exec("COMMIT")
+        } catch {
+            try? db.exec("ROLLBACK")
+            throw error
+        }
+        if appType == "opencode" {
+            try mergeOpencodeProvider(p, providerID: id, modelDict: opencodeDict, firstModel: nil)
+        }
+        return "已新建(未激活)"
+    }
+
+    /// 被动入口恰好是当前激活 provider 时,新模型列表同步进 live 配置,
+    /// 守卫口径与 syncModelsAfterRefresh 一致(代理托管态/ cc-switch 运行中不直写)
+    private func syncResidentLive(appType: String, p: ParsedKey, models: [String]) throws {
+        switch appType {
+        case "codex":
+            let proxied = (try? String(contentsOfFile: Self.codexConfigPath, encoding: .utf8))
+                .flatMap { c -> Bool in
+                    let custom = c.components(separatedBy: "[model_providers.custom]").dropFirst().first ?? ""
+                    return custom.contains("PROXY_MANAGED") || custom.contains("127.0.0.1:15721")
+                } ?? false
+            if !proxied { try mergeCodexConfig(p, models: models, wireApi: "responses") }
+        default:
+            guard !Self.ccSwitchRunning() else { return }
+            try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models))
+        }
+    }
+
+    private func residentName(for baseURL: String) -> String {
+        let host = baseURL.replacingOccurrences(of: #"^https?://"#, with: "", options: .regularExpression)
+        return "CPA·\(host)"
     }
 
     /// 刷新模型后同步 cc-switch:总是更新 DB settings_config(切换回该 provider 时用新列表),

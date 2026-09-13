@@ -266,5 +266,64 @@ enum CCSwitchWriterTests {
             t.equal(s3["db.grok"], s1["db.grok"], "refresh 后:grok-4.6 name 保留")
             t.equal(s3["db.grok"], s3["oc.grok"], "refresh 后:DB 与 opencode.json 同名")
         }
+
+        // CPA 常驻入口:被动 upsert,不抢激活、幂等、模型原地更新
+        h.runSuite("CCSwitchWriter.CPA 常驻入口") { t in
+            let env = try! TestEnv("cc-resident")
+            defer { env.cleanup() }
+            try! createSchema(env)
+            let w = CCSwitchWriter()
+            // 用户真实激活的 provider:常驻同步绝不能碰它的 is_current
+            var user = ParsedKey()
+            user.key = "sk-user-active-111111"
+            user.url = "https://user.example.org/v1"
+            let ur = try! w.add(user, appType: "opencode", models: ["glm-5.2"], proxy: nil)
+            let db = try! DB(path: env.dir + "/cc-switch.db")
+
+            let cpaURL = "http://127.0.0.1:8317"
+            let msg1 = try! w.syncCPAResident(appType: "opencode", baseURL: cpaURL,
+                                              clientKey: "sk-cpa-client-0001", models: ["m-a", "m-b"])
+            t.contains(msg1, "已新建", "首次:新建被动入口: \(msg1)")
+            let cnt1 = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
+            t.equal(cnt1, "2", "用户 provider + 常驻入口共存")
+            let residentID = try! db.scalar(
+                "SELECT id FROM providers WHERE app_type='opencode' AND id != ?", [ur.providerID])!
+            let cur = try! db.scalar("SELECT is_current FROM providers WHERE id=?", [residentID])
+            t.equal(cur, "0", "常驻入口不抢激活(is_current=0)")
+            let userCur = try! db.scalar("SELECT is_current FROM providers WHERE id=?", [ur.providerID])
+            t.equal(userCur, "1", "用户 provider 激活态不受影响")
+
+            // 再次同步同端点:原地更新模型,不重复建条目
+            let msg2 = try! w.syncCPAResident(appType: "opencode", baseURL: cpaURL,
+                                              clientKey: "sk-cpa-client-0001", models: ["m-a", "m-b", "m-c"])
+            t.contains(msg2, "已更新", "二次:原地更新: \(msg2)")
+            let cnt2 = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
+            t.equal(cnt2, "2", "重复同步不累积条目(修复前会删建或重复)")
+            let cfg = try! db.scalar("SELECT settings_config FROM providers WHERE id=?", [residentID]) ?? ""
+            t.contains(cfg, "m-c", "新模型已并入常驻入口")
+            t.contains(cfg, "sk-cpa-client-0001", "客户端 key 写入")
+
+            // 同 URL 不同 clientKey:不同凭据视为不同入口,新建而非覆盖(复用共存判定)
+            _ = try! w.syncCPAResident(appType: "opencode", baseURL: cpaURL,
+                                       clientKey: "sk-cpa-client-0002", models: ["z-a"])
+            let cnt3 = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
+            t.equal(cnt3, "3", "不同客户端 key 独立共存")
+
+            // 空模型列表:视为 CPA 未响应,跳过不清空既有列表
+            let msg4 = try! w.syncCPAResident(appType: "opencode", baseURL: cpaURL,
+                                              clientKey: "sk-cpa-client-0001", models: [])
+            t.contains(msg4, "跳过", "空列表跳过: \(msg4)")
+            let cfg4 = try! db.scalar("SELECT settings_config FROM providers WHERE id=?", [residentID]) ?? ""
+            t.contains(cfg4, "m-c", "跳过不清空既有模型")
+
+            // claude 类型凭据匹配走 env.ANTHROPIC_AUTH_TOKEN 分支
+            _ = try! w.syncCPAResident(appType: "claude", baseURL: cpaURL,
+                                       clientKey: "sk-cpa-client-0001", models: ["m-a"])
+            let msg5 = try! w.syncCPAResident(appType: "claude", baseURL: cpaURL,
+                                              clientKey: "sk-cpa-client-0001", models: ["m-a", "m-x"])
+            t.contains(msg5, "已更新", "claude 类型按 env token 二次匹配原地更新: \(msg5)")
+            let claudeCnt = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='claude'")
+            t.equal(claudeCnt, "1", "claude 常驻入口不重复建")
+        }
     }
 }

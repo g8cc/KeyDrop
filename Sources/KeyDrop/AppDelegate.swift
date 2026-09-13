@@ -239,6 +239,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cpaItem.state = Prefs.shared.useCPA ? .on : .off
         menu.addItem(cpaItem)
 
+        let cpaResidentItem = NSMenuItem(title: "CPA 常驻入口同步 cc-switch", action: #selector(toggleCPAResident), keyEquivalent: "")
+        cpaResidentItem.target = self
+        cpaResidentItem.state = Prefs.shared.cpaResident ? .on : .off
+        menu.addItem(cpaResidentItem)
+
         let loginItem = NSMenuItem(
             title: "开机自启",
             action: #selector(toggleLogin),
@@ -359,6 +364,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func toggleCPA() {
         state.toggleUseCPA()
+    }
+
+    @objc func toggleCPAResident() {
+        Prefs.shared.cpaResident.toggle()
+        try? Prefs.shared.save()
     }
 
     @objc func togglePanel() {

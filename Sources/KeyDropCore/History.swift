@@ -467,6 +467,7 @@ public final class Prefs {
     private var _useGrok = true
     private var _useCPA = false
     private var _useDSH = true
+    private var _cpaResident = true
     private var _cpaConfigPath: String? = nil
     private var _proxy = ""
 
@@ -485,6 +486,12 @@ public final class Prefs {
     public var useDSH: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _useDSH }
         set { lock.lock(); _useDSH = newValue; lock.unlock() }
+    }
+    /// CPA 导入成功后自动同步「CPA 固定入口」到 cc-switch(opencode/codex/claude),
+    /// 让各工具无需手动配置即可用 http://127.0.0.1:8317/v1 消费新导入的 key
+    public var cpaResident: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _cpaResident }
+        set { lock.lock(); _cpaResident = newValue; lock.unlock() }
     }
     public var cpaConfigPath: String? {
         get { lock.lock(); defer { lock.unlock() }; return _cpaConfigPath }
@@ -506,6 +513,7 @@ public final class Prefs {
             if let v = obj["useGrok"] as? Bool { _useGrok = v }
             if let v = obj["useCPA"] as? Bool { _useCPA = v }
             if let v = obj["useDSH"] as? Bool { _useDSH = v }
+            if let v = obj["cpaResident"] as? Bool { _cpaResident = v }
             _cpaConfigPath = obj["cpaConfigPath"] as? String
             if let v = obj["proxy"] as? String { _proxy = v }
         }
@@ -531,13 +539,14 @@ public final class Prefs {
         let grok = _useGrok
         let cpa = _useCPA
         let dsh = _useDSH
+        let resident = _cpaResident
         let path = _cpaConfigPath
         let proxy = _proxy
         lock.unlock()
         // flock 串行化跨进程写:app 与 CLI 并发 save 时,固定 tmp 路径会被对方
         // replaceItemAt 拽走导致写失败,并发覆盖也会丢掉对方的设置变更
         try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
-            var obj: [String: Any] = ["useCC": cc, "useGrok": grok, "useCPA": cpa, "useDSH": dsh, "proxy": proxy]
+            var obj: [String: Any] = ["useCC": cc, "useGrok": grok, "useCPA": cpa, "useDSH": dsh, "cpaResident": resident, "proxy": proxy]
             if let path, !path.isEmpty { obj["cpaConfigPath"] = path }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
