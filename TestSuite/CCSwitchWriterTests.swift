@@ -339,5 +339,50 @@ enum CCSwitchWriterTests {
             let ocLeft = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
             t.expect(ocLeft == "2", "仅删匹配端点+key 的行(剩 0002 与用户 provider,实际 \(ocLeft ?? "?"))")
         }
+
+        // cc-switch 原生类型(pi/openclaw/hermes):托管行可更新,用户手写行绝不覆盖
+        h.runSuite("CCSwitchWriter.CPA 常驻-原生类型安全") { t in
+            let env = try! TestEnv("cc-native-safe")
+            defer { env.cleanup() }
+            try! createSchema(env)
+            let w = CCSwitchWriter()
+            let db = try! DB(path: env.dir + "/cc-switch.db")
+            let url = "http://127.0.0.1:8317"
+
+            // 1) 无既有行 → 建 KeyDrop 托管行(固定 id keydrop-cpa-pi)
+            let r1 = try! w.syncCPAResidentNative(appType: "pi", baseURL: url,
+                                                  clientKey: "sk-n-1", models: ["m-a"])
+            t.contains(r1, "已新建(KeyDrop 托管", "首次新建托管行: \(r1)")
+            let hostedID = CCSwitchWriter.cpaResidentID(appType: "pi")
+            t.expect((try! db.scalar("SELECT count(*) FROM providers WHERE app_type='pi' AND id='\(hostedID)'")) == "1", "托管行使用固定 id")
+
+            // 2) 再次同步(模型变化)→ 托管行原地更新,不另建
+            let r2 = try! w.syncCPAResidentNative(appType: "pi", baseURL: url,
+                                                  clientKey: "sk-n-1", models: ["m-a", "m-b"])
+            t.contains(r2, "已更新", "托管行二次同步原地更新: \(r2)")
+            t.equal(try! db.scalar("SELECT count(*) FROM providers WHERE app_type='pi'"), "1", "托管行不累积")
+            let cfg = try! db.scalar("SELECT settings_config FROM providers WHERE app_type='pi'") ?? ""
+            t.contains(cfg, "m-b", "新模型并入托管行")
+
+            // 3) 用户手写同端点行 → 既不覆盖也不另建托管行
+            let env2 = try! TestEnv("cc-native-user")
+            defer { env2.cleanup() }
+            try! createSchema(env2)
+            let w2 = CCSwitchWriter()
+            let db2 = try! DB(path: env2.dir + "/cc-switch.db")
+            // 模拟用户手写:直接插一条 openclaw 行,baseUrl 相同但 id 非托管
+            try! db2.run(
+                "INSERT INTO providers (id,app_type,name,settings_config,is_current) VALUES ('mycpa','openclaw','cpa',?,0)",
+                [#"{"baseUrl":"http://localhost:8317/v1","apiKey":"sk-user-x","api":"openai-completions","models":[{"id":"shangtang","name":"shangtang"}]}"#]
+            )
+            let r3 = try! w2.syncCPAResidentNative(appType: "openclaw", baseURL: url,
+                                                   clientKey: "sk-user-x", models: ["zzz-new"])
+            t.contains(r3, "不覆盖也不另建", "检测到用户手写行不覆盖: \(r3)")
+            t.equal(try! db2.scalar("SELECT count(*) FROM providers WHERE app_type='openclaw'"), "1", "不另建托管行")
+            let keep = try! db2.scalar("SELECT settings_config FROM providers WHERE app_type='openclaw'") ?? ""
+            t.contains(keep, "shangtang", "用户手写的 shangtang 模型保留(曾被整行覆盖过)")
+            t.expect(!keep.contains("zzz-new"), "未把新模型塞进用户行")
+            // localhost 与 127.0.0.1 归一:同一端点即认定为用户手写
+        }
     }
 }

@@ -159,7 +159,7 @@ enum CoreTests {
                 models: ["glm-5.2"], force: true
             )
             let joined = outcome.lines.joined(separator: "\n")
-            t.contains(joined, "CPA 常驻入口(cc-switch-opencode)", "opencode 常驻同步: \(joined)")
+            t.contains(joined, "CPA 常驻(cc-switch-opencode)", "opencode 常驻同步: \(joined)")
             let db = try! DB(path: env.dir + "/cc-switch.db")
             let ocCnt = try! db.scalar(
                 "SELECT count(*) FROM providers WHERE app_type='opencode' AND settings_config LIKE '%sk-cpa-client-key-r1%'")

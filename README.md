@@ -14,7 +14,7 @@
   - **Grok Build**:纯 Grok 模型自动写入 `~/.grok/config.toml`;混合其他家族时仍走 OpenCode
   - **CPA**(cliproxy-api):写入 config.yaml
     - 多 key 逐一认证探测,明确失效的 401/403 key 自动剔除;网络/限流错误不会误删
-    - **CPA 常驻入口**:每次成功写入 CPA 后,自动把 CPA 固定端点(`http://127.0.0.1:8317/v1` + CPA 客户端 key)被动同步到 **cc-switch-opencode**,模型列表取 config 里条目的**精选列表**(不是 CPA 聚合全量);不抢激活、幂等更新。Claude Code / Codex 对反向代理封杀严格,**不放 CPA**(历史误建条目会自动清理)。以后导新 key 进 CPA,opencode 无需再配置,直接 `/model` 选新模型(菜单栏「CPA 常驻入口同步 cc-switch」可关,或 `KeyDrop cpa-sync` 手动刷新)
+    - **CPA 常驻入口**:每次成功写入 CPA 后,自动把 CPA 固定端点(`http://127.0.0.1:8317/v1` + CPA 客户端 key)同步到**所有装了的通用工具**:cc-switch 的 opencode / pi / openclaw / hermes + DeepSeek Harness,模型列表取 config 里条目的**精选列表**(不是 CPA 聚合全量);不抢激活、幂等更新、**用户手写的同端点配置绝不覆盖**(只维护 KeyDrop 自己的托管行)。Claude Code / Codex 对反向代理封杀严格,**不放 CPA**(历史误建条目自动清理)。以后导新 key 进 CPA,各工具无需再配置,直接选新模型(菜单栏「CPA 常驻入口同步 cc-switch」可关,或 `KeyDrop cpa-sync` 手动刷新)
   - **DeepSeek Harness**:所选模型含 deepseek 时同步写入 `~/.dsh/settings.yaml` 与 `.credentials.yaml`
   - **Clash**:代理订阅直接合并
 - **健康扫描**:自动定时检测 key 状态(ok / dead),与 cc-switch 对账

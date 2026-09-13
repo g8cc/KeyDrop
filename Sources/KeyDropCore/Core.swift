@@ -610,15 +610,45 @@ public final class Core {
             return ["– CPA 常驻入口: 未发现精选模型列表(条目 models 为空),跳过;在 config.yaml 里选好模型后再 cpa-sync"]
         }
         var out: [String] = []
-        // 常驻只进 opencode:它是 KeyDrop 唯一能可靠双写(DB + opencode.json)的类型。
-        // claude / codex 对反代封杀严格,不放 CPA —— 且迁移清理此前误建的行,幂等。
+        // opencode 双写(DB + opencode.json),KeyDrop 唯一有原生文件写入器的 cc-switch 类型
         do {
             let r = try cc.syncCPAResident(appType: "opencode", baseURL: ep.baseURL,
                                            clientKey: ep.clientKey, models: models)
-            out.append("✓ CPA 常驻入口(cc-switch-opencode): \(r)(\(models.count) 个精选模型)")
+            out.append("✓ CPA 常驻(cc-switch-opencode): \(r)(\(models.count) 个精选模型)")
         } catch {
-            out.append("⚠ CPA 常驻入口 cc-switch-opencode 同步失败: \(error.localizedDescription)")
+            out.append("⚠ CPA 常驻 cc-switch-opencode 同步失败: \(error.localizedDescription)")
         }
+        // pi/openclaw/hermes:cc-switch 支持的直连 JSON 类型。仅在「该类型在 cc-switch 有 provider 行
+        // = 用户在用」时写入(装了才导,没装不新建空类型)
+        for appType in ["pi", "openclaw", "hermes"] {
+            guard cc.typeInUse(appType) else { continue }
+            do {
+                let r = try cc.syncCPAResidentNative(appType: appType, baseURL: ep.baseURL,
+                                                     clientKey: ep.clientKey, models: models)
+                out.append("✓ CPA 常驻(cc-switch-\(appType)): \(r)")
+            } catch {
+                out.append("⚠ CPA 常驻 cc-switch-\(appType) 同步失败: \(error.localizedDescription)")
+            }
+        }
+        // dsh:装了(~/.dsh)才考虑写。已有「用户手写」的非 KeyDrop route 指向该端点则不动;
+        // 否则用固定 providerID 幂等写/更新 KeyDrop 自己的 route(第二次同步能刷新模型)。
+        // providerID 只用字母,避免 envName 生成含连字符的非法 shell 变量名
+        if DSHWriter.installed() {
+            let dshRoutes = DSHWriter.routesForEndpoint(baseURL: ep.baseURL)
+            let userOwned = dshRoutes.contains { !$0.hasPrefix("keydrop-") }
+            if userOwned {
+                out.append("✓ CPA 常驻(dsh): 已有你手写的该端点 route(\(dshRoutes.first ?? "")),未改动")
+            } else {
+                do {
+                    _ = try DSHWriter.add(providerID: "cparesident", key: ep.clientKey,
+                                          url: ep.baseURL, models: models)
+                    out.append("✓ CPA 常驻(dsh): 已写入/更新 keydrop-cparesident(\(models.count) 个精选模型)")
+                } catch {
+                    out.append("⚠ CPA 常驻 dsh 同步失败: \(error.localizedDescription)")
+                }
+            }
+        }
+        // claude / codex 反代封杀严:不放,迁移清理历史误建行
         for appType in ["claude", "codex"] {
             do {
                 let r = try cc.removeCPAResident(appType: appType, baseURL: ep.baseURL, clientKey: ep.clientKey)

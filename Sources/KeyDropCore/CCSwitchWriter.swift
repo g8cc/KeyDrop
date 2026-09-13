@@ -954,6 +954,142 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
 
     // MARK: - CPA 常驻入口(被动同步)
 
+    /// cc-switch 的 pi/openclaw/hermes 类型:settings_config 为直连 JSON(baseUrl/apiKey/models 平铺),
+    /// 现场样本约定:无 provider_endpoints 行、全部 is_current=0(激活态由别处管理)。
+    ///
+    /// 【安全铁律】用户手写行绝不覆盖:这些工具的 cc-switch 行常是用户精配的
+    /// (openclaw/cpa、hermes/Local-8317,模型列表被 openclaw.json 等按名引用)——
+    /// 曾整行覆盖过用户 openclaw 的 shangtang 模型(已回滚)。规则:
+    /// ① 存在同端点的非托管行(用户手写)→ 不碰、也不另建重复行;
+    /// ② KeyDrop 自己的托管行(固定 id keydrop-cpa-<type>)→ 原地更新,模型刷新能同步进去
+    /// 格式依据本机真实行样本;不碰 is_current。
+    public static func cpaResidentID(appType: String) -> String { "keydrop-cpa-\(appType)" }
+
+    public func syncCPAResidentNative(appType: String, baseURL: String, clientKey: String, models: [String]) throws -> String {
+        guard !models.isEmpty else { return "跳过(CPA 模型列表未获取)" }
+        let urlV1 = baseURL.hasSuffix("/v1") ? baseURL : baseURL + "/v1"
+        try Self.ensureDB()
+        let db = try DB(path: Self.dbPath)
+        let hostedID = Self.cpaResidentID(appType: appType)
+        let rows = try db.query(
+            "SELECT id, settings_config FROM providers WHERE app_type=?", [appType])
+        var hostedExists = false
+        for row in rows {
+            guard row.count > 1, let pid = row[0], let sc = row[1] else { continue }
+            if pid == hostedID { hostedExists = true; continue }
+            // 非托管行:用户手写。同端点存在则整次同步跳过(不覆盖、不另建)
+            guard let data = sc.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let u = Self.extractResidentURLKey(obj).url
+            else { continue }
+            if Self.normalizeHostForResident(u) == Self.normalizeHostForResident(urlV1) {
+                return "cc-switch-\(appType) 已有你手写的该端点配置,KeyDrop 不覆盖也不另建(模型更新请在该工具原生配置维护)"
+            }
+        }
+        let settingsConfig: String
+        switch appType {
+        case "pi":
+            settingsConfig = try jsonString([
+                "name": residentName(for: baseURL), "baseUrl": urlV1,
+                "api": "openai-completions", "apiKey": clientKey,
+                "compat": ["supportsDeveloperRole": false, "supportsReasoningEffort": false],
+                "models": models.map { ["id": $0, "name": $0] } as [[String: String]],
+            ])
+        case "openclaw":
+            let ms: [[String: Any]] = models.map { m in
+                ["id": m, "name": m, "api": "openai-completions",
+                 "cost": ["input": 0.0, "output": 0.0, "cacheWrite": 0.0, "cacheRead": 0.0],
+                 "contextWindow": 200_000, "maxTokens": 8192, "input": ["text"]]
+            }
+            settingsConfig = try jsonString([
+                "baseUrl": urlV1, "apiKey": clientKey,
+                "api": "openai-completions", "models": ms,
+            ])
+        case "hermes":
+            settingsConfig = try jsonString([
+                "name": residentName(for: baseURL), "base_url": urlV1, "api_key": clientKey,
+                "model": Core.preferredChatModel(models) ?? models[0],
+                "_cc_source": "custom_providers",
+            ])
+        default:
+            throw WriterError.file("syncCPAResidentNative 不支持类型 \(appType)")
+        }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        if hostedExists {
+            try db.run(
+                "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = ?",
+                [settingsConfig, hostedID, appType]
+            )
+            return "已更新(KeyDrop 托管行)"
+        }
+        try db.exec("BEGIN IMMEDIATE")
+        do {
+            try db.run(
+                "INSERT INTO providers (id, app_type, name, settings_config, created_at, meta, is_current) VALUES (?,?,?,?,?,?,0)",
+                [hostedID, appType, residentName(for: baseURL), settingsConfig, now, "{}"]
+            )
+            try db.exec("COMMIT")
+        } catch {
+            try? db.exec("ROLLBACK")
+            throw error
+        }
+        return "已新建(KeyDrop 托管,未激活)"
+    }
+
+    /// 从任意类型 settings_config 提取 (URL, key),覆盖全部已知存放:
+    /// 顶层 baseUrl(pi/openclaw)/base_url(hermes)、options.baseURL/apiKey(opencode)、
+    /// env.ANTHROPIC_BASE_URL/AUTH_TOKEN(claude)、config TOML base_url + auth.OPENAI_API_KEY(codex)。
+    /// 统一供 upsert/remove 匹配,避免某类型漏检导致删不掉重复建
+    static func extractResidentURLKey(_ obj: [String: Any]) -> (url: String?, key: String?) {
+        let opts = obj["options"] as? [String: Any]
+        let env = obj["env"] as? [String: Any]
+        var url = (obj["baseUrl"] as? String) ?? (obj["base_url"] as? String)
+            ?? (opts?["baseURL"] as? String) ?? (env?["ANTHROPIC_BASE_URL"] as? String)
+        var key = (obj["apiKey"] as? String) ?? (obj["api_key"] as? String)
+            ?? (opts?["apiKey"] as? String) ?? (env?["ANTHROPIC_AUTH_TOKEN"] as? String)
+        if key == nil { key = (obj["auth"] as? [String: Any])?["OPENAI_API_KEY"] as? String }
+        // codex 的 base_url 藏在 config(TOML 字符串)里:base_url = "..."
+        if url == nil, let cfg = obj["config"] as? String,
+           let re = try? NSRegularExpression(pattern: #"base_url\s*=\s*"([^"]*)""#) {
+            let ns = cfg as NSString
+            if let m = re.firstMatch(in: cfg, range: NSRange(location: 0, length: ns.length)), m.numberOfRanges >= 2 {
+                url = ns.substring(with: m.range(at: 1))
+            }
+        }
+        return (url, key)
+    }
+
+    private func residentNativeKeyField(appType: String) -> String {
+        appType == "hermes" ? "api_key" : "apiKey"
+    }
+
+    /// 判断一行 settings_config 是否指向同一 CPA 端点+凭据。
+    /// 覆盖三种存放:顶层 baseUrl(pi/openclaw)、顶层 base_url(hermes)、
+    /// options.baseURL(opencode)。localhost 与 127.0.0.1 归一,避免用户手写的
+    /// localhost:8317 被当成不同端点重复建;尾 /v1 归一
+    static func residentMatches(_ obj: [String: Any], urlV1: String, clientKey: String, keyField: String) -> Bool {
+        let opts = obj["options"] as? [String: Any]
+        let rawURL = (obj["baseUrl"] as? String) ?? (obj["base_url"] as? String) ?? (opts?["baseURL"] as? String)
+        let rawKey = (obj[keyField] as? String) ?? (opts?["apiKey"] as? String)
+        guard let u = rawURL, let k = rawKey, k == clientKey else { return false }
+        return normalizeHostForResident(u) == normalizeHostForResident(urlV1)
+    }
+
+    private static func normalizeHostForResident(_ url: String) -> String {
+        var s = url.hasSuffix("/") ? String(url.dropLast()) : url
+        if s.hasSuffix("/v1") { s = String(s.dropLast(3)) }
+        s = s.replacingOccurrences(of: "://localhost", with: "://127.0.0.1")
+        return s
+    }
+
+    /// 该 app_type 在 cc-switch 中已有任何 provider 行 = 用户在用这个工具类型
+    public func typeInUse(_ appType: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: Self.dbPath),
+              let db = try? DB(path: Self.dbPath) else { return false }
+        let n = (try? db.scalar("SELECT count(*) FROM providers WHERE app_type = ?", [appType])) ?? "0"
+        return n != "0"
+    }
+
     /// 被动移除某 app_type 的 CPA 常驻入口(匹配规范化 URL + 客户端 key)。
     /// 幂等:不存在返回 ""。仅删非激活行;若竟被用户激活(is_current=1)则不动,
     /// 返回提示由用户先在 cc-switch 切换 —— 删活跃 provider 会连带回退激活态,越权
@@ -961,17 +1097,24 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         guard FileManager.default.fileExists(atPath: Self.dbPath),
               let db = try? DB(path: Self.dbPath)
         else { return "" }
-        let normURL = normalizeEndpointURL(baseURL)
+        // 匹配统一走 extractResidentURLKey:覆盖顶层 baseUrl/base_url、opencode options、
+        // claude env.ANTHROPIC_*、codex config(TOML)内 base_url + auth key。
+        // 曾只查顶层导致 claude/codex 误建行删不掉(迁移清理失效)
+        let urlV1 = baseURL.hasSuffix("/v1") ? baseURL : baseURL + "/v1"
+        func rowMatches(_ obj: [String: Any]) -> Bool {
+            let (u, k) = Self.extractResidentURLKey(obj)
+            guard let u, let k, k == clientKey else { return false }
+            return Self.normalizeHostForResident(u) == Self.normalizeHostForResident(urlV1)
+        }
         let rows = try db.query(
-            "SELECT p.id, e.url, p.settings_config, p.is_current FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
-            [appType]
-        )
+            "SELECT id, settings_config, is_current FROM providers WHERE app_type=?", [appType])
         for row in rows {
-            guard row.count > 3, let pid = row[0], let u = row[1],
-                  normalizeEndpointURL(u) == normURL,
-                  Self.providerAPIKey(from: row[2] ?? "", appType: appType) == clientKey
+            guard row.count > 2, let pid = row[0], let sc = row[1],
+                  let data = sc.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  rowMatches(obj)
             else { continue }
-            if row[3] == "1" {
+            if row[2] == "1" {
                 return "cc-switch-\(appType) 的 CPA 入口当前处于激活态,未自动移除(请在 cc-switch 切到其他 provider 后重试)"
             }
             try db.exec("BEGIN IMMEDIATE")

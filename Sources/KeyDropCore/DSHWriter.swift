@@ -142,6 +142,41 @@ public enum DSHWriter {
         return "\"\(e)\""
     }
 
+    /// 扫描 settings.yaml,返回所有指向该端点(localhost/127.0.0.1 与尾 /v1 归一)的 route 名。
+    /// 调用方据此区分:存在非 keydrop- 前缀的匹配 route = 用户手配,常驻同步不覆盖;
+    /// 只有 KeyDrop 自己写的 route → 允许原地更新模型列表
+    public static func routesForEndpoint(baseURL: String) -> [String] {
+        guard FileManager.default.fileExists(atPath: settingsPath),
+              let text = try? String(contentsOfFile: settingsPath, encoding: .utf8)
+        else { return [] }
+        let u = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        let target = (u.hasSuffix("/v1") ? u : u + "/v1")
+            .replacingOccurrences(of: "://127.0.0.1", with: "://localhost")
+        let lines = text.components(separatedBy: "\n")
+        var out: [String] = []
+        var curRoute = ""
+        for line in lines {
+            // route 名行:恰好 4 空格缩进 + "name:";其属性 baseURL: 6 空格缩进
+            if line.hasPrefix("    "), !line.hasPrefix("      ") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                curRoute = t.hasSuffix(":") ? String(t.dropLast()) : ""
+                continue
+            }
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("baseURL:"), !curRoute.isEmpty else { continue }
+            let raw = t.dropFirst("baseURL:".count).trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            let norm = (raw.hasSuffix("/v1") ? raw : raw + "/v1")
+                .replacingOccurrences(of: "://127.0.0.1", with: "://localhost")
+            if norm == target { out.append(curRoute) }
+        }
+        return out
+    }
+
+    public static func installed() -> Bool {
+        FileManager.default.fileExists(atPath: dshHome)
+    }
+
     // MARK: - settings.yaml
 
     private static func upsertSettings(
