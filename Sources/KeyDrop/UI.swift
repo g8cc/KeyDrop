@@ -1080,6 +1080,11 @@ struct HelpView: View {
             HStack {
                 Text("KeyDrop 使用说明")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
+                Text("v\(Version.currentVersion())")
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.secondary.opacity(0.14)))
                 Spacer()
                 Button("关闭") { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -1393,7 +1398,7 @@ struct PanelView: View {
             HStack(spacing: 6) {
                 Text("KeyDrop")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
-                Text("贴 key 即用")
+                Text("贴 key 即用 · v\(Version.currentVersion())")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }

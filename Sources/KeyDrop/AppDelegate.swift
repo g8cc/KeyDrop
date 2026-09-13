@@ -255,6 +255,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         self.appendUpdateItems(to: menu)
         menu.addItem(.separator())
+        menu.addItem(.separator())
+        let versionItem = NSMenuItem(title: "KeyDrop v\(Version.currentVersion())", action: nil, keyEquivalent: "")
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
         let quitItem = NSMenuItem(title: "退出 KeyDrop", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
