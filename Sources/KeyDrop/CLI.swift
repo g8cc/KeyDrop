@@ -141,9 +141,10 @@ enum CLI {
 
         case "cpa-sync":
             // 手动触发 CPA 常驻入口同步:不改 CPA 配置,仅把 CPA 固定端点
-            // (http://127.0.0.1:8317/v1 + 客户端 key)被动 upsert 进 cc-switch 三工具,
-            // 模型列表从 CPA /v1/models 实时拉。用于首次建立或改完 CPA 配置立刻刷新
-            print("同步 CPA 常驻入口到 cc-switch(opencode / codex / claude)...")
+            // (http://127.0.0.1:8317/v1 + 客户端 key)被动 upsert 进 cc-switch-opencode,
+            // claude/codex 反代封杀严不放(并迁移清理历史误建行);
+            // 模型来源=config 条目精选列表。用于首次建立或改完配置立刻刷新
+            print("同步 CPA 常驻入口到 cc-switch(opencode;claude/codex 排除并清理)...")
             let out = Core.shared.syncCPAResidentEntries()
             print(out.isEmpty ? "(已关闭,或无需同步)" : out.joined(separator: "\n"))
             return 0

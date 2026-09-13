@@ -136,8 +136,6 @@ enum CoreTests {
             let env = try! TestEnv("core-resident")
             defer { env.cleanup() }
             try! CCSwitchWriterTests.createSchema(env)
-            // 模拟 CPA:一个能响应 /v1/models 的端点 + 客户端 key。
-            // 导入成功后 Core 应把该端点被动 upsert 进三个 app_type
             guard let cpaSrv = try? MockHTTPServer(mode: .openAI) else {
                 t.expect(false, "mock CPA 启动失败"); return
             }
@@ -149,31 +147,42 @@ enum CoreTests {
             }
             let core = Core()
             env.write("cpa-config.yaml", "port: 18317\n")
+            // 预置历史误建的 claude/codex CPA 常驻行,验证同步时被迁移清理
+            let pre = CCSwitchWriter()
+            _ = try! pre.syncCPAResident(appType: "claude", baseURL: "http://127.0.0.1:\(cpaSrv.port)",
+                                         clientKey: "sk-cpa-client-key-r1", models: ["glm-5.2"])
+            _ = try! pre.syncCPAResident(appType: "codex", baseURL: "http://127.0.0.1:\(cpaSrv.port)",
+                                         clientKey: "sk-cpa-client-key-r1", models: ["glm-5.2"])
             let outcome = try! core.add(
                 raw: "https://resident.example.org/v1 sk-resident-single-111111",
                 ccOverride: false, cpaOverride: true, dshOverride: false,
                 models: ["glm-5.2"], force: true
             )
             let joined = outcome.lines.joined(separator: "\n")
-            t.contains(joined, "CPA 常驻入口", "导入行含常驻同步结果: \(joined)")
+            t.contains(joined, "CPA 常驻入口(cc-switch-opencode)", "opencode 常驻同步: \(joined)")
             let db = try! DB(path: env.dir + "/cc-switch.db")
-            for app in ["opencode", "codex", "claude"] {
-                let cnt = try! db.scalar(
-                    "SELECT count(*) FROM providers WHERE app_type=? AND settings_config LIKE '%sk-cpa-client-key-r1%'", [app])
-                t.equal(cnt, "1", "cc-switch-\(app) 各有一条 CPA 常驻入口")
-            }
-            // 常驻入口不得抢激活:无任何 provider 被标 is_current(导入前 DB 为空,激活只能来自常驻)
+            let ocCnt = try! db.scalar(
+                "SELECT count(*) FROM providers WHERE app_type='opencode' AND settings_config LIKE '%sk-cpa-client-key-r1%'")
+            t.equal(ocCnt, "1", "cc-switch-opencode 有一条 CPA 常驻入口")
+            let claCnt = try! db.scalar(
+                "SELECT count(*) FROM providers WHERE app_type='claude' AND settings_config LIKE '%sk-cpa-client-key-r1%'")
+            t.equal(claCnt, "0", "claude 的 CPA 常驻入口已被迁移清理(反代封杀)")
+            let codCnt = try! db.scalar(
+                "SELECT count(*) FROM providers WHERE app_type='codex' AND settings_config LIKE '%sk-cpa-client-key-r1%'")
+            t.equal(codCnt, "0", "codex 的 CPA 常驻入口已被迁移清理(反代封杀)")
+            t.contains(joined, "已移除", "清理动作有回执: \(joined)")
+            // 常驻入口不得抢激活
             let anyCurrent = try! db.scalar("SELECT count(*) FROM providers WHERE is_current=1")
             t.equal(anyCurrent, "0", "常驻同步不抢任何 app_type 的激活")
-            // 幂等:再次导入(换一把 key)→ 同端点同客户端 key 原地更新,不重复建
-            let outcome2 = try! core.add(
+            // 幂等:再次导入 → opencode 原地更新不累积,claude/codex 保持 0
+            _ = try! core.add(
                 raw: "https://resident2.example.org/v1 sk-resident-single-222222",
                 ccOverride: false, cpaOverride: true, dshOverride: false,
                 models: ["glm-5.2"], force: true
             )
             let cnt2 = try! db.scalar(
                 "SELECT count(*) FROM providers WHERE app_type='opencode' AND settings_config LIKE '%sk-cpa-client-key-r1%'")
-            t.equal(cnt2, "1", "第二次导入:常驻入口原地更新不累积(\(outcome2.lines.joined(separator: "; ").prefix(80)))")
+            t.equal(cnt2, "1", "第二次导入:opencode 常驻入口原地更新不累积")
             // 开关关闭 → 不再同步,也不清已有
             core.prefs.cpaResident = false
             let outcome3 = try! core.add(

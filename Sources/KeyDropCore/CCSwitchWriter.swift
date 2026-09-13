@@ -954,6 +954,44 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
 
     // MARK: - CPA 常驻入口(被动同步)
 
+    /// 被动移除某 app_type 的 CPA 常驻入口(匹配规范化 URL + 客户端 key)。
+    /// 幂等:不存在返回 ""。仅删非激活行;若竟被用户激活(is_current=1)则不动,
+    /// 返回提示由用户先在 cc-switch 切换 —— 删活跃 provider 会连带回退激活态,越权
+    public func removeCPAResident(appType: String, baseURL: String, clientKey: String) throws -> String {
+        guard FileManager.default.fileExists(atPath: Self.dbPath),
+              let db = try? DB(path: Self.dbPath)
+        else { return "" }
+        let normURL = normalizeEndpointURL(baseURL)
+        let rows = try db.query(
+            "SELECT p.id, e.url, p.settings_config, p.is_current FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
+            [appType]
+        )
+        for row in rows {
+            guard row.count > 3, let pid = row[0], let u = row[1],
+                  normalizeEndpointURL(u) == normURL,
+                  Self.providerAPIKey(from: row[2] ?? "", appType: appType) == clientKey
+            else { continue }
+            if row[3] == "1" {
+                return "cc-switch-\(appType) 的 CPA 入口当前处于激活态,未自动移除(请在 cc-switch 切到其他 provider 后重试)"
+            }
+            try db.exec("BEGIN IMMEDIATE")
+            do {
+                try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [pid])
+                try db.run("DELETE FROM providers WHERE id = ? AND app_type = ?", [pid, appType])
+                try db.exec("COMMIT")
+            } catch {
+                try? db.exec("ROLLBACK")
+                throw error
+            }
+            if appType == "opencode" {
+                do { try clearOpencodeProvider(id: pid) }
+                catch { AppLog.warn("opencode.json CPA 条目清理失败: \(error.localizedDescription)") }
+            }
+            return "已移除 cc-switch-\(appType) 的 CPA 常驻入口"
+        }
+        return ""
+    }
+
     /// 把 CPA 固定端点被动 upsert 到指定 app_type 的 cc-switch DB:
     /// 匹配「endpoint 规范化 URL + settings_config 内 key」的既有 provider → 原地更新
     /// settings_config(不重复建);没有则新建 is_current=0。

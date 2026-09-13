@@ -589,7 +589,8 @@ public final class Core {
     }
 
     /// CPA 写入成功后的常驻入口同步:把 CPA 固定端点(http://host:port + CPA 客户端 key)
-    /// upsert 进 cc-switch 三个 app_type,模型列表从 CPA /v1/models 实时拉。
+    /// 被动 upsert 进 cc-switch-opencode,模型来源=config 条目精选列表。
+    /// claude / codex 对反代封杀严格,不放 CPA,并迁移清理历史误建的行。
     /// 全程 best-effort:CPA 没在跑/拉不到列表/cc-switch 缺失都只记一行提示,绝不让导入失败。
     /// 幂等:重复导入命中同一 provider 原地更新模型;绝不抢激活(用户当前用谁就用谁)。
     /// 公开供 CLI `cpa-sync` 手动触发(首次建立 / 改了 CPA 配置后立刻刷新)。
@@ -609,15 +610,21 @@ public final class Core {
             return ["– CPA 常驻入口: 未发现精选模型列表(条目 models 为空),跳过;在 config.yaml 里选好模型后再 cpa-sync"]
         }
         var out: [String] = []
-        for appType in CCSwitchWriter.supportedAppTypes() {
+        // 常驻只进 opencode:它是 KeyDrop 唯一能可靠双写(DB + opencode.json)的类型。
+        // claude / codex 对反代封杀严格,不放 CPA —— 且迁移清理此前误建的行,幂等。
+        do {
+            let r = try cc.syncCPAResident(appType: "opencode", baseURL: ep.baseURL,
+                                           clientKey: ep.clientKey, models: models)
+            out.append("✓ CPA 常驻入口(cc-switch-opencode): \(r)(\(models.count) 个精选模型)")
+        } catch {
+            out.append("⚠ CPA 常驻入口 cc-switch-opencode 同步失败: \(error.localizedDescription)")
+        }
+        for appType in ["claude", "codex"] {
             do {
-                // 与 activateCPA 口径一致传裸 baseURL:claude 的 ANTHROPIC_BASE_URL 用根路径,
-                // opencode/codex 的 baseURL 由各自 writer 补 /v1,多带会双路径
-                let r = try cc.syncCPAResident(appType: appType, baseURL: ep.baseURL,
-                                               clientKey: ep.clientKey, models: models)
-                out.append("✓ CPA 常驻入口(cc-switch-\(appType)): \(r)(\(models.count) 个精选模型)")
+                let r = try cc.removeCPAResident(appType: appType, baseURL: ep.baseURL, clientKey: ep.clientKey)
+                if !r.isEmpty { out.append("↺ \(r)") }
             } catch {
-                out.append("⚠ CPA 常驻入口 cc-switch-\(appType) 同步失败: \(error.localizedDescription)")
+                out.append("⚠ cc-switch-\(appType) CPA 入口清理失败: \(error.localizedDescription)")
             }
         }
         return out

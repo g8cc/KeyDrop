@@ -324,6 +324,20 @@ enum CCSwitchWriterTests {
             t.contains(msg5, "已更新", "claude 类型按 env token 二次匹配原地更新: \(msg5)")
             let claudeCnt = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='claude'")
             t.equal(claudeCnt, "1", "claude 常驻入口不重复建")
+
+            // removeCPAResident:迁移清理 claude/codex 的既有 CPA 行;幂等;按端点+key 精确
+            let rm1 = try! w.removeCPAResident(appType: "claude", baseURL: cpaURL, clientKey: "sk-cpa-client-0001")
+            t.contains(rm1, "已移除", "claude CPA 行被移除: \(rm1)")
+            let claudeCnt2 = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='claude'")
+            t.equal(claudeCnt2, "0", "claude CPA 行清零")
+            let rm2 = try! w.removeCPAResident(appType: "claude", baseURL: cpaURL, clientKey: "sk-cpa-client-0001")
+            t.equal(rm2, "", "再次移除幂等返回空")
+            // opencode 移除会连带清 opencode.json 里的 provider 条目(clearOpencodeProvider)
+            let rm3 = try! w.removeCPAResident(appType: "opencode", baseURL: cpaURL, clientKey: "sk-cpa-client-0001")
+            t.contains(rm3, "已移除", "opencode CPA 行移除: \(rm3)")
+            // 不同端点/不同 key 不互删:opencode 还剩 0002 那条与用户 provider
+            let ocLeft = try! db.scalar("SELECT count(*) FROM providers WHERE app_type='opencode'")
+            t.expect(ocLeft == "2", "仅删匹配端点+key 的行(剩 0002 与用户 provider,实际 \(ocLeft ?? "?"))")
         }
     }
 }
