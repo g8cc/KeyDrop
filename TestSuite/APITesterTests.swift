@@ -22,6 +22,7 @@ final class MockHTTPServer {
         case claudeModels // /models → 200,纯 claude 系(测 codex→claude 反向迁移)
         case nonChatModels // /models → 200,图生在前 + chat 家族在后(测激活模型不落图生)
         case selectiveAuth // Authorization 含 invalid 的 key 返回 401,其余正常
+        case selectiveModelQuota // /models 返回 4 模型(1 个 *-free + 3 限流);chat 仅 free 模型 200,其余 429 quota
     }
     let mode: Mode
 
@@ -43,12 +44,29 @@ final class MockHTTPServer {
     }
 
     private func handle(_ client: SocketClient) {
-        guard let req = client.readRequest() else { return }
-        let line = req.components(separatedBy: "\r\n").first ?? ""
+        guard var req = client.readRequest() else { return }
+        let headerOnly = req
+        let line = headerOnly.components(separatedBy: "\r\n").first ?? ""
         let parts = line.components(separatedBy: " ")
         guard parts.count >= 2 else { return }
         let method = parts[0]
         let target = parts[1]
+        // 仅 selectiveModelQuota 的 chat POST 需要 body 里的 model 字段来区分响应。
+        // 其它模式一律不读 body → 行为与旧 mock 完全一致,不会因等待 body 而死锁。
+        // readUntil 收满 \r\n\r\n 即返回,但 URLSession 常把 header+body 一并送达,
+        // 所以先判断分隔符之后是否已有 >= content-length 的字节,已有就不再 recv
+        // (否则 readBody 会对着已发完的流死等满 SO_RCVTIMEO,4 模型 × 3s 拖死测试)。
+        if mode == .selectiveModelQuota, method == "POST", target.contains("/chat/completions"),
+           let r = headerOnly.lowercased().range(of: "content-length:"),
+           let n = Int(headerOnly.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(while: { $0.isNumber })), n > 0 {
+            var bodySoFar = ""
+            if let sep = headerOnly.range(of: "\r\n\r\n") {
+                bodySoFar = String(headerOnly[sep.upperBound...])
+            }
+            let have = bodySoFar.utf8.count
+            req = have >= n ? headerOnly : headerOnly + client.readBody(toLength: n - have)
+        }
         let authorization = req.components(separatedBy: "\r\n")
             .first { $0.lowercased().hasPrefix("authorization:") } ?? ""
         let apiKey = req.components(separatedBy: "\r\n")
@@ -57,6 +75,14 @@ final class MockHTTPServer {
         // different headers; selectiveAuth must model invalid credentials for
         // either protocol so a fallback probe cannot mask a 401.
         let invalidKey = authorization.contains("invalid") || apiKey.contains("invalid")
+        // POST body 里的 model 字段(selectiveModelQuota 按模型区分响应):
+        // JSON 形如 "model":"xxx",用捕获组直接取引号内值
+        var requestedModel = ""
+        if let re = try? NSRegularExpression(pattern: "\"model\"\\s*:\\s*\"([^\"]*)\""),
+           let m = re.firstMatch(in: req, range: NSRange(req.startIndex..., in: req)), m.numberOfRanges >= 2,
+           let gr = Range(m.range(at: 1), in: req) {
+            requestedModel = String(req[gr])
+        }
 
         if method == "GET" && target.hasPrefix("http://") {
             // HTTP 代理模式:绝对 URI,转发到目标
@@ -81,7 +107,23 @@ final class MockHTTPServer {
         }
 
         var body = ""
-        if mode == .selectiveAuth && invalidKey {
+        if mode == .selectiveModelQuota {
+            if method == "GET", target.hasSuffix("/models") {
+                // 4 个模型:仅 z-ai/glm-5.3-free 可用,composer/grok-4.5/grok-4.6 按模型限流
+                body = "{\"data\":[" + [
+                    "{\"id\":\"composer-2.5\",\"object\":\"model\"}",
+                    "{\"id\":\"grok-4.5\",\"object\":\"model\"}",
+                    "{\"id\":\"grok-4.6\",\"object\":\"model\"}",
+                    "{\"id\":\"z-ai/glm-5.3-free\",\"object\":\"model\"}"
+                ].joined(separator: ",") + "]}"
+            } else if target.contains("/chat/completions") {
+                if requestedModel.contains("free") {
+                    body = "{\"id\":\"c\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+                } else {
+                    body = "{\"error\":{\"code\":\"429\",\"message\":\"quota exhausted\"}}"
+                }
+            }
+        } else if mode == .selectiveAuth && invalidKey {
             body = "{\"error\":{\"message\":\"Unauthorized\"}}"
         } else if mode == .selectiveAuth {
             body = "{\"data\":[{\"id\":\"grok-4.6\",\"object\":\"model\"}]}"
@@ -144,7 +186,9 @@ final class MockHTTPServer {
             body = "{\"data\":[{\"id\":\"dall-e-3\",\"object\":\"model\"},{\"id\":\"deepseek-v4-flash-0731\",\"object\":\"model\"}]}"
         }
         let status: String
-        if mode == .selectiveAuth && invalidKey {
+        if mode == .selectiveModelQuota, target.contains("/chat/completions"), !requestedModel.contains("free") {
+            status = "429 Too Many Requests"
+        } else if mode == .selectiveAuth && invalidKey {
             status = "401 Unauthorized"
         } else if mode == .html200 && target.hasSuffix("/v1/models") {
             status = "401 Unauthorized"
@@ -154,7 +198,7 @@ final class MockHTTPServer {
             status = "401 Unauthorized"
         } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
             status = "424 Failed Dependency"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .selectiveAuth || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .selectiveAuth || mode == .selectiveModelQuota || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"
@@ -234,6 +278,25 @@ final class SocketClient {
     }
     func readRequest() -> String? {
         readUntil("\r\n\r\n")
+    }
+    // 仅供 selectiveModelQuota 用:读满 POST body 拿 model 字段。
+    // 带 SO_RCVTIMEO 兜底,绝不因对端不再发数据而死等(URLSession 可能已把 body
+    // 和 header 分包、或根本不等 body)。其他 mode 的 mock 不调用它,行为不变。
+    func readBody(toLength want: Int) -> String {
+        var tv = timeval(tv_sec: 0, tv_usec: __darwin_suseconds_t(300 * 10_000)) // 3s
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        defer {
+            var off = timeval(tv_sec: 0, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &off, socklen_t(MemoryLayout<timeval>.size))
+        }
+        var got = ""
+        var buf = [UInt8](repeating: 0, count: 1024)
+        while got.utf8.count < want {
+            let n = Darwin.recv(fd, &buf, min(buf.count, want - got.utf8.count), 0)
+            if n <= 0 { break }   // 超时/关闭都退出,不死等
+            got += String(decoding: buf[0..<n], as: UTF8.self)
+        }
+        return got
     }
     func readResponse() -> String {
         readUntil("\r\n\r\n") ?? ""

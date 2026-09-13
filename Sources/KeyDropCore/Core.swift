@@ -246,6 +246,21 @@ public final class Core {
                         throw ParseError.io("输入的 \(tried.count) 个模型均验证失败: \(tried.joined(separator: ", "))。最后失败: \(lastFail)")
                     }
                 }
+            } else if !test.workingModels.isEmpty, !test.quotaModels.isEmpty,
+                      let picker = pickModels {
+                // 部分模型限流(其余可用):key 是活的,但默认列表含限流项,
+                // 强制弹窗让用户挑(哪怕 ≤5)。test.models 已按 working 优先、限流沉底排序,
+                // 弹窗顶部即最可能可用的模型。真实事故:4 模型 1 免费可用 3 限流,
+                // 旧逻辑 ≤5 自动全导,用户没法选
+                let picked = picker(test.models)
+                if picked.isEmpty { throw ParseError.io("已取消选择模型") }
+                selectedModels = picked
+                notes.append("部分模型限流(\(test.quotaModels.count) 个),已按你的选择导入 \(picked.count) 个")
+            } else if !test.workingModels.isEmpty, !test.quotaModels.isEmpty {
+                // CLI 无选择器:自动排除确认限流的模型(test.models 已按 working 优先重排)
+                let q = Set(test.quotaModels)
+                selectedModels = test.models.filter { !q.contains($0) }
+                notes.append("自动排除 \(q.count) 个限流模型: \(test.quotaModels.prefix(3).joined(separator: "、"))\(q.count > 3 ? " 等" : "")")
             } else if test.models.count <= 5 {
                 selectedModels = test.models
                 notes.append("可用模型仅 \(test.models.count) 个,已全部导入")

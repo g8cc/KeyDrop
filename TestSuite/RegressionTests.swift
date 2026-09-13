@@ -494,6 +494,50 @@ enum RegressionTests {
             t.contains(outcome.lines.joined(separator: "\n"), "自动剔除 1 个失效 key", "结果提示剔除数量")
         }
 
+        // 真实事故(hashneuron):4 模型中首选 composer 429 quota、glm-5.3-free 可用,
+        // 旧逻辑 chat 只探 models.first → 整 key 误判无额度进额度区,用户"导入成功但看不到"
+        h.runSuite("Regression.部分模型限流不绑架整 key") { t in
+            guard let srv = try? MockHTTPServer(mode: .selectiveModelQuota) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            // ① 探测层:key 可用、不误判 quota;free 模型排最前;3 个限流模型记录在案
+            let res = APITester.test(url: base, key: "sk-partial-quota-111111", timeout: 5)
+            t.expect(res.ok, "有 free 模型可用 → key 判可用: \(res.detail)")
+            t.expect(!res.quotaExhausted, "部分限流不得判整 key 无额度")
+            t.expect(!res.models.contains("test"), "占位 test 不混入模型列表")
+            t.equal(res.models.first, "z-ai/glm-5.3-free", "free 模型排最前")
+            t.equal(Set(res.quotaModels).count, 3, "3 个限流模型被逐个确认")
+            t.equal(res.workingModels, ["z-ai/glm-5.3-free"], "free 模型确认可用")
+            // ② GUI 导入(有选择器):部分限流 → 强制弹窗(哪怕 4≤5),用户挑中的才导入
+            let env = try! TestEnv("reg-partial-gui")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", "port: 18317\n")
+            let core = Core()
+            var pickerCalled = false
+            let gui = try! core.add(
+                raw: base + " sk-partial-quota-111111",
+                ccOverride: false, cpaOverride: true, dshOverride: false, force: false
+            ) { ms in
+                pickerCalled = true
+                return ms.filter { $0.contains("free") }   // 用户只挑免费模型
+            }
+            t.expect(pickerCalled, "部分限流时强制弹选择器(修复前 ≤5 自动全导无法选)")
+            t.equal(gui.entry.models, ["z-ai/glm-5.3-free"], "只导入用户挑中的模型")
+            t.equal(gui.entry.health, "ok", "key 落可用区而非额度区")
+            // ③ CLI 导入(无选择器):自动排除限流模型
+            let env2 = try! TestEnv("reg-partial-cli")
+            defer { env2.cleanup() }
+            env2.write("cpa-config.yaml", "port: 18317\n")
+            let core2 = Core()
+            let cli = try! core2.add(
+                raw: base + " sk-partial-quota-222222",
+                ccOverride: false, cpaOverride: true, dshOverride: false, force: false
+            )
+            t.equal(cli.entry.models, ["z-ai/glm-5.3-free"], "CLI 自动排除 3 个限流模型")
+            t.contains(cli.lines.joined(separator: "\n"), "自动排除 3 个限流模型", "提示排除: \(cli.lines.joined(separator: " | ").prefix(120))")
+        }
+
         h.runSuite("Regression.CPA nvapi 多 key 全链路") { t in
             let env = try! TestEnv("reg-cpa-nvapi")
             defer { env.cleanup() }

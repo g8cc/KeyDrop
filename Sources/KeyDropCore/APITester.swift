@@ -11,7 +11,13 @@ public struct APITestResult {
     public let quotaExhausted: Bool
     /// chat 端点确认不可用(429 限流无 quota 词 / 402 / 424 / 5xx)→ 移出可用列表
     public let chatDegraded: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false) {
+    /// 多模型探测中确认可用的模型(chat 200/400/404)
+    public let workingModels: [String]
+    /// 多模型探测中确认额度耗尽的模型(逐个 429/402 + quota 词)。
+    /// key 级判定不再被单个模型的 429 绑架:任一模型可用即 key 可用,
+    /// 限流模型交给调用方排除/提示(真实事故:免费模型可用但首选模型 429,整 key 误入额度区)
+    public let quotaModels: [String]
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = []) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -20,6 +26,8 @@ public struct APITestResult {
         self.needsProxy = needsProxy
         self.quotaExhausted = quotaExhausted
         self.chatDegraded = chatDegraded
+        self.workingModels = workingModels
+        self.quotaModels = quotaModels
     }
 }
 
@@ -237,22 +245,51 @@ public enum APITester {
                 }
                 style = "openai"
                 // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
-                // 429/402 + quota 词 → 额度耗尽;429 限流/402/424/5xx → 端点异常;400/404 → 正常
-                let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: models.first ?? "test")
-                if let st = chat.quota {
-                    return APITestResult(ok: true, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st) quota exhausted(无额度)",
-                                         authFailed: false, quotaExhausted: true)
+                // chat 探测多模型(上限 4,free 字样模型优先):单个模型 429 不代表整 key 无额度。
+                // 任一模型 200/400/404 → key 可用;探测过的模型全部 quota → 才判无额度;
+                // 401/403 → key 失效短路。真实事故:4 模型中首选 composer 429、
+                // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
+                let probeOrder = chatProbeOrder(models)
+                var working: [String] = []
+                var quotaModels: [String] = []
+                var degradedModel: (String, Int)? = nil
+                var authModel: (String, Int)? = nil
+                for probe in probeOrder {
+                    let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe)
+                    if let st = chat.authStatus { authModel = (probe, st); break }
+                    if chat.quota != nil { quotaModels.append(probe); continue }
+                    if let st = chat.degraded {
+                        if degradedModel == nil { degradedModel = (probe, st) }
+                        continue
+                    }
+                    working.append(probe)
                 }
-                if let st = chat.degraded {
+                if let (m, st) = authModel {
                     return APITestResult(ok: false, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(服务不可用/限流)",
+                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(\(m) 认证失败/key 失效)",
+                                         authFailed: true)
+                }
+                // models 为空时探测用的是占位 "test",不得混进返回模型列表;有真实模型才重排
+                let hasRealModels = !models.isEmpty
+                if !working.isEmpty {
+                    let q = quotaModels.isEmpty ? "" : ",其中 \(quotaModels.count) 个模型限流(\(quotaModels.prefix(3).joined(separator: "、"))\(quotaModels.count > 3 ? " 等" : ""))"
+                    let reordered = hasRealModels
+                        ? (working + models.filter { !Set(working + quotaModels).contains($0) } + quotaModels)
+                        : models
+                    return APITestResult(ok: true, style: style, models: reordered,
+                                         detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q,
+                                         authFailed: false,
+                                         workingModels: hasRealModels ? working : [], quotaModels: hasRealModels ? quotaModels : [])
+                }
+                if let (m, st) = degradedModel {
+                    return APITestResult(ok: false, style: style, models: models,
+                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(\(m) 服务不可用/限流)",
                                          authFailed: false)
                 }
-                if let st = chat.authStatus {
-                    return APITestResult(ok: false, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(认证失败/key 失效)",
-                                         authFailed: true)
+                if !quotaModels.isEmpty, hasRealModels {
+                    return APITestResult(ok: true, style: style, models: models,
+                                         detail: "GET \(ep) → 200, 但探测的 \(quotaModels.count) 个模型均 quota exhausted(无额度)",
+                                         authFailed: false, quotaExhausted: true, quotaModels: quotaModels)
                 }
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
@@ -279,6 +316,15 @@ public enum APITester {
         authFailed = authFailed || chat.1
         lastErr += "; \(chat.2)"
         return APITestResult(ok: false, style: style, models: [], detail: lastErr, authFailed: authFailed)
+    }
+
+    /// chat 探测模型采样:free/试用字样优先(免费档最可能通,真实中转站常按模型限额),
+    /// 其余保序;上限 4 个 —— 模型少全试不加压,模型多也只花 4 次请求
+    static func chatProbeOrder(_ models: [String]) -> [String] {
+        let capped = models.isEmpty ? ["test"] : models
+        let freeFirst = capped.filter { $0.lowercased().contains("free") }
+        let rest = capped.filter { !$0.lowercased().contains("free") }
+        return Array((freeFirst + rest).prefix(4))
     }
 
     /// POST chat 健康检查结果
