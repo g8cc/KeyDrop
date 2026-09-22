@@ -379,9 +379,12 @@ final class AppState: ObservableObject {
                 return data.count > 0
             }.value
             cpaAPIOk = ok
-            cpaAPIStatus = ok
-                ? "已保存并验证通过:API 模式生效(此后不再触碰 CPA 数据目录)"
-                : "连接失败:检查 CPA 是否运行、密钥是否为管理面板口令"
+            if ok {
+                // 成功即关窗:设置已持久化,下次打开此面板可再次查看状态
+                cpaAPISheetShown = false
+            } else {
+                cpaAPIStatus = "连接失败:检查 CPA 是否运行、密钥是否为管理面板口令"
+            }
         }
     }
     func clearCPAAPI() {
@@ -1623,9 +1626,13 @@ struct PanelView: View {
                 targetChip("CPA", on: state.useCPA, color: Color(red: 0.28, green: 0.48, blue: 0.82)) {
                     state.toggleUseCPA()
                 }
-                .contextMenu {
-                    Button("CPA 管理 API…") { state.openCPAAPI() }
+                Button { state.openCPAAPI() } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.secondary)
                 }
+                .buttonStyle(.borderless)
+                .help("CPA 管理 API 配置:密钥化后 KeyDrop 不触碰 CPA 数据目录,根治「文稿」弹窗")
                 targetChip("DSH", on: state.useDSH, color: Color(red: 0.85, green: 0.55, blue: 0.15)) {
                     state.toggleUseDSH()
                 }
