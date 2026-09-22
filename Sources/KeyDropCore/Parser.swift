@@ -313,8 +313,12 @@ public enum Parser {
                 line = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
             } else if let ci = line.firstIndex(of: ":") {
                 let pre = String(line[line.startIndex..<ci])
-                if pre.count < 60, !pre.contains("http"), !pre.contains(" ") {
-                    lhs = pre.trimmingCharacters(in: .whitespaces)
+                // 标签冒号两侧允许空格(京东云控制台样式:"keybase64 : cGst…"):
+                // 只要冒号前是干净标签(去空白后无内部空格)就按「标签:值」处理。
+                // 曾因只认无空格写法,标签被逐词切分漏进模型列表(真实事故:jdcloud 导入)
+                let trimmedPre = pre.trimmingCharacters(in: .whitespaces)
+                if pre.count < 60, !pre.contains("http"), !trimmedPre.contains(" ") {
+                    lhs = trimmedPre
                     line = String(line[line.index(after: ci)...]).trimmingCharacters(in: .whitespaces)
                 } else {
                     let tokens = line.components(separatedBy: CharacterSet.whitespaces)

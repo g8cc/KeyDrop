@@ -1,14 +1,43 @@
 import Foundation
 
-final class CPAWriter {
+public enum CPAWriteError: Error, LocalizedError {
+    case notFound(String)
+    public var errorDescription: String? {
+        switch self {
+        case .notFound(let p): return "CPA config 不存在: \(p)"
+        }
+    }
+}
+
+public final class CPAWriter {
 
     let configPath: String
 
-    init(configPath: String) {
+    public init(configPath: String) {
         self.configPath = configPath
     }
 
-    static func locateConfig() -> String? {
+    /// CPA 跑在 Docker 时,宿主机 loopback 代理(127.0.0.1/localhost/0.0.0.0)在容器内
+    /// 指向容器自身,直连测试能过(宿主机视角)但写进 config 后 CPA 取不到代理,导入的 key
+    /// 全废。此处按部署形态改写 host 为 host.docker.internal(保留 scheme/port/path)。
+    /// 判定 docker:显式 KEYDROP_CPA_DOCKER=1,或现有 config 里已有 proxy-url 含
+    /// host.docker.internal(用户已在用 docker 代理)。KEYDROP_CPA_DOCKER=0 强制非 docker。
+    /// 纯函数(不碰文件),供单测直接断言
+    public static func rewriteProxyForDocker(_ proxy: String?, configContent: String) -> String? {
+        guard let proxy = proxy, !proxy.isEmpty else { return proxy }
+        let env = ProcessInfo.processInfo.environment["KEYDROP_CPA_DOCKER"]
+        if env == "0" { return proxy }
+        let isDocker = env == "1" || configContent.contains("host.docker.internal")
+        guard isDocker else { return proxy }
+        guard var comps = URLComponents(string: proxy), let host = comps.host else { return proxy }
+        let loopback = host == "127.0.0.1" || host == "localhost" || host == "0.0.0.0"
+                      || host.hasPrefix("127.")
+        guard loopback else { return proxy }
+        comps.host = "host.docker.internal"
+        return comps.string ?? proxy
+    }
+
+    public static func locateConfig() -> String? {
         if let override = ProcessInfo.processInfo.environment["KEYDROP_CPA_CONFIG"] {
             return FileManager.default.fileExists(atPath: override) ? override : nil
         }
@@ -117,12 +146,12 @@ final class CPAWriter {
 
     // MARK: - CPA endpoint info
 
-    struct CPAEndpoint {
-        let baseURL: String
-        let clientKey: String
+    public struct CPAEndpoint {
+        public let baseURL: String
+        public let clientKey: String
     }
 
-    static func endpointInfo() -> CPAEndpoint? {
+    public static func endpointInfo() -> CPAEndpoint? {
         let port = ProcessInfo.processInfo.environment["KEYDROP_CPA_PORT"]
             ?? readPortFromConfig() ?? "8317"
         let host = ProcessInfo.processInfo.environment["KEYDROP_CPA_HOST"] ?? "127.0.0.1"
@@ -152,15 +181,211 @@ final class CPAWriter {
         return nil
     }
 
+    // MARK: - image channel
+
+    /// 生图 key 写入 CPA:落到独立的 openai-compatibility 聚合条目
+    /// (`name = host:port-image`,base-url 与文本条目相同)。必须分条目:
+    /// - 同条目会让文本 `--add` 的「精选保护」逻辑把生图模型灌进 CPA 常驻
+    ///   入口(文本工具看到 image 模型),反向导入时又会因 models 非空而
+    ///   跳过探测模型 → 文本 provider 一个模型都没有
+    /// - 分条目后两条链路互不干扰,CPA 按模型名把 /v1/images/generations
+    ///   路由到打了 `image: true` 的这条
+    /// 幂等:重复 image-add 同上游只合 key(去重)、重写模型标记,不产生重复项
+    public func addImageChannel(baseURL: String, key: String, models: [String], proxy: String? = nil) throws -> String {
+        let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelList = models.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard !k.isEmpty, !url.isEmpty else { throw WriterError.missingKey }
+        guard !modelList.isEmpty else { throw WriterError.file("生图模型列表为空") }
+        guard FileManager.default.fileExists(atPath: configPath) else {
+            throw CPAWriteError.notFound(configPath)
+        }
+        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try Self.validateYAML(path: configPath)
+            let content = try String(contentsOfFile: configPath, encoding: .utf8)
+            let proxy = Self.rewriteProxyForDocker(proxy, configContent: content)
+            var lines = content.components(separatedBy: "\n")
+            let providerName = aggregatedName(for: url) + "-image"
+            if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
+                // keys 合并(去重);models 交给 markImageModel 逐项处理
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [k], models: [])
+                for m in modelList {
+                    // 每次插入都可能位移行号,逐项重新定位条目范围
+                    let fresh = findAggregatedEntry(in: lines, providerName: providerName) ?? entryRange
+                    markImageModel(&lines, entryRange: fresh, model: m)
+                }
+            } else {
+                try appendAggregatedEntry(&lines, providerName: providerName, baseURL: url,
+                                          keys: [k], models: modelList, proxy: proxy)
+                for m in modelList {
+                    guard let fresh = findAggregatedEntry(in: lines, providerName: providerName) else { break }
+                    markImageModel(&lines, entryRange: fresh, model: m)
+                }
+            }
+            try atomicWrite(lines.joined(separator: "\n"))
+            return "已写入 CPA 生图条目「\(providerName)」模型 \(modelList.joined(separator: ", "))(image: true);CPA 自动热重载"
+        }
+    }
+
+    /// 在聚合条目内确保 `model` 这个 models 子项带 `image: true`:
+    /// - 子项存在且已有 image: → 值改成 true(保留其它字段)
+    /// - 子项存在无 image: → 在子项末尾插 image: true
+    /// - models 段存在但无此子项 → 段尾追加 name+alias+image: true
+    /// - 条目无 models 段 → 条目末尾新建 models: 段带标记项
+    /// 幂等:同 key 重复 image-add 只会重写 image: true 行,不产生重复项
+    /// (子项判重按 `- name:` 行精确匹配,`entryModels` 同源读 name)
+    private func markImageModel(_ lines: inout [String], entryRange: Range<Int>, model: String) {
+        guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
+            // 条目无 models 段:在条目末尾(去尾随空行)追加 models: 头 + 带标记的模型项。
+            // 不能走 mergeAggregatedModels —— 它只写 name+alias,会漏掉 image: true
+            let entryIndent = String(lines[entryRange.lowerBound].prefix(while: { $0 == " " || $0 == "\t" }))
+            let propIndent = entryIndent + "  "
+            var insertAt = entryRange.upperBound
+            while insertAt > entryRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
+            let block = [
+                "\(propIndent)models:",
+                "\(propIndent)  - name: \(yamlScalar(model))",
+                "\(propIndent)    alias: \(yamlScalar(model))",
+                "\(propIndent)    image: true",
+            ]
+            lines.insert(contentsOf: block, at: insertAt)
+            return
+        }
+        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
+        // 遍历 models 子项找 name == model
+        var i = header + 1
+        while i < entryRange.upperBound {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { i += 1; continue }
+            let curIndent = line.prefix(while: { $0 == " " || $0 == "\t" }).count
+            if curIndent <= headerIndent { break } // 出了 models 段
+            if trimmed.hasPrefix("- name:") {
+                let nm = stripYAMLValue(String(trimmed.dropFirst("- name:".count))).trimmingCharacters(in: .whitespaces)
+                if nm == model {
+                    // 找到子项:确定其行范围(到下一条同级或更浅缩进的非空行为止)
+                    var end = entryRange.upperBound
+                    var j = i + 1
+                    while j < entryRange.upperBound {
+                        let lj = lines[j]
+                        let tj = lj.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if tj.isEmpty { j += 1; continue }
+                        let ij = lj.prefix(while: { $0 == " " || $0 == "\t" }).count
+                        if ij <= curIndent { end = j; break }
+                        j += 1
+                    }
+                    let imgIndent = String(repeating: " ", count: curIndent + 2)
+                    if let imgLine = (i+1..<end).first(where: {
+                        lines[$0].trimmingCharacters(in: .whitespaces).hasPrefix("image:")
+                    }) {
+                        lines[imgLine] = "\(imgIndent)image: true"
+                    } else {
+                        // 插到子项末尾(end 前进至最后一条非空子项行之后)
+                        var ins = end
+                        while ins > i + 1, lines[ins - 1].trimmingCharacters(in: .whitespaces).isEmpty { ins -= 1 }
+                        lines.insert("\(imgIndent)image: true", at: ins)
+                    }
+                    return
+                }
+            }
+            i += 1
+        }
+        // models 段存在但无此子项:段尾追加带标记的完整项
+        let itemIndent = String(repeating: " ", count: headerIndent + 2)
+        var insertAt = header + 1
+        var j2 = header + 1
+        while j2 < entryRange.upperBound {
+            let lj = lines[j2]
+            let tj = lj.trimmingCharacters(in: .whitespacesAndNewlines)
+            if tj.isEmpty { j2 += 1; continue }
+            let ij = lj.prefix(while: { $0 == " " || $0 == "\t" }).count
+            if ij <= headerIndent { break }
+            j2 += 1
+            insertAt = j2
+        }
+        while insertAt > header + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
+        let block = [
+            "\(itemIndent)- name: \(yamlScalar(model))",
+            "\(itemIndent)  alias: \(yamlScalar(model))",
+            "\(itemIndent)  image: true",
+        ]
+        lines.insert(contentsOf: block, at: insertAt)
+    }
+
     // MARK: - add
 
-    func add(_ p: ParsedKey, proxy: String? = nil) throws -> String {
-        // flock 包住整个「读→改→写」临界区:CLI 与菜单栏进程并发写同一 config.yaml
-        // 时,读出的旧内容会把对方刚写的条目覆盖掉,原地写甚至可能交错损坏文件
-        _ = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
-            try addSingle(key: p.key, url: p.url, model: p.model, proxy: proxy)
+    /// 单 key 写入 openai-compatibility 聚合条目(与多 key addMulti 同一条路)。
+    /// 不再走 claude-api-key 平铺段的原因:
+    /// - collectCuratedModels(cpa-sync 常驻入口的模型来源)只读聚合段,平铺段
+    ///   条目对 cpa-sync 隐形 → 下次同步会丢掉这些模型
+    /// - 聚合段才有轮询/weight/精选保护这套成体系的行为
+    /// 复用 addMultiLocked 的写入逻辑(合并/新建/精选保护/原子写),但不做 key 探测:
+    /// 调用方(Core.add)已对 key 做过认证测试,models 传本次 selectedModels(用户已选)。
+    func addAggregated(baseURL: String, key: String, models: [String], proxy: String? = nil) throws -> String {
+        let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !k.isEmpty else { throw WriterError.missingKey }
+        guard FileManager.default.fileExists(atPath: configPath) else {
+            throw WriterError.file("CPA config 不存在: \(configPath)")
         }
-        return "已写入 CPA 配置(\(configPath));CPA 运行时会自动热重载"
+        let writeMsg = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try addMultiLocked(baseURL: baseURL, keys: [k], models: models, proxy: proxy)
+        }
+        return writeMsg.0
+    }
+
+    /// 刷新时按用户重新勾选的列表「整体替换」聚合条目 models 段。
+    /// 与 addMultiLocked 的「只合 key 不动精选列表」不同:refresh 的语义是用户对
+    /// 模型列表的重新确认,被取消勾选的模型必须同步移除,否则 CPA 条目永远停在
+    /// 首次导入的列表(真实场景:cc 系已更新 4 模型,CPA 仍停在误杀后剩下的 1 个)。
+    /// 条目不存在时抛错(由调用方提示),绝不重建已删除的条目
+    public func updateAggregatedModels(baseURL: String, models: [String]) throws -> String {
+        var uniq: [String] = []
+        var seen = Set<String>()
+        for m in models {
+            let t = m.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty, seen.insert(t).inserted { uniq.append(t) }
+        }
+        guard !uniq.isEmpty else { throw WriterError.file("更新 CPA 模型列表收到空列表") }
+        guard FileManager.default.fileExists(atPath: configPath) else {
+            throw WriterError.file("CPA config 不存在: \(configPath)")
+        }
+        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try Self.validateYAML(path: configPath)
+            let content = try String(contentsOfFile: configPath, encoding: .utf8)
+            var lines = content.components(separatedBy: "\n")
+            let providerName = aggregatedName(for: baseURL)
+            guard let entryRange = findAggregatedEntry(in: lines, providerName: providerName) else {
+                throw WriterError.file("CPA 聚合条目不存在: \(providerName)")
+            }
+            guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
+                // 条目无 models 段(上次探测失败):补写本次列表,复用 merge 的插入逻辑
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [], models: uniq)
+                try atomicWrite(lines.joined(separator: "\n"))
+                return "已补写 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
+            }
+            let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
+            // models 段范围:header+1 起直到缩进 ≤ header 的非空行(段内其它子键更深缩进,一并替换)
+            var end = header + 1
+            var itemIndent = String(repeating: " ", count: headerIndent + 4)
+            while end < entryRange.upperBound {
+                let line = lines[end]
+                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { end += 1; continue }
+                let ind = line.prefix(while: { $0 == " " || $0 == "\t" }).count
+                if ind <= headerIndent { break }
+                if lines[end].trimmingCharacters(in: .whitespaces).hasPrefix("- name:") {
+                    itemIndent = String(repeating: " ", count: ind)
+                }
+                end += 1
+            }
+            var block: [String] = []
+            for m in uniq {
+                block.append("\(itemIndent)- name: \(yamlScalar(m))")
+                block.append("\(itemIndent)  alias: \(yamlScalar(m))")
+            }
+            lines.replaceSubrange((header + 1)..<end, with: block)
+            try atomicWrite(lines.joined(separator: "\n"))
+            return "已更新 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
+        }
     }
 
     /// 多 key 写聚合条目到 `openai-compatibility:` 段下,同 baseURL 的 key 归一组,
@@ -235,9 +460,9 @@ final class CPAWriter {
     /// 返回 (消息, 条目最终模型列表)。已有非空 models 的条目视为用户精选:
     /// 再导入只合并 key,绝不追加探测模型(真实反馈:CPA 聚合 /models 混入 22 家
     /// 上游共 100+ 模型,用户只要 SOTA 四件套,KeyDrop 不得把一大堆回填)
-    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy: String? = nil) throws -> (String, [String]) {
-        try Self.validateYAML(path: configPath)
+    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy rawProxy: String? = nil) throws -> (String, [String]) {        try Self.validateYAML(path: configPath)
         let content = try String(contentsOfFile: configPath, encoding: .utf8)
+        let proxy = Self.rewriteProxyForDocker(rawProxy, configContent: content)
         var lines = content.components(separatedBy: "\n")
         let providerName = aggregatedName(for: baseURL)
         var finalModels = probedModels
@@ -360,56 +585,6 @@ final class CPAWriter {
             }
         }
         return t
-    }
-
-    private func addSingle(key: String?, url: String?, model: String?, proxy: String? = nil) throws {        guard let key, !key.isEmpty else { throw WriterError.missingKey }
-        guard let url, !url.isEmpty else { throw WriterError.missingURL }
-        guard FileManager.default.fileExists(atPath: configPath) else {
-            throw WriterError.file("CPA config 不存在: \(configPath)")
-        }
-        // 写入前校验现有配置,已损坏则拒绝修改(避免继续污染)
-        do {
-            try Self.validateYAML(path: configPath)
-        } catch {
-            throw WriterError.file("现有 CPA 配置 YAML 非法,拒绝修改: \(error.localizedDescription)\n(可用 config.yaml.keydrop-bak 恢复)")
-        }
-        let content = try String(contentsOfFile: configPath, encoding: .utf8)
-        var lines = content.components(separatedBy: "\n")
-        let section = findSection(in: lines)
-        if let section,
-           splitItems(lines: lines, section: section).contains(where: { itemContainsAPIKey($0, in: lines, key: key) }) {
-            throw WriterError.file("该 key 已存在于 CPA 配置,跳过")
-        }
-
-        let secStart = section?.start ?? lines.count
-        let secEnd = section?.end ?? lines.count
-        let itemIndent = section?.itemIndent ?? "  "
-
-        var block: [String] = []
-        block.append("\(itemIndent)- api-key: \(yamlScalar(key))")
-        block.append("\(itemIndent)  base-url: \(yamlScalar(url))")
-        if let proxy, !proxy.isEmpty {
-            block.append("\(itemIndent)  proxy-url: \(yamlScalar(proxy))")
-        }
-        if let model, !model.isEmpty {
-            block.append("\(itemIndent)  models:")
-            block.append("\(itemIndent)    - name: \(yamlScalar(model))")
-            block.append("\(itemIndent)      alias: \(yamlScalar(model))")
-        }
-
-        if section != nil {
-            var insertAt = secEnd
-            while insertAt > secStart + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty {
-                insertAt -= 1
-            }
-            lines.insert(contentsOf: block, at: insertAt)
-        } else {
-            if let last = lines.last, !last.isEmpty { lines.append("") }
-            lines.append("claude-api-key:")
-            lines.append(contentsOf: block)
-        }
-
-        try atomicWrite(lines.joined(separator: "\n"))
     }
 
     // MARK: - aggregated write helpers

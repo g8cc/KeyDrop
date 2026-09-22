@@ -273,6 +273,69 @@ enum ImportPipelineTests {
             t.contains(e4.read("codex.toml"), "model = \"gpt-5.6-sol\"", "[chatOK] 落盘 codex")
         }
 
+        // MARK: - 点分模型名不误杀(真实事故:stepfun step_plan 7 选 5 只剩 1)
+
+        h.runSuite("导入管线.点分模型名不误杀") { t in
+            // add + picker:勾选含点分名的子集,不得被 looksLikeModel 域名规则静默过滤
+            let (env, core) = makeEnv("pipe-dotted")
+            defer { env.cleanup() }
+            guard let srv = try? MockHTTPServer(mode: .dottedModels) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let picked = ["step-3.7-flash", "step-3.5-flash", "step-3.5-flash-2603", "step-image-edit-2"]
+            let r = try! core.add(raw: "http://127.0.0.1:\(srv.port) sk-dottedmodels11111111",
+                                  ccOverride: true, cpaOverride: false, dshOverride: false, force: false) { _ in picked }
+            // 勾选 4 个(含 3 个点分名):修复前 strict 过滤只剩无点的 step-image-edit-2
+            t.equal(r.entry.models, picked, "[add] 勾选的点分模型全部保留")
+            t.equal(r.entry.model, picked.first, "[add] model=勾选第一个")
+            t.contains(env.read("opencode.json"), "step-3.7-flash", "[add] 点分模型落盘 opencode")
+
+            // refresh:弹窗选项必须是原始 /models 列表,点分名不得被预杀
+            var refreshGot: [String]? = nil
+            let msg = try! core.refreshModels(entryIDPrefix: r.entry.id) { options in
+                refreshGot = options
+                return picked
+            }
+            t.notNil(refreshGot)
+            t.equal(refreshGot?.count, 7, "[refresh] 选项含全部 7 个原始模型")
+            t.expect(refreshGot?.contains("step-3.7-flash") == true, "[refresh] 点分模型在选项中")
+            t.contains(msg, "已更新 4 个", "[refresh] 勾选子集照常更新")
+            let e1 = core.history.snapshot().first { $0.id == r.entry.id }
+            t.equal(e1?.models, picked, "[refresh] 条目模型保持勾选子集")
+        }
+
+        // MARK: - 刷新同步 CPA 聚合条目模型列表(整体替换,取消勾选的同步移除)
+
+        h.runSuite("Regression.refresh 同步 CPA 模型列表") { t in
+            let env = try! TestEnv("reg-cpa-refresh")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", "port: 18317\napi-keys:\n  - sk-client000000000\n")
+            guard let srv = try? MockHTTPServer(mode: .dottedModels) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let core = Core()
+            let r = try! core.add(raw: "http://127.0.0.1:\(srv.port) sk-cparefresh00000001",
+                                  ccOverride: false, cpaOverride: true, dshOverride: false, force: false) { _ in
+                ["step-3.7-flash", "step-image-edit-2"]
+            }
+            t.expect(r.ok, "导入成功")
+            var cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "- name: step-3.7-flash", "初选模型写入 CPA")
+            t.expect(!cfg.contains("step-3.5-flash"), "未选模型不在 CPA")
+
+            // 刷新重选 → CPA 模型列表整体替换
+            let msg = try! core.refreshModels(entryIDPrefix: r.entry.id) { _ in
+                ["step-3.5-flash", "step-5-preview", "step-image-edit-2"]
+            }
+            t.contains(msg, "CPA", "刷新消息含 CPA 同步结果")
+            cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "- name: step-3.5-flash", "新勾选模型写入")
+            t.contains(cfg, "- name: step-5-preview", "新勾选模型写入 2")
+            t.contains(cfg, "alias: step-3.5-flash", "alias 同步写入")
+            t.expect(!cfg.contains("step-3.7-flash"), "被取消勾选的模型同步移除")
+            t.contains(cfg, "sk-cparefresh00000001", "key 保留不动")
+        }
+
         // MARK: - 代理随写传播
 
         h.runSuite("导入管线.代理传播") { t in

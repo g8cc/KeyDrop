@@ -34,10 +34,18 @@ final class Harness {
         expect(haystack.contains(needle), msg.isEmpty ? "「\(needle)」不在「\(haystack)」中" : msg, file: file, line: line)
     }
 
-    func runSuite(_ name: String, _ body: (Harness) -> Void) {
+    func runSuite(_ name: String, _ body: (Harness) throws -> Void) {
         let h = Harness()
         h.suiteName = name
-        body(h)
+        do {
+            try body(h)
+        } catch {
+            h.failures.append(Failure(
+                file: #fileID,
+                line: #line,
+                msg: "测试抛出未处理错误: \(error.localizedDescription)"
+            ))
+        }
         passed += h.passed
         for f in h.failures {
             failures.append(Failure(file: f.file, line: f.line, msg: "\(name): \(f.msg)"))
@@ -74,6 +82,9 @@ final class TestEnv {
         // 未设置时默认 1(cc-switch「运行中」),与历史行为一致
         setenv("KEYDROP_FAKE_CC_RUNNING", "1", 0)
         setenv("KEYDROP_PROXY", "", 1)
+        // 自动代理探测隔离:开发者本机常有真实代理(7890)在监听,探测命中会把
+        // 回环 mock 的请求塞进真实代理(mihomo 对回环目标返 502),污染测试结果
+        setenv("KEYDROP_NO_AUTOPROXY", "1", 1)
         // 隔离加固:以下路径若不显式指向临时目录,测试可能触达开发者本机的真实文件
         // KEYDROP_LLM_PARSE=0:规则解析失败时不得真连本机 LLM 端点(127.0.0.1:8317, 15s 超时)
         setenv("KEYDROP_LLM_PARSE", "0", 1)

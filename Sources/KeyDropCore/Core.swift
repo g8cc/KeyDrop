@@ -19,6 +19,24 @@ public final class Core {
         ProcessInfo.processInfo.environment["KEYDROP_APP"] ?? "opencode"
     }
 
+    /// 代理输入规范化(真实反馈:顶部代理框要手打一整串 URL 还显示不全)。
+    /// "7890" → http://127.0.0.1:7890;"host:port" → http://host:port;
+    /// 已带 scheme 原样保留。纯函数,供单测。
+    public static func normalizeProxyInput(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        if s.contains("://") { return s }
+        if s.count <= 5, let port = Int(s), port > 0, port <= 65535 {
+            return "http://127.0.0.1:\(s)"
+        }
+        if s.contains(":"),
+           let comps = URLComponents(string: "http://" + s),
+           comps.host != nil, comps.host?.isEmpty == false, comps.port != nil {
+            return "http://" + s
+        }
+        return s
+    }
+
     let cc = CCSwitchWriter()
     public let history = HistoryStore.shared
     public let prefs = Prefs.shared
@@ -42,7 +60,10 @@ public final class Core {
         let proxyURL: String? = {
             if let proxy, !proxy.isEmpty { return proxy }
             let p = prefs.proxy
-            return p.isEmpty ? nil : p
+            if !p.isEmpty { return p }
+            // 用户确认本机代理常开:设置未填时自动探测本机代理,直连失败会自动补测
+            guard ProcessInfo.processInfo.environment["KEYDROP_NO_AUTOPROXY"] != "1" else { return nil }
+            return Core.detectLocalProxy()
         }()
         let rawLines = raw.split(whereSeparator: { $0.isNewline })
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -196,13 +217,22 @@ public final class Core {
         parsed.name = name
 
         var selectedModels: [String] = []
+        // 结果是否来自 picker(用户在弹窗里从真实 /models 列表勾选或手输)。
+        // picker 结果不得再过 looksLikeModel 去噪(见下方 strict 过滤处注释)
+        var pickedViaPicker = false
         var addHealth: (health: String, detail: String)? = nil
+        var probedNeedsProxy = false
         if !force {
             let test = APITester.test(url: url, key: key, proxy: proxyURL)
+            noteProxyWorked(needsProxy: test.needsProxy, used: proxyURL)
             if !test.ok {
                 throw ParseError.io("测试失败,未写入。\(test.detail)\n(确认真实或 --force 跳过测试)")
             }
             addHealth = Self.healthFor(test)
+            probedNeedsProxy = test.needsProxy
+            // 直连已通时不给模型验证传代理:验证端点拿到代理就直接用(无直连回退),
+            // 本机代理对回环 mock/内网目标会返 502,反而把验证搞挂(真实回归事故)
+            let verifyProxy = probedNeedsProxy ? proxyURL : nil
             notes.append("测试: \(test.detail)")
             if let m = models, !m.isEmpty {
                 selectedModels = m
@@ -214,7 +244,7 @@ public final class Core {
                     var lastFail = ""
                     for m in pastedModels {
                         tried.append(m)
-                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: proxyURL)
+                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy)
                         if check.ok {
                             selectedModels = [m]
                             notes.append("模型验证通过: \(m)(贴入 \(tried.count) 个,逐一验证)")
@@ -230,20 +260,28 @@ public final class Core {
                     if picked.isEmpty {
                         throw ParseError.io("已取消选择模型")
                     }
-                    var tried: [String] = []
-                    var lastFail = ""
+                    pickedViaPicker = true
+                    // 端点无 /models 列表,模型名是用户手输的猜测值,逐一 chat 验证;
+                    // 全部验证通过的都保留(用户明确勾选/输入了 N 个就应得到 N 个),
+                    // 失败的只进提示,不再「第一个通过就 break」把其余的静默丢掉
+                    var verified: [String] = []
+                    var failures: [String] = []
                     for m in picked {
-                        tried.append(m)
-                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: proxyURL)
+                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy)
                         if check.ok {
-                            selectedModels = [m]
-                            notes.append("模型验证通过: \(m)(输入 \(tried.count) 个,逐一验证)")
-                            break
+                            verified.append(m)
+                        } else {
+                            failures.append("\(m) → \(check.detail)")
                         }
-                        lastFail = "\(m) → \(check.detail)"
                     }
-                    if selectedModels.isEmpty {
-                        throw ParseError.io("输入的 \(tried.count) 个模型均验证失败: \(tried.joined(separator: ", "))。最后失败: \(lastFail)")
+                    if verified.isEmpty {
+                        throw ParseError.io("输入的 \(picked.count) 个模型均验证失败: \(failures.joined(separator: "; "))")
+                    }
+                    selectedModels = verified
+                    if failures.isEmpty {
+                        notes.append("模型验证通过: \(verified.count) 个全部可用")
+                    } else {
+                        notes.append("模型验证: \(verified.count) 个通过,\(failures.count) 个失败已跳过(\(failures.prefix(2).joined(separator: "; "))\(failures.count > 2 ? " 等" : ""))")
                     }
                 }
             } else if !test.workingModels.isEmpty, !test.quotaModels.isEmpty,
@@ -254,6 +292,7 @@ public final class Core {
                 // 旧逻辑 ≤5 自动全导,用户没法选
                 let picked = picker(test.models)
                 if picked.isEmpty { throw ParseError.io("已取消选择模型") }
+                pickedViaPicker = true
                 selectedModels = picked
                 notes.append("部分模型限流(\(test.quotaModels.count) 个),已按你的选择导入 \(picked.count) 个")
             } else if !test.workingModels.isEmpty, !test.quotaModels.isEmpty {
@@ -269,6 +308,7 @@ public final class Core {
                 if picked.isEmpty {
                     throw ParseError.io("已取消选择模型")
                 }
+                pickedViaPicker = true
                 selectedModels = picked
             } else if let pm = parsed.model, !pm.isEmpty {
                 selectedModels = [pm]
@@ -281,11 +321,16 @@ public final class Core {
             selectedModels = [pm]
         }
         selectedModels = selectedModels.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        // 用户手动输入的模型名放宽校验;自动探测的仍走 looksLikeModel
-        if models == nil {
+        // looksLikeModel 只为「粘贴文本解析出的模型候选」去噪。picker 结果是用户从
+        // /models JSON(data[].id)的真实模型 ID 里明确勾选(或手输)的,再过滤只会误伤:
+        // step-3.7-flash / stepaudio-2.5-tts / step-3.5-flash 这类「非白名单家族+点分」
+        // 新命名会被当域名整批杀掉,7 选 5 只剩无点的 step-image-edit-2(真实事故:
+        // stepfun step_plan 网关)。刷新路径 refreshModels 早已「保留用户勾选/手输,
+        // 不因启发式误杀」,此处对齐同一原则
+        if models == nil, !pickedViaPicker {
             let strict = selectedModels.filter { Parser.looksLikeModel($0) }
-            if !strict.isEmpty || pickModels == nil {
-                selectedModels = strict.isEmpty ? selectedModels : strict
+            if !strict.isEmpty {
+                selectedModels = strict
             }
         }
         parsed.model = selectedModels.first
@@ -300,6 +345,17 @@ public final class Core {
         let resolvedAppType = routedAppType == "grok" && !useGrok ? "opencode" : routedAppType
         if resolvedAppType != appType {
             notes.append("按所选模型导入到 \(resolvedAppType)")
+        }
+
+        // 需代理网关导入 codex 的操作指引:Codex 的 config.toml 无 API 代理字段
+        // (官方 config-reference,features.network_proxy 仅作用于沙箱命令),
+        // 仅两条路 —— cc-switch 接管代理,或启动环境变量
+        func proxyHintLine() -> String {
+            let px = proxyURL?.isEmpty == false ? proxyURL! : (prefs.proxy.isEmpty ? "http://127.0.0.1:7890" : prefs.proxy)
+            if CCSwitchWriter.ccSwitchRunning() {
+                return "  ℹ 该网关需代理:Codex 配置不支持代理字段。可在 cc-switch「代理」面板开启 Codex 接管(出站走其已配置的全局上游代理),该 provider 即可直连被墙网关"
+            }
+            return "  ℹ 该网关需代理:Codex 配置不支持代理字段。启动 codex 前 export HTTPS_PROXY=\(px) HTTP_PROXY=\(px),或在 cc-switch「代理」面板开启 Codex 接管"
         }
 
         let useCC = ccOverride ?? prefs.useCC
@@ -381,6 +437,9 @@ public final class Core {
                     anyOK = true
                     let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
                     lines.append("✓ cc-switch: 已更新已有 provider「\(dup.name ?? "")」到 \(appLabel)(幂等)")
+                    if resolvedAppType == "codex", probedNeedsProxy {
+                        lines.append(proxyHintLine())
+                    }
                 } else {
                     let r = try cc.add(parsed, appType: resolvedAppType, models: selectedModels, proxy: proxyURL)
                     entry.targets.append(appTag)
@@ -390,6 +449,9 @@ public final class Core {
                     anyOK = true
                     let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
                     lines.append("✓ cc-switch: 已添加 provider「\(r.providerName)」到 \(appLabel) 并激活")
+                    if resolvedAppType == "codex", probedNeedsProxy {
+                        lines.append(proxyHintLine())
+                    }
                     if r.renamedFrom != nil {
                         lines.append("  热激活: 原 provider 已暂存,删除本条时自动还原")
                     }
@@ -484,13 +546,16 @@ public final class Core {
             if let cfg = prefs.resolvedCPAConfig() {
                 prefs.cpaConfigPath = cfg
                 do {
-                    let msg = try CPAWriter(configPath: cfg).add(parsed, proxy: proxyURL)
+                    // 单 key 与多 key 同路写 openai-compatibility 聚合段:
+                    // collectCuratedModels(cpa-sync)只读聚合条目,平铺段条目对它隐形
+                    let msg = try CPAWriter(configPath: cfg)
+                        .addAggregated(baseURL: url, key: key, models: selectedModels, proxy: proxyURL)
                     if !entry.targets.contains("cpa") { entry.targets.append("cpa") }
                     entry.cpaConfigPath = cfg
                     anyOK = true
                     lines.append("✓ CPA: \(msg)")
-                    // 单 key 走平铺段,其精选模型就是本次 selectedModels(用户为该网关挑的几个);
-                    // 空则传 nil 回退收集其它 cpa 条目精选,绝不拉 CPA 聚合全量
+                    // 常驻模型来源 = 条目最终 models(已有精选时即精选列表);
+                    // 空传 nil 回退收集其它 cpa 条目的精选,绝不拉 CPA 聚合全量
                     lines.append(contentsOf: syncCPAResidentEntries(models: selectedModels.isEmpty ? nil : selectedModels))
                 } catch {
                     lines.append("✗ CPA 失败: \(error.localizedDescription)")
@@ -700,7 +765,76 @@ public final class Core {
 
     private func proxyForHealth() -> String? {
         let p = prefs.proxy
-        return p.isEmpty ? nil : p
+        if !p.isEmpty { return p }
+        // 设置未填时自动探测本机代理(用户确认:本机代理常开)。测试环境隔离开关。
+        // APITester.test 永远直连优先,传入探测结果在直连可用时零开销
+        guard ProcessInfo.processInfo.environment["KEYDROP_NO_AUTOPROXY"] != "1" else { return nil }
+        return Core.detectLocalProxy()
+    }
+
+    // MARK: - 本机代理自动探测
+
+    /// 自动探测的候选端口(测试可注入)。覆盖常见本地代理混合端口
+    public static var autoProxyCandidates = [
+        "http://127.0.0.1:7890",    // mihomo-party / Clash Verge 混合端口
+        "http://127.0.0.1:7891",    // Clash socks/http
+        "http://127.0.0.1:1087",    // 老版 Clash http
+        "http://127.0.0.1:6152",    // Surge
+        "http://127.0.0.1:10808",   // v2rayN http
+        "http://127.0.0.1:8118",    // Privoxy
+    ]
+    private static var cachedAutoProxy: String? = nil
+    private static var lastProbeAt: TimeInterval = 0
+    private static let probeLock = NSLock()
+
+    /// 设置未填代理时的兼底:按候选端口 TCP 探测本机在监听的代理。
+    /// 进程内缓存,15 分钟重探一次;结果在代理真正连通后由 noteProxyWorked 写入设置
+    public static func detectLocalProxy(force: Bool = false) -> String? {
+        probeLock.lock(); defer { probeLock.unlock() }
+        let now = Date().timeIntervalSince1970
+        if !force, lastProbeAt != 0, now - lastProbeAt < 900 { return cachedAutoProxy }
+        lastProbeAt = now
+        cachedAutoProxy = autoProxyCandidates.first { tcpReachable($0) }
+        return cachedAutoProxy
+    }
+
+    /// 测试辅助:清空探测缓存
+    public static func resetProxyProbeForTest() {
+        probeLock.lock(); cachedAutoProxy = nil; lastProbeAt = 0; probeLock.unlock()
+    }
+
+    private static func tcpReachable(_ proxy: String) -> Bool {
+        guard let url = URL(string: proxy), let host = url.host, let port = url.port else { return false }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        guard inet_pton(AF_INET, host, &addr.sin_addr) == 1 else { return false }
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        let r = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if r == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+        var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        guard poll(&pfd, 1, 300) > 0 else { return false }
+        var err: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len)
+        return err == 0
+    }
+
+    /// 代理真正连通后(直连失败 + 经代理成功)把探测到的代理写入设置,
+    /// 让它在设置里可见、可改;用户手填的永远优先,不动
+    public func noteProxyWorked(needsProxy: Bool, used: String?) {
+        guard needsProxy, prefs.proxy.isEmpty, let used, !used.isEmpty else { return }
+        prefs.proxy = used
+        AppLog.info("自动代理: 直连失败、经 \(used) 连通,已写入设置(可在设置中修改/清除)")
     }
 
     /// history.update 的统一入口:落盘失败(磁盘满/权限)必须留痕,
@@ -737,18 +871,96 @@ public final class Core {
             group.enter()
             queue.async {
                 defer { sem.signal(); group.leave() }
-                let test = APITester.test(url: e.url!, key: e.key!, timeout: 10, proxy: self.proxyForHealth())
+                let px = self.proxyForHealth()
+                let test = APITester.test(url: e.url!, key: e.key!, timeout: 10,
+                                          proxy: px, preferredModel: e.model,
+                                          modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t })
+                self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 let (h, d) = Self.healthFor(test)
                 var updated = e
-                updated.health = h
-                updated.healthDetail = d
+                // 失败防抖:单次失败(网络抖动/瞬时 5xx)保留 ok 判定,只记 streak;
+                // 连续 ≥2 次失败才真正降级。成功即清零。真实反馈:显示可用但用不了,
+                // 反向问题同样存在 —— 一次抖动就把可用 key 踢进异常区造成误杀
+                let streak = (e.failStreak ?? 0) + (test.ok ? 0 : 1)
+                updated.failStreak = test.ok ? 0 : streak
+                if test.ok || streak >= 2 || (e.health != "ok" && e.health != nil) {
+                    updated.health = h
+                    updated.healthDetail = d
+                } else {
+                    updated.health = "ok"   // 防抖:首败保留可用,详情说明实情
+                    updated.healthDetail = "⚠ 探测失败 1 次(保留可用,连续 2 次将降级): \(d.prefix(70))"
+                }
                 updated.healthAt = now
+                updated.latencyMs = test.ok ? test.latencyMs : e.latencyMs
+                // 模型级监控:已探测的模型(通过/限流)各自记账 —— provider 导入多个模型,
+                // 每个模型都应有独立轨迹(用户确认的粒度)。degraded 模型 detail 里只有
+                // 一个名字,也标失败
+                var modelPoints: [String: ProbePoint] = [:]
+                if test.ok {
+                    let lat = test.modelLatencies ?? [:]
+                    for m in test.workingModels {
+                        modelPoints[m] = ProbePoint(t: now, ms: lat[m], ok: true)
+                    }
+                    for m in test.quotaModels {
+                        modelPoints[m] = ProbePoint(t: now, ms: lat[m], ok: false)
+                    }
+                } else if updated.health != "ok" {
+                    // key 级失败且防抖后仍判失败(死 key / 网关持续 5xx / 网络不通):
+                    // 本轮所有模型都不可用,全部记红格 —— 否则 key 挂掉期间模型条整体
+                    // 冻结成灰,看起来像「还没轮到测」,掩盖了死亡时间轴(真实反馈)。
+                    // 首败防抖轮(updated.health == "ok")不记,避免一次抖动把模型条
+                    // 染红而 key 级却绿着,两套信号互相矛盾
+                    for m in e.models ?? (e.model.map { [$0] } ?? []) {
+                        modelPoints[m] = ProbePoint(t: now, ms: nil, ok: false)
+                    }
+                }
+                // 增量语义:每个模型包一层单点数组,mergeHealth 负责追加进完整轨迹并截 30
+                // (与 probeLog 的 merge 模式一致,避免快照覆盖监控历史)
+                if modelPoints.isEmpty {
+                    updated.modelProbeLog = nil
+                } else {
+                    updated.modelProbeLog = modelPoints.mapValues { [$0] }
+                }
+                // CPA 链路监控:用户真实请求走 CPA(8317 轮询上游池),健康测试却直连上游
+                // —— 上游 OK ≠ CPA 链路 OK(容器网络/路由/代理都可能断)。对带 cpa 目标的
+                // 条目,用实际激活模型经 CPA 探测一次;失败在详情标注,不直接降级
+                // (链路问题多为配置性,直连可用说明 key 本身没死)
+                // 修复:生图/嵌入等 non-chat 模型跳过 CPA chat 探测 —— CPA 会以
+                // "model only supported on /v1/images/generations" 拒绝,曾把
+                // gpt-image-2 条目误标为链路异常(真实事故)。跳过 = 视为未测,
+                // 不显示 CPA 徽章,不误报
+                if e.targets.contains("cpa"), test.ok, updated.health == "ok",
+                   let cpa = CPAWriter.endpointInfo(), let m = e.model ?? e.models?.first, !m.isEmpty,
+                   !Core.isNonChatModel(m) {
+                    let cpaBase = cpa.baseURL.hasSuffix("/v1") ? cpa.baseURL : cpa.baseURL + "/v1"
+                    let via = APITester.testModelChat(base: cpaBase, key: cpa.clientKey, model: m, timeout: 15)
+                    updated.viaCPAOk = via.ok
+                    updated.viaCPAAt = now
+                    // CPA 结果注到该模型本轮增量点上(数组末位);无点则建一个纯链路点
+                    if var mp = updated.modelProbeLog {
+                        if var arr = mp[m], !arr.isEmpty {
+                            arr[arr.count - 1].cpa = via.ok
+                            mp[m] = arr
+                        } else {
+                            mp[m] = [ProbePoint(t: now, ms: nil, ok: via.ok, cpa: via.ok)]
+                        }
+                        updated.modelProbeLog = mp
+                    } else {
+                        updated.modelProbeLog = [m: [ProbePoint(t: now, ms: nil, ok: via.ok, cpa: via.ok)]]
+                    }
+                    if !via.ok {
+                        updated.healthDetail = (updated.healthDetail ?? "") + " | ⚠ CPA 链路探测失败(\(via.detail.prefix(60)))"
+                    }
+                } else if !e.targets.contains("cpa") {
+                    updated.viaCPAOk = nil
+                    updated.viaCPAAt = nil
+                }
                 // 只收集不落盘;结束后 mergeHealth 一次性按字段合并保存(见 scanHealth 尾部)
                 // 每条各 save 一次会把整份历史反复序列化写盘(O(N²) IO 放大)
                 outLock.lock()
                 updatedEntries.append(updated)
-                if h != "ok" {
-                    out.append("\(e.id.prefix(8)) \(h == "dead" ? "key 失效" : "异常"): \(d.prefix(80))")
+                if updated.health != "ok" || (updated.viaCPAOk == false) {
+                    out.append("\(e.id.prefix(8)) \(updated.health == "dead" ? "key 失效" : "异常"): \((updated.healthDetail ?? "").prefix(80))")
                 }
                 outLock.unlock()
             }
@@ -797,7 +1009,9 @@ public final class Core {
             queue.async {
                 defer { sem.signal(); group.leave() }
                 guard let url = e.url, let key = e.key, !key.isEmpty else { return }
-                let test = APITester.test(url: url, key: key, timeout: 10, proxy: self.proxyForHealth())
+                let px = self.proxyForHealth()
+                let test = APITester.test(url: url, key: key, timeout: 10, proxy: px)
+                self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 var updated = e
                 if test.authFailed {
                     updated.targets.removeAll { $0.hasPrefix("ccswitch") }
@@ -822,6 +1036,17 @@ public final class Core {
                 // 测完立刻落盘:不攒到最后批量写。批量写会把竞态窗口拉长到整轮扫描的时长,
                 // 期间 CLI 删除的条目会被旧内存快照复活;立即写窗口只有毫秒级
                 self.historyUpdateLogged(updated)
+                // 探测点记账:对账发了真实请求,必须喂监控时间轴。曾因只更新 health
+                // 不写 probeLog,对账条目 healthAt 每轮刷新 → scanHealth 永远视为
+                // 「刚测过」而跳过 → mergeHealth 永不执行 → 监控图永久空白
+                // (真实事故 20d64797:可用区显示 ok,监控页零数据)
+                do {
+                    try self.history.appendProbePoint(
+                        id: e.id, ok: test.ok, ms: test.ok ? test.latencyMs : nil,
+                        cpa: nil, at: updated.healthAt ?? Date().timeIntervalSince1970)
+                } catch {
+                    AppLog.error("对账探测点写入失败: \(error.localizedDescription)")
+                }
             }
         }
         // 等全部对账完成,保持「返回时对账已生效」的既有语义(逐条已在并发任务内即时落盘)
@@ -866,7 +1091,9 @@ public final class Core {
         guard let url = entry.url, let key = entry.key, !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
-        let test = APITester.test(url: url, key: key, proxy: proxyForHealth())
+        let px = proxyForHealth()
+        let test = APITester.test(url: url, key: key, proxy: px)
+        noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
         if test.ok {
             if var found = history.find(idPrefix: entryIDPrefix) {
@@ -1027,15 +1254,17 @@ public final class Core {
 
     public func refreshModels(
         entryIDPrefix: String,
+        proxy: String? = nil,
         pickModels: (([String]) -> [String])? = nil
     ) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
+        let effProxy = proxy ?? proxyForHealth()
         guard let url = entry.url, let key = entry.key, !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
-        let test = APITester.test(url: url, key: key, proxy: proxyForHealth())
+        let test = APITester.test(url: url, key: key, proxy: effProxy)
         guard test.ok else {
             let h = Self.healthFor(test)
             // 只改 health 不动 status:status="dead" 会让条目从 UI 全部列表消失,
@@ -1049,18 +1278,49 @@ public final class Core {
                 ? "(key 已失效,已移入待删除区)" : ""
             throw ParseError.io("✗ 不可用: \(test.detail)\(deadMark)")
         }
-        // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表
+        // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表。
+        // 余额接口只在「本轮没有任何 chat 实测通过」时才有发言权:很多中转站的余额
+        // 接口与实际可用性脱节(订阅制/分组计费/虚报),chat 实测通过才是硬证据。
+        // 真实反馈(dc403556):chat 全绿却被余额接口判进无额度区,周期扫描又把它
+        // 捞回可用区 —— 两条路径来回横跳
         var quotaNote: String? = nil
+        var balanceZero = false
         if test.quotaExhausted {
             quotaNote = "无额度(chat 端点 429/402 quota exhausted)"
-        } else if APITester.checkBalance(url: url, key: key, proxy: proxyForHealth()) == .zero {
-            quotaNote = "无余额/配额耗尽(余额接口)"
+        } else {
+            balanceZero = APITester.checkBalance(url: url, key: key, proxy: effProxy) == .zero
+            if test.workingModels.isEmpty, balanceZero {
+                quotaNote = "无余额/配额耗尽(余额接口)"
+            }
         }
         entry.health = quotaNote != nil ? "quota" : "ok"
-        entry.healthDetail = quotaNote ?? test.detail
+        if quotaNote == nil, balanceZero {
+            // 余额接口报 0 但 chat 实测可用:保留可用判定,详情里留痕提醒用户
+            entry.healthDetail = test.detail + " ⚠ 余额接口报 0,但 chat 实测可用 — 以实测为准"
+        } else {
+            entry.healthDetail = quotaNote ?? test.detail
+        }
         entry.healthAt = Date().timeIntervalSince1970
+        // 手动重测同样进监控图(所有探测路径统一入档);probeLog 由 history.update
+        // 保留,不怕后续整条覆盖
+        do {
+            try history.appendProbePoint(id: entry.id, ok: entry.health == "ok",
+                                         ms: test.latencyMs, cpa: nil,
+                                         at: entry.healthAt ?? Date().timeIntervalSince1970)
+            var mps: [String: ProbePoint] = [:]
+            let lat = test.modelLatencies ?? [:]
+            for m in test.workingModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: true) }
+            for m in test.quotaModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: false) }
+            try history.appendModelProbePoints(id: entry.id, points: mps)
+        } catch {
+            AppLog.warn("探测点写入失败: \(error.localizedDescription)")
+        }
         let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
         let currentModels = Set(previousModels)
+        // test.models 是 /models JSON(data[].id)的真实模型 ID;testModels 仅给无
+        // picker 的 CLI 路径兖当去噪。弹窗选项必须用原始列表:step-3.7-flash /
+        // stepaudio-2.5-tts 这类「非白名单家族+点分」名会在此被当域名预杀,
+        // 用户在刷新弹窗里根本看不到它们(与 add() 的 picker 误杀同一根因)
         let testModels = test.models.filter { Parser.looksLikeModel($0) }
 
         // ccswitch 同步/迁移闭包:统一处理「家族不变 → 原地 sync」与「家族变化 → 迁移」。
@@ -1119,7 +1379,7 @@ public final class Core {
             if newAppType == oldAppType {
                 var p = ParsedKey()
                 p.url = url; p.key = key; p.model = models.first ?? entry.model
-                do { try cc.syncModelsAfterRefresh(p, providerID: oldPid, appType: oldAppType, models: models, proxy: proxyForHealth()) }
+                do { try cc.syncModelsAfterRefresh(p, providerID: oldPid, appType: oldAppType, models: models, proxy: effProxy) }
                 catch { return "⚠ cc-switch 同步失败: \(error.localizedDescription)" }
                 return nil
             }
@@ -1129,7 +1389,7 @@ public final class Core {
             p.url = url; p.key = key; p.model = models.first ?? entry.model
             _ = try? cc.remove(providerID: oldPid, renamedFrom: nil, renamedTo: nil, appType: oldAppType)
             do {
-                let r = try cc.add(p, nameOverride: entry.name, appType: newAppType, models: models, proxy: proxyForHealth())
+                let r = try cc.add(p, nameOverride: entry.name, appType: newAppType, models: models, proxy: effProxy)
                 entry.targets = entry.targets.filter { !$0.hasPrefix("ccswitch") } + [newTag]
                 entry.ccProviderID = r.providerID
                 entry.models = models
@@ -1141,7 +1401,7 @@ public final class Core {
                 // 把 entry 指回新建的回滚 provider 并提示 reimport。
                 var p2 = ParsedKey()
                 p2.url = url; p2.key = key; p2.model = models.first ?? entry.model
-                if let rb = try? cc.add(p2, nameOverride: entry.name, appType: oldAppType, models: models, proxy: proxyForHealth()) {
+                if let rb = try? cc.add(p2, nameOverride: entry.name, appType: oldAppType, models: models, proxy: effProxy) {
                     entry.ccProviderID = rb.providerID
                 }
                 return "⚠ 迁移失败已回滚: \(error.localizedDescription);建议重新导入该 key"
@@ -1181,7 +1441,7 @@ public final class Core {
             p.model = models.first
             do {
                 let r = try cc.add(p, nameOverride: entry.name,
-                                   appType: newAppType, models: models, proxy: proxyForHealth())
+                                   appType: newAppType, models: models, proxy: effProxy)
                 // 新 cc provider 已建;删旧 grok route 成功才摘 grok 牌。
                 // 删除失败(锁/IO)时旧 [model.*] 表仍在,若照旧 removeAll("grok")
                 // 会留下无人认领的 grok 段 —— 保留 grok 标签让 delete 继续负责清理
@@ -1224,7 +1484,9 @@ public final class Core {
             let m = migrateNote.map { "\n\($0)" } ?? ""
             return "✓ \(quotaNote != nil ? "端点可用但无额度" : "可用"): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)\(m)"
         }
-        let modelsChanged = currentModels != Set(testModels)
+        // 变化检测用原始列表:entry.models 修复后可能含被本启发式误杀的点分名,
+        // 拿过滤后的列表比对着会把「无变化」误判成「已变化」,每次刷新都弹窗
+        let modelsChanged = currentModels != Set(test.models)
 
         if !modelsChanged {
             historyUpdateLogged(entry)
@@ -1239,7 +1501,7 @@ public final class Core {
 
         var filtered: [String] = []
         if let picker = pickModels {
-            let sel = picker(testModels)
+            let sel = picker(test.models)
             if sel.isEmpty {
                 // 取消选择也是一次有效测试结果,落盘 health 再抛,避免结果丢失
                 historyUpdateLogged(entry)
@@ -1265,10 +1527,30 @@ public final class Core {
         if entry.targets.contains("dsh") {
             _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: filtered)
         }
+        // CPA 聚合条目同步:filtered 是用户在弹窗里重新确认的模型列表,与
+        // cc-switch/grok/dsh 同一账本口径。缺失此步时刷新只更新 cc 系目标,
+        // CPA 条目永远停在首次导入的列表(真实场景:cc 已 4 模型,CPA 仍 1 个)
+        var cpaNote = ""
+        if entry.targets.contains("cpa") {
+            let cfgPath = entry.cpaConfigPath
+                .flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+                ?? prefs.resolvedCPAConfig()
+            if let cfg = cfgPath {
+                do {
+                    let cpaMsg = try CPAWriter(configPath: cfg).updateAggregatedModels(baseURL: url, models: filtered)
+                    entry.cpaConfigPath = cfg
+                    cpaNote = "\n✓ CPA: \(cpaMsg)"
+                    let resident = syncCPAResidentEntries(models: filtered)
+                    if !resident.isEmpty { cpaNote += "\n" + resident.joined(separator: "\n") }
+                } catch {
+                    cpaNote = "\n⚠ CPA 同步失败: \(error.localizedDescription)"
+                }
+            }
+        }
         try history.update(entry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
-        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)"
+        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(cpaNote)"
     }
 
     /// 编辑条目:改模型列表/名称,重新验证模型并同步所有目标(cc-switch/dsh)

@@ -95,7 +95,7 @@ enum MCPImageServer {
                 }
                 guard let channel = ImageChannelStore.load() else {
                     result = nil
-                    errResp = ["code": -32001, "message": "未配置生图渠道,请先运行 keydrop image-add <key> <url>"]
+                    errResp = ["code": -32001, "message": "未配置生图渠道,请先运行 keydrop image-add <key> <url>(有 CPA 时会自动聚合)"]
                     break
                 }
                 let model = (args["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? channel.model

@@ -21,6 +21,7 @@ final class MockHTTPServer {
         case chatOK      // /models → 200 空列表;POST chat → 200(网关无模型列表但 chat 可用)
         case claudeModels // /models → 200,纯 claude 系(测 codex→claude 反向迁移)
         case nonChatModels // /models → 200,图生在前 + chat 家族在后(测激活模型不落图生)
+        case dottedModels // /models → 200,7 个 stepfun 式模型(5 个含点、会被 looksLikeModel 域名规则误杀)
         case selectiveAuth // Authorization 含 invalid 的 key 返回 401,其余正常
         case selectiveModelQuota // /models 返回 4 模型(1 个 *-free + 3 限流);chat 仅 free 模型 200,其余 429 quota
     }
@@ -184,6 +185,16 @@ final class MockHTTPServer {
             body = "{\"data\":[{\"id\":\"claude-sonnet-4-5\",\"object\":\"model\"},{\"id\":\"claude-opus-4-1\",\"object\":\"model\"}]}"
         } else if mode == .nonChatModels {
             body = "{\"data\":[{\"id\":\"dall-e-3\",\"object\":\"model\"},{\"id\":\"deepseek-v4-flash-0731\",\"object\":\"model\"}]}"
+        } else if mode == .dottedModels {
+            if target.hasSuffix("/models") {
+                // 复刻 stepfun step_plan 真实返回:非白名单家族(step-*)+点分命名的
+                // 新版模型名,旧的 looksLikeModel 过滤会把 5 个点分名当域名误杀
+                let ids = ["step-3.7-flash", "stepaudio-2.5-tts", "stepaudio-2.5-asr",
+                           "step-image-edit-2", "step-3.5-flash-2603", "step-3.5-flash", "step-5-preview"]
+                body = "{\"data\":[" + ids.map { "{\"id\":\"\($0)\",\"object\":\"model\"}" }.joined(separator: ",") + "]}"
+            } else if target.contains("/chat/completions") {
+                body = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+            }
         }
         let status: String
         if mode == .selectiveModelQuota, target.contains("/chat/completions"), !requestedModel.contains("free") {
@@ -198,7 +209,7 @@ final class MockHTTPServer {
             status = "401 Unauthorized"
         } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
             status = "424 Failed Dependency"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .selectiveAuth || mode == .selectiveModelQuota || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"
@@ -317,6 +328,37 @@ final class SocketClient {
 
 enum APITesterTests {
     static func run(_ h: Harness) {
+        h.runSuite("APITester.探测轮换") { t in
+            // 轮换语义:激活模型置顶,从未测过 > 最久未测,每轮仍只 4 个
+            let models = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"]
+            let now: TimeInterval = 1_000_000
+            // 首轮(无历史):等价于原逻辑,不轮换
+            let r0 = APITester.chatProbeOrder(models, preferred: "m3")
+            t.equal(r0.count, 4, "[首轮] 仍只测 4 个")
+            t.equal(r0.first, "m3", "[首轮] 激活模型置顶")
+
+            // 三轮后:m1-m6 已有记录(时间递增),m7/m8 从未测过
+            let times: [String: TimeInterval] = [
+                "m1": now - 300, "m2": now - 200, "m3": now - 100,
+                "m4": now - 500, "m5": now - 400, "m6": now - 250,
+            ]
+            let r1 = APITester.chatProbeOrder(models, preferred: "m3", modelProbeTimes: times)
+            t.equal(r1.count, 4, "[轮换] 仍只测 4 个")
+            t.equal(r1.first, "m3", "[轮换] 激活模型始终置顶")
+            t.equal(Set(r1.suffix(3)), ["m7", "m8", "m4"], "[轮换] 从未测过优先,已测的最久未测优先(m4 最老)")
+
+            // 全部测过一轮后:纯按最久未测轮换
+            let times2 = Dictionary(uniqueKeysWithValues: models.map { ($0, now - 100) })
+            let r2 = APITester.chatProbeOrder(models, preferred: "m3", modelProbeTimes: times2)
+            t.equal(r2.first, "m3", "[全测过] 激活模型置顶")
+            t.expect(!r2.suffix(3).contains("m3"), "[全测过] 激活模型不重复占槽")
+
+            // 模型数 ≤4:不进入轮换分支,全量探测(原有行为)
+            let small = ["a", "b", "c", "d"]
+            let r3 = APITester.chatProbeOrder(small, preferred: "c", modelProbeTimes: ["a": now])
+            t.equal(Set(r3), Set(small), "[≤4] 全量探测")
+        }
+
         h.runSuite("APITester") { t in
             guard let server = try? MockHTTPServer() else {
                 t.expect(false, "mock server 启动失败")

@@ -515,18 +515,46 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         try writeJSON(["OPENAI_API_KEY": p.key ?? ""], to: authPath)
     }
 
-    private func restoreCodexConfig() throws {
-        let cfgPath = Self.codexConfigPath
-        let bakPath = cfgPath + ".bak"
-        if FileManager.default.fileExists(atPath: bakPath) {
-            _ = try? FileManager.default.removeItem(atPath: cfgPath)
-            try FileManager.default.moveItem(atPath: bakPath, toPath: cfgPath)
+    /// 删除 current provider 后,把 live 恢复为回退目标 fb 自己的 DB 配置。
+    /// 真实事故(2026-09):旧实现 restoreCodexConfig() 把 config.toml.bak move 回 live ——
+    /// .bak 是「上次写 live 前」的滚动全局快照,可能冻结着早已删除网关(hiyo)的配置;
+    /// cc-switch 运行中 watch live 又把这份陈旧内容回写进它内存 current 的 DB 行,
+    /// 先后污染了 de5.net 行(9-14)与 seekai.cc 行(9-17~9-18)。
+    /// 正确语义:live = 回退目标自己的配置;cc-switch 运行中则完全不碰 live
+    /// (由 cc-switch 按 DB current 自行切换,同 restoreLiveEnv 守卫)。
+    private func restoreLiveFromProvider(_ providerID: String, db: DB) {
+        guard !Self.ccSwitchRunning() else { return }
+        guard let cfgStr = try? db.scalar(
+            "SELECT settings_config FROM providers WHERE id = ? AND app_type = 'codex'",
+            [providerID]
+        ) ?? nil,
+            let data = cfgStr.data(using: .utf8),
+            let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            Logger.warn("codex live 恢复跳过: 回退目标 \(providerID.prefix(8)) settings_config 不可解析")
+            return
         }
-        let authPath = Self.codexAuthPath
-        let authBak = authPath + ".bak"
-        if FileManager.default.fileExists(atPath: authBak) {
-            _ = try? FileManager.default.removeItem(atPath: authPath)
-            try FileManager.default.moveItem(atPath: authBak, toPath: authPath)
+        let (url, key) = Self.extractResidentURLKey(cfg)
+        guard let u = url, let k = key, !u.isEmpty, !k.isEmpty else {
+            Logger.warn("codex live 恢复跳过: 回退目标 \(providerID.prefix(8)) 缺 URL/key")
+            return
+        }
+        var p = ParsedKey()
+        p.url = u
+        p.key = k
+        // model 从 config TOML 提取;非 gpt 系模型 codexConfigToml 会丢弃(交由 codex 默认),无害
+        var models: [String] = []
+        if let cfgToml = cfg["config"] as? String,
+           let re = try? NSRegularExpression(pattern: #"^model\s*=\s*"([^"]*)""#, options: [.anchorsMatchLines]),
+           let m = re.firstMatch(in: cfgToml, range: NSRange(cfgToml.startIndex..., in: cfgToml)),
+           m.numberOfRanges > 1,
+           let rng = Range(m.range(at: 1), in: cfgToml) {
+            models = [String(cfgToml[rng])]
+        }
+        do {
+            try mergeCodexConfig(p, models: models)
+        } catch {
+            Logger.warn("codex live 恢复失败: \(error.localizedDescription)")
         }
     }
 
@@ -800,7 +828,10 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                         try db.exec("COMMIT")
                         do { try updateSwitchSettings(nil, for: appType) } catch { warn(error) }
                         do { try clearOpencodeProvider(id: providerID) } catch { warn(error) }
-                        if appType == "codex" { try? restoreCodexConfig() }
+                        // 修复(真实事故 2026-09,hiyo 覆盖 seekai/de5 行):不再用 .bak 复活陈旧
+                        // live。删除唯一的 provider 后 live 指向已删网关属预期状态,由用户自行
+                        // 切换;cc-switch 运行中更不可碰 live(其回写会写进已悬空的 current 行)
+                        warnings.append("已无其他 \(appType) provider,live 配置保留原样(可能指向已删除的网关)")
                         return joinDeleteMsg("已删除,并清除当前设置", warnings)
                     }
                     try db.run("UPDATE providers SET is_current = 0 WHERE app_type = ?", [appType])
@@ -808,12 +839,14 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                     try db.exec("COMMIT")
                     do { try updateSwitchSettings(fb, for: appType) } catch { warn(error) }
                     do { try clearOpencodeProvider(id: providerID) } catch { warn(error) }
-                    if appType == "codex" { try? restoreCodexConfig() }
+                    restoreLiveFromProvider(fb, db: db)
                     return joinDeleteMsg("已删除,回退到最近 provider(\(fb.prefix(8))…)", warnings)
                 }
                 try db.exec("COMMIT")
                 do { try clearOpencodeProvider(id: providerID) } catch { warn(error) }
-                if appType == "codex" { try? restoreCodexConfig() }
+                // 修复(真实事故 2026-09):非 current 删除时 current 未变,live 不得被
+                // restoreCodexConfig() 的 .bak(滚动陈旧快照)覆盖 —— 那会把早已删除
+                // 网关的配置写回 live,再被运行中的 cc-switch 回写进 current 行
                 return joinDeleteMsg("已删除", warnings)
             }
 

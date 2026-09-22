@@ -26,6 +26,7 @@ HistoryTests.run(harness)
 CoreTests.run(harness)
 RegressionTests.run(harness)
 ImportPipelineTests.run(harness)
+ProxyPoolTests.run(harness)
 
 print("────────────────────────────")
 if harness.failures.isEmpty {

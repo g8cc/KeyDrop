@@ -1,5 +1,18 @@
 import Foundation
 
+/// 单次探测结果点(监控图数据源)。每条目滚动保留最近 30 个点
+public struct ProbePoint: Codable, Equatable {
+    public var t: TimeInterval
+    public var ms: Double?
+    public var ok: Bool
+    /// CPA 链路探测结果(nil=该轮未测/无 cpa 目标)
+    public var cpa: Bool?
+
+    public init(t: TimeInterval, ms: Double?, ok: Bool, cpa: Bool? = nil) {
+        self.t = t; self.ms = ms; self.ok = ok; self.cpa = cpa
+    }
+}
+
 public struct HistoryEntry: Codable {
     private enum CodingKeys: String, CodingKey {
         case id, ts, raw, format, name, url, model, models, key, keyMasked, targets
@@ -7,6 +20,9 @@ public struct HistoryEntry: Codable {
         case health, healthDetail, healthAt
         case ccMissing
         case clashFile
+        case latencyMs, failStreak, viaCPAOk, viaCPAAt
+        case probeLog
+        case modelProbeLog
     }
 
     public var id: String
@@ -36,6 +52,40 @@ public struct HistoryEntry: Codable {
     /// Clash 订阅生成的 yaml 文件名(仅 basename,存于 profiles 目录);
     /// 没有它 delete 无法清理生成的订阅文件
     public var clashFile: String?
+    /// 最近一次 chat 探测的端到端延迟(毫秒)。实战监控:慢网关也显示"可用",
+    /// 但延迟让用户对"用的时候行不行"有预期(真实反馈:显示可用,用起来 30s 无响应)
+    public var latencyMs: Double?
+    /// 连续探测失败次数(成功即清零)。防抖:单次网络抖动不降级状态,
+    /// 连续 ≥2 次才把 health 从 ok 改为 err/dead
+    public var failStreak: Int?
+    /// CPA 链路最近一次探测结果(经 127.0.0.1:8317 用实际激活模型)。nil=未测/无 cpa 目标。
+    /// 健康测试直连上游,但用户真实请求走 CPA —— 上游 OK ≠ CPA 链路 OK
+    public var viaCPAOk: Bool?
+    /// CPA 链路探测时间
+    public var viaCPAAt: TimeInterval?
+    /// 探测历史(监控图数据源),滚动保留最近 30 个点
+    public var probeLog: [ProbePoint]?
+    /// 模型级探测历史(模型级监控):模型名 → 各自的 30 点轨迹。
+    /// key 级 probeLog 回答"这把 key 整体好不好",这里回答"每个模型分别好不好"
+    public var modelProbeLog: [String: [ProbePoint]]?
+
+    /// uptime 百分比(status page 行业指标):已采集周期中通过的占比。
+    /// 只按已采集格算(灰格不拉低),nil=尚无采集数据
+    public var uptimePercent: Int? {
+        guard let log = probeLog, !log.isEmpty else { return nil }
+        let ok = log.filter { $0.ok }.count
+        return Int((Double(ok) / Double(log.count) * 100).rounded())
+    }
+
+    /// 模型级 uptime:模型名 → 百分比(只含有采集数据的模型)
+    public var modelUptimes: [String: Int] {
+        var out: [String: Int] = [:]
+        for (m, log) in modelProbeLog ?? [:] where !log.isEmpty {
+            let ok = log.filter { $0.ok }.count
+            out[m] = Int((Double(ok) / Double(log.count) * 100).rounded())
+        }
+        return out
+    }
 
     public var healthColor: (ok: Bool, dead: Bool) {
         switch health {
@@ -68,7 +118,13 @@ public struct HistoryEntry: Codable {
         healthDetail: String? = nil,
         healthAt: TimeInterval? = nil,
         ccMissing: Bool? = nil,
-        clashFile: String? = nil
+        clashFile: String? = nil,
+        latencyMs: Double? = nil,
+        failStreak: Int? = nil,
+        viaCPAOk: Bool? = nil,
+        viaCPAAt: TimeInterval? = nil,
+        probeLog: [ProbePoint]? = nil,
+        modelProbeLog: [String: [ProbePoint]]? = nil
     ) {
         self.id = id
         self.ts = ts
@@ -93,6 +149,12 @@ public struct HistoryEntry: Codable {
         self.healthAt = healthAt
         self.ccMissing = ccMissing
         self.clashFile = clashFile
+        self.latencyMs = latencyMs
+        self.failStreak = failStreak
+        self.viaCPAOk = viaCPAOk
+        self.viaCPAAt = viaCPAAt
+        self.probeLog = probeLog
+        self.modelProbeLog = modelProbeLog
     }
 
     public init(from decoder: Decoder) throws {
@@ -120,6 +182,12 @@ public struct HistoryEntry: Codable {
         healthAt = try c.decodeIfPresent(TimeInterval.self, forKey: .healthAt)
         ccMissing = try c.decodeIfPresent(Bool.self, forKey: .ccMissing)
         clashFile = try c.decodeIfPresent(String.self, forKey: .clashFile)
+        latencyMs = try c.decodeIfPresent(Double.self, forKey: .latencyMs)
+        failStreak = try c.decodeIfPresent(Int.self, forKey: .failStreak)
+        viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)
+        viaCPAAt = try c.decodeIfPresent(TimeInterval.self, forKey: .viaCPAAt)
+        probeLog = try c.decodeIfPresent([ProbePoint].self, forKey: .probeLog)
+        modelProbeLog = try c.decodeIfPresent([String: [ProbePoint]].self, forKey: .modelProbeLog)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -147,6 +215,12 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(healthAt, forKey: .healthAt)
         try c.encodeIfPresent(ccMissing, forKey: .ccMissing)
         try c.encodeIfPresent(clashFile, forKey: .clashFile)
+        try c.encodeIfPresent(latencyMs, forKey: .latencyMs)
+        try c.encodeIfPresent(failStreak, forKey: .failStreak)
+        try c.encodeIfPresent(viaCPAOk, forKey: .viaCPAOk)
+        try c.encodeIfPresent(viaCPAAt, forKey: .viaCPAAt)
+        try c.encodeIfPresent(probeLog, forKey: .probeLog)
+        try c.encodeIfPresent(modelProbeLog, forKey: .modelProbeLog)
     }
 
     private static let timeFormatter: DateFormatter = {
@@ -355,7 +429,12 @@ public final class HistoryStore {
         lock.lock()
         defer { lock.unlock() }
         guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
-        _items[i] = e
+        var merged = e
+        // probeLog 是监控账本,归 store 所有:调用方的 entry 快照可能早于最新探测点
+        // (refreshModels 先 appendProbePoint 再 update 整条),整条覆盖会回滚监控历史
+        merged.probeLog = _items[i].probeLog
+        merged.modelProbeLog = _items[i].modelProbeLog
+        _items[i] = merged
         try saveLocked(dirtyIDs: [e.id])
     }
 
@@ -370,8 +449,56 @@ public final class HistoryStore {
             _items[i].health = e.health
             _items[i].healthDetail = e.healthDetail
             _items[i].healthAt = at
+            // 实战监控字段随健康扫描一并合并(延迟/防抖/CPA 链路)
+            _items[i].latencyMs = e.latencyMs
+            _items[i].failStreak = e.failStreak
+            _items[i].viaCPAOk = e.viaCPAOk
+            _items[i].viaCPAAt = e.viaCPAAt
+            // 探测历史滚动追加(监控图数据源)
+            let pt = ProbePoint(t: at, ms: e.latencyMs,
+                                ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
+            var log = (_items[i].probeLog ?? []) + [pt]
+            if log.count > 30 { log = Array(log.suffix(30)) }
+            _items[i].probeLog = log
+            // 模型级追加:e.modelProbeLog 携带本轮各模型新点,与 store 现状合并截 30
+            if let newPoints = e.modelProbeLog, !newPoints.isEmpty {
+                var merged = _items[i].modelProbeLog ?? [:]
+                for (m, pts) in newPoints {
+                    var arr = (merged[m] ?? []) + pts
+                    if arr.count > 30 { arr = Array(arr.suffix(30)) }
+                    merged[m] = arr
+                }
+                _items[i].modelProbeLog = merged
+            }
         }
         try saveLocked(dirtyIDs: Set(entries.map { $0.id }))
+    }
+
+    /// 手动重测(refreshModels)路径追加单个探测点(监控图数据源)
+    public func appendProbePoint(id: String, ok: Bool, ms: Double?, cpa: Bool?, at: TimeInterval) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+        var log = (_items[i].probeLog ?? []) + [ProbePoint(t: at, ms: ms, ok: ok, cpa: cpa)]
+        if log.count > 30 { log = Array(log.suffix(30)) }
+        _items[i].probeLog = log
+        try saveLocked(dirtyIDs: [id])
+    }
+
+    /// 模型级探测点追加(手动重测/扫描共用)
+    public func appendModelProbePoints(id: String, points: [String: ProbePoint]) throws {
+        guard !points.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+        var merged = _items[i].modelProbeLog ?? [:]
+        for (m, pt) in points {
+            var arr = (merged[m] ?? []) + [pt]
+            if arr.count > 30 { arr = Array(arr.suffix(30)) }
+            merged[m] = arr
+        }
+        _items[i].modelProbeLog = merged
+        try saveLocked(dirtyIDs: [id])
     }
 
     /// 批量更新后只落盘一次。健康扫描等高频小更新的场景用这个,
@@ -565,6 +692,26 @@ public final class Prefs {
             } else {
                 try FileManager.default.moveItem(at: tmp, to: fileURL)
             }
+        }
+    }
+}
+
+// MARK: - 分区辅助:用户配置的模型是否全军覆没
+
+public extension HistoryEntry {
+    /// 条目自己配置的模型是否「全部限流/失败」:每个配置模型的最新探测点都存在且全红。
+    ///
+    /// key 级 health=ok 只说明网关上「某个」模型能通 —— 哪怕通的不是用户配置的。
+    /// 真实反馈(ed0d76a6):条目只配了 glm-5.3-flash,它连续 6 轮 429,但网关上
+    /// 未配置的 nemotron 能通 → key 级判 ok → 条目躺在可用区,对用户却是纯坏消息。
+    /// 分区/横幅必须以「用户配置的模型」为准;未采集的模型不算数(轮换中,不误伤)
+    var allConfiguredModelsLimited: Bool {
+        let configured = models ?? (model.map { [$0] } ?? [])
+        guard !configured.isEmpty else { return false }
+        let log = modelProbeLog ?? [:]
+        return configured.allSatisfy { m in
+            guard let last = log[m]?.last else { return false }
+            return !last.ok
         }
     }
 }

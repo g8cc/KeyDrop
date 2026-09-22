@@ -240,7 +240,10 @@ enum CoreTests {
             let okEntry = core.history.snapshot().first { $0.key == "sk-test-bal1111111111" }
             t.equal(okEntry?.health, "ok", "有余额 health=ok")
 
-            // 无余额:刷新后 health=quota
+            // 无余额:余额接口报 0 但 chat 实测有模型通过 → 以实测为准判 ok。
+            // 真实事故(dc403556):中转站余额接口与实际可用性脱节,chat 全绿却被
+            // 旧逻辑判 quota 进无额度区,周期扫描又捞回来 —— 两路径来回横跳。
+            // 旧断言(余额 0 → quota)正是在这次事故中被推翻的旧行为
             guard let srvZero = try? MockHTTPServer(mode: .balanceZero) else {
                 t.expect(false, "mock 启动失败")
                 return
@@ -250,12 +253,11 @@ enum CoreTests {
             let zeroEntry0 = core.history.snapshot().first { $0.key == "sk-test-bal2222222222" }
             t.expect(zeroEntry0 != nil, "条目已入库2")
             let zeroMsg = try! core.refreshModels(entryIDPrefix: zeroEntry0!.id)
-            t.contains(zeroMsg, "无余额", "无余额刷新标 quota: \(zeroMsg)")
-            t.contains(zeroMsg, "充值后", "提示可恢复: \(zeroMsg)")
             let zeroEntry = core.history.snapshot().first { $0.key == "sk-test-bal2222222222" }
-            t.equal(zeroEntry?.health, "quota", "无余额 health=quota")
-            t.equal(zeroEntry?.healthColor.ok, false, "quota 非可用色")
-            t.equal(zeroEntry?.healthColor.dead, false, "quota 非失效色")
+            t.equal(zeroEntry?.health, "ok", "余额接口报 0 但 chat 实测可用 → 仍判可用")
+            t.contains(zeroEntry?.healthDetail ?? "", "以实测为准", "详情留痕余额脱节: \(zeroEntry?.healthDetail ?? "")")
+            t.equal(zeroEntry?.healthColor.ok, true, "可用色")
+            t.equal(zeroEntry?.healthColor.dead, false, "非失效色")
 
             // 网关无余额接口:保持 ok
             guard let srvNone = try? MockHTTPServer(mode: .balanceNoInfo) else {

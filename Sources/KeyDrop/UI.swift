@@ -1,5 +1,6 @@
 import KeyDropCore
 import AppKit
+import Charts
 import SwiftUI
 import UserNotifications
 
@@ -32,6 +33,24 @@ final class AppState: ObservableObject {
     @Published var highlightID: String?
     @Published var highlightPulse = 0
     @Published var helpShown = false
+    /// 监控图 sheet 当前展示的条目 ID(nil=关闭)
+    @Published var monitorEntryID: String? = nil
+
+    /// status banner 计数:只统计可用区(health=ok/proxy-ok 的 active 条目)。
+    /// 额度区(quota)与待删除区(dead/err)不进横幅 —— 用户只关注当前可用网关的
+    /// 健康度,死 key/无额度是已知状态,各自分区里可见即可(统计口径由用户确认)。
+    /// 配置模型全红的条目已挬入无额度区,同样不算可用(口径与分区一致)
+    func statusCounts() -> (ok: Int, warn: Int, dead: Int) {
+        var ok = 0, warn = 0
+        for e in core.history.snapshot()
+        where e.status == "active" && e.healthAt != nil
+              && (e.health == "ok" || e.health == "proxy-ok")
+              && !e.allConfiguredModelsLimited {
+            if e.viaCPAOk == false { warn += 1 } else { ok += 1 }
+        }
+        return (ok, warn, 0)
+    }
+    /// 监控总览 sheet
     @Published var editShown = false
     @Published var editTarget: HistoryEntry?
     @Published var editModelsText = ""
@@ -511,19 +530,34 @@ final class AppState: ObservableObject {
     // 若不互斥,多份扫描并发执行会互相覆盖 status、反复刷新整表
     private var lastHealthScanAt: Date?
     private var healthScanRunning = false
+    /// 上次提醒过的未绑定账号数:数量不变就不重复记日志,变了(新增/绑完)才再提醒
+    static var lastLoggedUnboundCount: Int = -1
     func scanHealth() {
         if let last = lastHealthScanAt, Date().timeIntervalSince(last) < 600 { return }
         guard !healthScanRunning else { return }
         healthScanRunning = true
         lastHealthScanAt = Date()
         Task.detached(priority: .userInitiated) { [weak self] in
+            // OAuth 账号代理绑定提醒:只数数 + 落日志,绝不自动改 auth 文件
+            // (批量写另一个应用的凭证必须显式触发;粘性设计保证手动重跑永远安全)。
+            // 放在 UI 层巡检而非 Core.scanHealth:测试套件跑得到 Core,碰不到 AppState,
+            // 免得测试环境经 docker inspect 触到开发者真实 auth-dir
+            if let dir = ProxyPool.defaultAuthDir() {
+                let unbound = ProxyPool.unboundAccounts(authDir: dir).count
+                if unbound > 0 && unbound != Self.lastLoggedUnboundCount {
+                    Self.lastLoggedUnboundCount = unbound
+                    AppLog.info("CPA: \(unbound) 个 OAuth 账号未绑定独立代理,运行 KeyDrop proxy-pool 一键粘性绑定(默认读 ~/.keydrop/proxy-pool.txt)")
+                }
+            }
             Core.shared.scanHealth { msgs in
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.healthScanRunning = false
                     self.historyVersion += 1
                     if !msgs.isEmpty {
-                        self.setStatus("健康扫描: \(msgs.joined(separator: "; "))", ok: false)
+                        // 扫描消息不再弹 statusText 横幅(用户确认:每 10 分钟弹一次纯打扰,
+                        // 条目级变化由圆点/分区/监控总览承载)—— 落日志即可
+                        AppLog.info("健康扫描: " + msgs.joined(separator: "; "))
                     }
                 }
             }
@@ -607,8 +641,17 @@ final class AppState: ObservableObject {
     }
 
     func setProxy(_ v: String) {
+        // 输入过程只更新显示文本;持久化的是规范化值,保证半截输入不落盘
         proxyText = v
-        prefs.proxy = v.trimmingCharacters(in: .whitespacesAndNewlines)
+        prefs.proxy = Core.normalizeProxyInput(v)
+        try? prefs.save()
+    }
+
+    /// 提交(回车/失焦)时把显示也规范化成完整 URL,所见即所存
+    func commitProxy() {
+        let normalized = Core.normalizeProxyInput(proxyText)
+        proxyText = normalized
+        prefs.proxy = normalized
         try? prefs.save()
     }
 
@@ -635,6 +678,73 @@ final class AppState: ObservableObject {
 // MARK: - History row
 
 struct HistoryRow: View {
+    /// 单模型监控格条:该模型的采集轨迹;未采集显示浅灰待采格
+    @ViewBuilder
+    private func modelSparkline(_ m: String) -> some View {
+        let log = entry.modelProbeLog?[m] ?? []
+        if log.isEmpty {
+            HStack(spacing: 2) {
+                ForEach(0..<12, id: \.self) { _ in
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(Color.secondary.opacity(0.10))
+                        .frame(width: 6, height: 10)
+                }
+            }
+            .help("该模型尚未被探测(每轮只测 4 个:激活模型置顶,其余按「从未测过→最久未测」轮换,几轮内全覆盖);灰=无证据,≠不可用")
+        } else {
+            let okc = log.filter { $0.ok }.count
+            let up = Int((Double(okc) / Double(log.count) * 100).rounded())
+            MonitorSparkline(log: log, slots: 14, height: 14)
+                .help("绿=通过<3s · 黄=通过3-8s · 紫=通过≥8s(慢) · 红=失败;悬停单格看当次详情")
+            Text("\(up)%")
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(up >= 95
+                    ? Color(red: 0.22, green: 0.58, blue: 0.40)
+                    : (up >= 80 ? Color.orange : Color.red))
+                .frame(width: 34, alignment: .trailing)
+                .help("该模型 uptime:探测中通过的占比(只数通过,不管快慢 —— 全黄/全紫也是 100%)")
+        }
+    }
+
+    /// 实战监控徽章:探测延迟 / CPA 链路状态 / 最近验证时间。
+    /// 拆成独立方法:内联在主行时表达式过复杂,SwiftUI 类型检查超时
+    @ViewBuilder
+    private func monitorBadges(_ entry: HistoryEntry) -> some View {
+        if let ms = entry.latencyMs, entry.health == "ok" || entry.health == "proxy-ok" {
+            Text("·")
+            Text(String(format: "%.1fs", ms / 1000))
+                .foregroundStyle(ms > 8000
+                    ? Color(red: 0.85, green: 0.55, blue: 0.15)
+                    : Color.secondary.opacity(0.9))
+                .help("最近一次探测延迟。越低体感越快;超过 8s 标黄提醒")
+        }
+        if let ok = entry.viaCPAOk, entry.targets.contains("cpa") {
+            Text("·")
+            Text(ok ? "CPA ✓" : "CPA ⚠")
+                .foregroundStyle(ok
+                    ? Color(red: 0.22, green: 0.58, blue: 0.40)
+                    : Color(red: 0.85, green: 0.55, blue: 0.15))
+                .help(ok
+                    ? "CPA 链路探测通过(经 127.0.0.1:8317,实际请求走的路径)"
+                    : "上游可用但经 CPA 调不通:检查 CPA 配置/容器/模型路由(↻ 重测可复验)")
+        }
+        if let at = entry.healthAt {
+            Text("·")
+            Text(Self.healthAgeStr(at))
+                .help("最近一次健康验证时间;扫描周期 30 分钟(仅测超期条目)")
+        }
+    }
+
+    /// 健康验证距今的人类可读时长(监控:让"可用"带着新鲜度)
+    static func healthAgeStr(_ at: TimeInterval) -> String {
+        let mins = Int((Date().timeIntervalSince1970 - at) / 60)
+        if mins < 1 { return "刚刚验证" }
+        if mins < 60 { return "\(mins) 分钟前验证" }
+        let hrs = mins / 60
+        if hrs < 24 { return "\(hrs) 小时前验证" }
+        return "\(hrs / 24) 天前验证"
+    }
+
     let entry: HistoryEntry
     let refreshing: Bool
     let busy: Bool
@@ -646,6 +756,7 @@ struct HistoryRow: View {
     let onCopyCurl: () -> Void
     let onReimport: () -> Void
     let onEdit: () -> Void
+    var onShowMonitor: (() -> Void)? = nil
     let highlighted: Bool
     @State private var showDeleteConfirm = false
     @State private var hovered = false
@@ -715,6 +826,17 @@ struct HistoryRow: View {
                     .padding(.top, 4)
                     .help(dotTip)
 
+                // key 活着但用户配置的模型全被限流 → 已挬入无额度区,行内标注区别于真死 key
+                if entry.allConfiguredModelsLimited,
+                   entry.health == "ok" || entry.health == "proxy-ok" {
+                    Text("所选模型均限流 · key 本身可用")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.15))
+                        .padding(.horizontal, 5).padding(.vertical, 1.5)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Color(red: 0.85, green: 0.55, blue: 0.15).opacity(0.13)))
+                        .help("网关上其它模型能通所以 key 级判 ok,但你配置的模型最新探测全部失败;换选其它模型或等限流恢复")
+                }
+
                 VStack(alignment: .leading, spacing: 3) {
                     Text(entry.summary)
                         .font(.system(size: 12.5, weight: .semibold))
@@ -726,40 +848,43 @@ struct HistoryRow: View {
                         Text(entry.format)
                         Text("·")
                         Text(entry.keyMasked)
+                        monitorBadges(entry)
                     }
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
 
                     if let displayModels, !displayModels.isEmpty {
-                        LazyVGrid(
-                            columns: [
-                                GridItem(.flexible(), alignment: .leading),
-                                GridItem(.flexible(), alignment: .leading)
-                            ],
-                            spacing: 3
-                        ) {
-                            ForEach(Array(displayModels.enumerated()), id: \.offset) { _, m in
-                                Button {
-                                    onCopy(m)
-                                } label: {
-                                    HStack(spacing: 3) {
-                                        Image(systemName: "doc.on.doc")
-                                            .font(.system(size: 10))
-                                            .foregroundStyle(.secondary)
-                                        Text(CCSwitchWriter.copyModelName(for: entry, model: m))
-                                            .font(.system(size: 11, design: .monospaced))
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
+                        // 每个模型一行:模型名(点击复制)+ 右侧该模型的监控格条
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(displayModels, id: \.self) { m in
+                                HStack(spacing: 8) {
+                                    Button {
+                                        onCopy(m)
+                                    } label: {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "doc.on.doc")
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(.secondary)
+                                            Text(CCSwitchWriter.copyModelName(for: entry, model: m))
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                        }
                                     }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .buttonStyle(.borderless)
+                                    .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
+                                    .help("点击复制，去 \(appLaunch?.cmd ?? "AI 客户端") /model 粘贴即可唯一定位")
+                                    Spacer(minLength: 4)
+                                    modelSparkline(m)
                                 }
-                                .buttonStyle(.borderless)
-                                .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
-                                .help("点击复制，去 \(appLaunch?.cmd ?? "AI 客户端") /model 粘贴即可唯一定位")
                             }
                         }
                         .padding(.top, 1)
                     }
+                    // key 级格条不再上行:当前死活由圆点+分区表达,时间轴历史(何时死/挂几次/
+                    // 延迟趋势)在「监控」弹窗的趋势图与事件记录里完整保留。监控系统本身
+                    // (scanHealth)不受影响 —— 它是把 key 分进无额度/待删除区的机制,
+                    // 也是充值后自动复活的检测器
                 }
 
                 Spacer(minLength: 4)
@@ -767,6 +892,17 @@ struct HistoryRow: View {
                 if entry.status == "active" {
                     HStack(spacing: 10) {
                         if testable {
+                            Button {
+                                onShowMonitor?()
+                            } label: {
+                                Image(systemName: "chart.xyaxis.line")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(Color(red: 0.35, green: 0.40, blue: 0.48))
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(busy)
+                            .help("查看监控图表(延迟趋势/探测历史)")
+
                             Button {
                                 onCopyCurl()
                             } label: {
@@ -986,7 +1122,9 @@ struct ModelPickerView: View {
                     .keyboardShortcut(.return, modifiers: [])
                 } else {
                     Button(selected.isEmpty ? "请勾选模型" : "导入 \(selected.count) 个") {
-                        state.confirmModelPicker(Array(selected))
+                        // Set 无序:按 allOptions(探测优先级)顺序传出,
+                        // 保证 entry.model=第一个勾选是确定的,不随哈希顺序漂移
+                        state.confirmModelPicker(allOptions.filter { selected.contains($0) })
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(selected.isEmpty)
@@ -1105,6 +1243,7 @@ struct HelpView: View {
                     section("代理", icon: "network") {
                         item("顶栏「代理」框填本地代理,如 http://127.0.0.1:7890")
                         item("写入时同步到 Claude Code 环境变量与 CPA 条目级 proxy-url;留空则清除旧代理")
+                        item("Codex 特殊:其配置不支持代理字段。被墙网关导入 codex 后,请在 cc-switch「代理」面板开启 Codex 接管,或启动 codex 前 export HTTPS_PROXY")
                     }
                     section("健康探测与清理", icon: "heart") {
                         item("每小时自动探测全部 key:超时标「异常」,401/403 标「失效」")
@@ -1208,7 +1347,6 @@ struct EditView: View {
 
 struct PanelView: View {
     @ObservedObject var state: AppState
-    @State private var showHistory = true
     @State private var showStatusDetail = false
     @State private var showDeadArea = false
     @State private var showQuotaArea = false
@@ -1216,6 +1354,7 @@ struct PanelView: View {
     @State private var toastText: String?
     @State private var dropTargeted = false
     @FocusState private var inputFocused: Bool
+    @FocusState private var proxyFieldFocused: Bool
 
     private func showToast(_ s: String) {
         withAnimation(.easeOut(duration: 0.15)) { toastText = s }
@@ -1300,7 +1439,8 @@ struct PanelView: View {
     private var historyItems: [HistoryEntry] {
         _ = state.historyVersion
         return state.core.history.snapshot()
-            .filter { $0.status == "active" && $0.health != "dead" && $0.health != "err" && $0.health != "quota" }
+            .filter { $0.status == "active" && $0.health != "dead" && $0.health != "err" && $0.health != "quota"
+                     && !$0.allConfiguredModelsLimited }   // 配置的模型全红(key 还活着)→ 无额度区
             .filter(matches)
             .sorted { $0.ts > $1.ts }
             .prefix(60)
@@ -1310,7 +1450,7 @@ struct PanelView: View {
     private var quotaItems: [HistoryEntry] {
         _ = state.historyVersion
         return state.core.history.snapshot()
-            .filter { $0.status == "active" && $0.health == "quota" }
+            .filter { $0.status == "active" && ($0.health == "quota" || $0.allConfiguredModelsLimited) }
             .filter(matches)
             .sorted { $0.ts > $1.ts }
             .prefix(60)
@@ -1335,16 +1475,12 @@ struct PanelView: View {
                 inputBlock
                 actionRow
                 statusArea
-                if showHistory {
-                    historyBlock
-                } else {
-                    Spacer(minLength: 0)
-                }
+                historyBlock
             }
             .padding(14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 580, height: 520)
+        .frame(width: 600, height: 520)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             DispatchQueue.main.async { inputFocused = true }
@@ -1353,9 +1489,6 @@ struct PanelView: View {
         }
         .onChange(of: state.statusText) { _, newValue in
             if newValue.isEmpty { showStatusDetail = false }
-        }
-        .onChange(of: state.highlightID) { _, newValue in
-            if newValue != nil { showHistory = true }
         }
         .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
             handleDrop(providers)
@@ -1372,6 +1505,15 @@ struct PanelView: View {
         }
         .sheet(isPresented: $state.helpShown) {
             HelpView(state: state)
+        }
+        .sheet(isPresented: Binding(
+            get: { state.monitorEntryID != nil },
+            set: { if !$0 { state.monitorEntryID = nil } }
+        )) {
+            if let id = state.monitorEntryID,
+               let entry = state.core.history.find(idPrefix: id) {
+                MonitorView(entry: entry)
+            }
         }
         .sheet(isPresented: $state.editShown) {
             EditView(state: state)
@@ -1394,62 +1536,66 @@ struct PanelView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 6) {
+        // 两行结构:第一行「身份 + 轻工具」,第二行「写入目标 + 网络」。
+        // 旧版单行塞 8 个控件,高度参差、主次不分(真实反馈:顶部太挤)。
+        // 版本号做成胶囊徽章:用户明确要求版本号常驻可见(比 tagline 有信息量)
+        VStack(spacing: 7) {
+            HStack(spacing: 8) {
                 Text("KeyDrop")
                     .font(.system(size: 15, weight: .bold, design: .rounded))
-                Text("贴 key 即用 · v\(Version.currentVersion())")
-                    .font(.system(size: 10))
+                    .lineLimit(1)
+                    .fixedSize()
+                Text("v\(Version.currentVersion())")
+                    .font(.system(size: 9.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(.secondary)
-            }
-            Spacer()
-            targetChip("cc-switch", on: state.useCC, color: Color(red: 0.22, green: 0.58, blue: 0.40)) {
-                state.toggleUseCC()
-            }
-            targetChip("Grok", on: state.useGrok, color: Color(red: 0.35, green: 0.45, blue: 0.85)) {
-                state.toggleUseGrok()
-            }
-            targetChip("CPA", on: state.useCPA, color: Color(red: 0.28, green: 0.48, blue: 0.82)) {
-                state.toggleUseCPA()
-            }
-            targetChip("DSH", on: state.useDSH, color: Color(red: 0.85, green: 0.55, blue: 0.15)) {
-                state.toggleUseDSH()
-            }
-            TextField("代理 (可选)", text: Binding(
-                get: { state.proxyText },
-                set: { state.setProxy($0) }
-            ))
-            .textFieldStyle(.roundedBorder)
-            .font(.system(size: 10, design: .monospaced))
-            .frame(width: 130)
-            .help("本地代理,如 http://127.0.0.1:7890;测试与写入时使用,Claude Code/CPA 同步生效")
-            Toggle(isOn: $showHistory) {
-                HStack(spacing: 3) {
-                    Image(systemName: "clock")
-                        .font(.system(size: 10))
-                    Text("历史")
-                        .font(.system(size: 10, weight: .semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(Capsule().fill(Color.secondary.opacity(0.13)))
+                Spacer()
+                Button {
+                    state.helpShown = true
+                } label: {
+                    Text("?")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 20, height: 20)
+                        .background(Circle().fill(Color.primary.opacity(0.08)))
+                        .foregroundStyle(.secondary)
                 }
+                .buttonStyle(.borderless)
+                .help("使用说明")
             }
-            .toggleStyle(.button)
-            .buttonStyle(.borderless)
-            .help(showHistory ? "隐藏历史列表" : "显示历史列表")
-            .foregroundStyle(showHistory ? Color.primary : Color.secondary)
-            .padding(.horizontal, 4)
-            Button {
-                state.helpShown = true
-            } label: {
-                Text("?")
-                    .font(.system(size: 13, weight: .bold))
-                    .frame(width: 18, height: 18)
-                    .background(Circle().fill(Color.primary.opacity(0.08)))
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                targetChip("cc-switch", on: state.useCC, color: Color(red: 0.22, green: 0.58, blue: 0.40)) {
+                    state.toggleUseCC()
+                }
+                targetChip("Grok", on: state.useGrok, color: Color(red: 0.35, green: 0.45, blue: 0.85)) {
+                    state.toggleUseGrok()
+                }
+                targetChip("CPA", on: state.useCPA, color: Color(red: 0.28, green: 0.48, blue: 0.82)) {
+                    state.toggleUseCPA()
+                }
+                targetChip("DSH", on: state.useDSH, color: Color(red: 0.85, green: 0.55, blue: 0.15)) {
+                    state.toggleUseDSH()
+                }
+                Spacer(minLength: 8)
+                TextField("代理", text: Binding(
+                    get: { state.proxyText },
+                    set: { state.setProxy($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 10, design: .monospaced))
+                .frame(width: 132)
+                .focused($proxyFieldFocused)
+                .onSubmit { state.commitProxy() }
+                .onChange(of: proxyFieldFocused) { _, focused in
+                    if !focused { state.commitProxy() }
+                }
+                .help("本地代理,如 http://127.0.0.1:7890;留空则自动探测本机代理(直连失败时补测,连通后自动填入此框)")
             }
-            .buttonStyle(.borderless)
-            .help("使用说明")
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
     }
 
     private func targetChip(_ title: String, on: Bool, color: Color, action: @escaping () -> Void) -> some View {
@@ -1457,8 +1603,8 @@ struct PanelView: View {
             Text(title)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(on ? color : Color.secondary)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
                 .background(
                     RoundedRectangle(cornerRadius: 5)
                         .fill(on ? color.opacity(0.14) : Color.primary.opacity(0.05))
@@ -1536,16 +1682,8 @@ struct PanelView: View {
                 inputFocused = true
             }
             .disabled(state.isBusy)
-
-            Text("⌘↩ 添加 · ⌘V 粘贴")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-
+            .help("⌘V 粘贴;⌘↩ 添加并激活")
             Spacer()
-
-            Text("↻ 测试 · 终端图标复制 curl")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -1564,6 +1702,16 @@ struct PanelView: View {
 
     private var historyBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
+            let sc = state.statusCounts()
+            // 横幅只保留「零可用」一种(灰色,真正需要行动的状态)。CPA 链路异常
+            // 横幅已移除(用户确认:无用信息纯打扰;签名制收起也挡不住异常集合
+            // 每轮变动导致的重复弹出)—— 行内 CPA 徽章 + 监控总览 + 单条目监控图承载
+            if sc.ok + sc.warn == 0 {
+                OverallStatusBanner(okCount: sc.ok, warnCount: sc.warn, deadCount: sc.dead, compact: true)
+            }
+            // 颜色图例常显在主界面(用户确认:不能只靠悬停)—— 模型格条是双维编码
+            // (通过与否 × 延迟快慢),不标注的话「全黄/全紫也 100%」看起来像算错
+            StatusLegend(showUptimeNote: false)
             Divider().opacity(0.3)
             let items = historyItems
             let deads = deadItems
@@ -1673,6 +1821,7 @@ struct PanelView: View {
                                     },
                                     onReimport: { state.doReimport(e.id) },
                                     onEdit: { state.showEdit(e) },
+                                    onShowMonitor: { state.monitorEntryID = e.id },
                                     highlighted: state.highlightID == e.id && state.highlightPulse > 0
                                 )
                             }
@@ -1737,6 +1886,7 @@ struct PanelView: View {
                                             },
                                             onReimport: { state.doReimport(e.id) },
                                             onEdit: { state.showEdit(e) },
+                                            onShowMonitor: { state.monitorEntryID = e.id },
                                             highlighted: false
                                         )
                                     }
@@ -1823,6 +1973,7 @@ struct PanelView: View {
                                             },
                                             onReimport: { state.doReimport(e.id) },
                                             onEdit: { state.showEdit(e) },
+                                            onShowMonitor: { state.monitorEntryID = e.id },
                                             highlighted: false
                                         )
                                     }
@@ -1903,4 +2054,371 @@ struct PanelView: View {
     }
 }
 
-// MARK: - (end)
+// MARK: - (end)\n
+/// 底部状态格条(uptime status page 行业形态):固定 30 个格子,
+/// 一格 = 一个采集周期,**统一高度**,颜色编码可用程度:
+/// 绿=通过且快(<3s) 橙=通过偏慢(3-8s) 红=失败 浅灰=该周期未采集。
+/// 新数据点从右侧填入,左侧灰格随采集积累逐渐被填满 —— 一屏扫过所有 provider。
+/// 悬停单格显示该次探测的时间/延迟/结果
+struct MonitorSparkline: View {
+    let log: [ProbePoint]
+    var slots: Int = 30
+    var height: CGFloat = 20
+    /// 最新格脉冲动画(status page 惯例:当前采集周期呼吸闪烁)—— 总览大图用
+    var pulseLatest = false
+    @State private var pulsing = false
+
+    var body: some View {
+        let points = Array(log.suffix(slots))
+        let pad = slots - points.count   // 左侧未采集的灰格(时间轴:最新在右)
+        return HStack(spacing: 3) {
+            ForEach(0..<max(pad, 0), id: \.self) { _ in
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.secondary.opacity(0.13))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: height)
+                    .help("该周期未采集(随自动扫描/↻ 重测逐渐填满)")
+            }
+            ForEach(Array(points.enumerated()), id: \.offset) { i, p in
+                let isLatest = i == points.count - 1
+                StatusCell(point: p, uptime: uptimePercent, height: height,
+                           pulse: pulseLatest && isLatest, pulsing: $pulsing)
+            }
+        }
+    }
+
+    private var uptimePercent: Int? {
+        guard !log.isEmpty else { return nil }
+        let ok = log.filter { $0.ok }.count
+        return Int((Double(ok) / Double(log.count) * 100).rounded())
+    }
+
+}
+
+/// 单个状态格:颜色编码 + 最新格脉冲(当前采集周期呼吸闪烁,status page 惯例)
+struct StatusCell: View {
+    let point: ProbePoint
+    let uptime: Int?
+    let height: CGFloat
+    let pulse: Bool
+    @Binding var pulsing: Bool
+
+    var body: some View {
+        let base = RoundedRectangle(cornerRadius: 2)
+            .fill(Self.cellColor(point))
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+        Group {
+            if pulse {
+                base.overlay(
+                    RoundedRectangle(cornerRadius: 2)
+                        .strokeBorder(Self.cellColor(point).opacity(pulsing ? 0.9 : 0.15),
+                                      lineWidth: 1.5)
+                )
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
+                        pulsing = true
+                    }
+                }
+            } else {
+                base
+            }
+        }
+        .help(Self.hoverText(point, uptime: uptime))
+    }
+
+    // 状态色唯一事实源,图例(StatusLegend)从这里引用,避免两处改不同步
+    static let okFast    = Color(red: 0.30, green: 0.66, blue: 0.42)   // 绿:通过且 <3s
+    static let okSlow    = Color(red: 0.88, green: 0.62, blue: 0.20)   // 橙:通过但 3-8s
+    // 紫:通过但 ≥8s。曾用与失败几乎相同的红(0.82,0.35,0.25),用户看到整条红
+    // 以为什么时候都挂了,实际 uptime 100% —— 两红无法区分,换成紫
+    static let okTooSlow = Color(red: 0.62, green: 0.46, blue: 0.85)
+    static let fail      = Color(red: 0.80, green: 0.28, blue: 0.24)   // 红:探测失败
+    static let pending   = Color.secondary.opacity(0.13)               // 灰:未采集
+
+    static func cellColor(_ p: ProbePoint) -> Color {
+        if !p.ok { return fail }
+        let ms = p.ms ?? 3000
+        if ms < 3000 { return okFast }
+        if ms < 8000 { return okSlow }
+        return okTooSlow
+    }
+
+    static func hoverText(_ p: ProbePoint, uptime: Int?) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        let time = f.string(from: Date(timeIntervalSince1970: p.t))
+        let up = uptime.map { " · uptime \($0)%" } ?? ""
+        if p.ok, let ms = p.ms {
+            let speed = ms < 3000 ? "" : (ms < 8000 ? "(慢)" : "(很慢)")
+            return "\(time) · 通过\(speed) · \(Int(ms)) ms\(up)"
+        }
+        return "\(time) · 探测失败\(up)"
+    }
+}
+
+/// 状态格颜色图例:格条是「通过与否 × 延迟快慢」双维编码,而 uptime 只数通过与否
+/// —— 不标注的话「全黄/全紫也 100%」看起来像算错(真实反馈)
+struct StatusLegend: View {
+    var showUptimeNote = true
+
+    var body: some View {
+        HStack(spacing: 10) {
+            cell(StatusCell.okFast, "通过 <3s")
+            cell(StatusCell.okSlow, "通过 3-8s")
+            cell(StatusCell.okTooSlow, "通过 ≥8s(慢)")
+            cell(StatusCell.fail, "失败")
+            cell(Color.secondary.opacity(0.13), "未采集")
+            if showUptimeNote {
+                Spacer(minLength: 0)
+                Text("% = 通过占比(uptime)")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func cell(_ c: Color, _ label: String) -> some View {
+        HStack(spacing: 3) {
+            RoundedRectangle(cornerRadius: 2).fill(c)
+                .frame(width: 9, height: 9)
+            Text(label)
+                .font(.system(size: 9.5))
+                .foregroundStyle(.secondary)
+        }
+        .help("格条颜色 = 通过与否 + 延迟快慢两维;uptime 只数通过与否,全黄/全紫也是 100%")
+    }
+}
+
+
+// MARK: - 监控图(sub2api channelmonitor 思路:探针历史 + 趋势展示)
+
+import Charts
+
+/// 单条目的延迟趋势图 + 探测明细。数据源 = probeLog(每条目滚动 30 点)
+struct MonitorView: View {
+    let entry: HistoryEntry
+    @Environment(\.dismiss) private var dismiss
+
+    private var okPoints: [(t: Date, ms: Double)] {
+        (entry.probeLog ?? []).compactMap { p in
+            p.ok && p.ms != nil ? (Date(timeIntervalSince1970: p.t), p.ms!) : nil
+        }
+    }
+    private var failCount: Int { (entry.probeLog ?? []).filter { !$0.ok }.count }
+    private var cpaLatest: Bool? { entry.viaCPAOk }
+
+    /// 事件聚合(status page Incidents):连续失败段聚成一个事件(起止+次数),倒序
+    private var incidents: [(start: Date, end: Date, count: Int)] {
+        var out: [(Date, Date, Int)] = []
+        var cur: (Date, Date, Int)? = nil
+        for p in entry.probeLog ?? [] {
+            if !p.ok {
+                let d = Date(timeIntervalSince1970: p.t)
+                if cur == nil { cur = (d, d, 1) } else { cur?.1 = d; cur?.2 += 1 }
+            } else if let c = cur {
+                out.append(c)
+                cur = nil
+            }
+        }
+        if let c = cur { out.append(c) }
+        return out.reversed()
+    }
+
+    private static func incidentTime(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm"
+        return f.string(from: d)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Text("监控").font(.system(size: 15, weight: .bold, design: .rounded))
+                Text(entry.summary)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button("关闭") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+
+            let log = entry.probeLog ?? []
+            if log.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "chart.xyaxis.line")
+                        .font(.system(size: 30)).foregroundStyle(.tertiary)
+                    Text("暂无探测记录 —— 数据自本版本起积累")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                    Text("点历史行的 ↻ 立即重测可产生第一个数据点;自动扫描每 30 分钟一轮(仅测超期条目)")
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                if okPoints.isEmpty {
+                    VStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange)
+                        Text("最近 \(log.count) 次探测全部失败").font(.system(size: 12, weight: .medium))
+                    }
+                    .frame(maxWidth: .infinity).padding(.vertical, 20)
+                } else {
+                    Chart {
+                        ForEach(okPoints, id: \.t) { p in
+                            LineMark(x: .value("时间", p.t), y: .value("延迟(秒)", p.ms / 1000))
+                                .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
+                                .interpolationMethod(.catmullRom)
+                            PointMark(x: .value("时间", p.t), y: .value("延迟(秒)", p.ms / 1000))
+                                .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
+                        }
+                    }
+                    .chartYAxisLabel("延迟(秒)")
+                    .frame(height: 190)
+                }
+
+                // 模型级监控:每个模型的独立状态格条 + uptime(用户确认的粒度:
+                // provider 导入多个模型,每个都应有独立轨迹)
+                StatusLegend()
+                    .padding(.top, -4)
+                if let mlog = entry.modelProbeLog, !mlog.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("按模型").font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(mlog.keys.sorted(), id: \.self) { m in
+                            HStack(spacing: 8) {
+                                Text(m)
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .lineLimit(1).truncationMode(.middle)
+                                    .frame(width: 150, alignment: .leading)
+                                MonitorSparkline(log: mlog[m] ?? [], slots: 20, height: 14)
+                                if !mlog[m]!.isEmpty {
+                                    let okc = mlog[m]!.filter { $0.ok }.count
+                                    let up = Int((Double(okc) / Double(mlog[m]!.count) * 100).rounded())
+                                    Text("\(up)%")
+                                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(up >= 95
+                                            ? Color(red: 0.22, green: 0.58, blue: 0.40)
+                                            : (up >= 80 ? Color.orange : Color.red))
+                                        .frame(width: 40, alignment: .trailing)
+                                }
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+                }
+
+                HStack(spacing: 16) {
+                    Label("\(log.count) 次探测", systemImage: "list.bullet")
+                    Text("成功 \(log.count - failCount)")
+                        .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
+                    Text("失败 \(failCount)")
+                        .foregroundStyle(failCount > 0 ? Color(red: 0.78, green: 0.28, blue: 0.24) : .secondary)
+                    if let cpa = cpaLatest, entry.targets.contains("cpa") {
+                        Text(cpa ? "CPA 链路 ✓" : "CPA 链路 ⚠")
+                            .foregroundStyle(cpa ? Color(red: 0.22, green: 0.58, blue: 0.40) : Color(red: 0.85, green: 0.55, blue: 0.15))
+                    }
+                    if let ms = entry.latencyMs {
+                        Text("最近延迟 \(String(format: "%.1f", ms / 1000))s")
+                    }
+                    Spacer()
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+                if !incidents.isEmpty {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("事件记录").font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        ForEach(Array(incidents.prefix(3).enumerated()), id: \.offset) { _, inc in
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.15))
+                                Text("\(Self.incidentTime(inc.start)) ~ \(Self.incidentTime(inc.end))")
+                                    .font(.system(size: 11, design: .monospaced))
+                                Text("连续 \(inc.count) 次失败")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.04)))
+                }
+                Divider().opacity(0.3)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(Array(log.reversed().prefix(12).enumerated()), id: \.offset) { _, p in
+                            HStack(spacing: 10) {
+                                Image(systemName: p.ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                    .foregroundStyle(p.ok ? Color(red: 0.22, green: 0.58, blue: 0.40) : Color(red: 0.78, green: 0.28, blue: 0.24))
+                                    .font(.system(size: 11))
+                                Text(Self.timeStr(p.t))
+                                    .font(.system(size: 11, design: .monospaced))
+                                if p.ok, let ms = p.ms {
+                                    Text("\(String(format: "%.0f", ms)) ms")
+                                        .font(.system(size: 11, design: .monospaced))
+                                } else {
+                                    Text("失败").font(.system(size: 11)).foregroundStyle(.secondary)
+                                }
+                                if let cpa = p.cpa {
+                                    Text(cpa ? "CPA ✓" : "CPA ⚠")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(cpa ? Color(red: 0.22, green: 0.58, blue: 0.40) : Color(red: 0.85, green: 0.55, blue: 0.15))
+                                }
+                                Spacer()
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 150)
+            }
+        }
+        .padding(18)
+        .frame(width: 640, height: 520)
+    }
+
+    static func timeStr(_ t: TimeInterval) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f.string(from: Date(timeIntervalSince1970: t))
+    }
+}
+
+
+// MARK: - 总体状态横幅(status page 标志性元素)
+
+/// "All Systems Operational" 式横幅:按 active 条目的 health 分布分级
+struct OverallStatusBanner: View {
+    let okCount: Int
+    let warnCount: Int
+    let deadCount: Int
+    var compact = false
+
+    var body: some View {
+        // 口径(用户确认):只反映可用区。额度区/待删除区不参与分级 ——
+        // 它们是已知状态,横幅只回答「我现在能用的网关好不好」
+        let (bg, icon, title): (Color, String, String) = {
+            if okCount + warnCount == 0 {
+                return (Color.secondary.opacity(0.75),
+                        "minus.circle.fill", "暂无可用网关(失效/无额度条目见下方分区)")
+            }
+            if warnCount > 0 {
+                return (Color(red: 0.85, green: 0.55, blue: 0.15),
+                        "exclamationmark.triangle.fill",
+                        "可用 \(okCount) 个 · \(warnCount) 个链路异常(上游正常但经 CPA 不通)")
+            }
+            return (Color(red: 0.18, green: 0.52, blue: 0.34),
+                    "checkmark.seal.fill", "全部网关可用 · \(okCount) 个在线")
+        }()
+        HStack(spacing: 8) {
+            Image(systemName: icon).font(.system(size: compact ? 13 : 15))
+            Text(title).font(.system(size: compact ? 12 : 13, weight: .semibold))
+            Spacer()
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12).padding(.vertical, compact ? 7 : 10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(bg))
+    }
+}
+

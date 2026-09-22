@@ -23,6 +23,15 @@
 - **刷新模型**:重新测试端点,更新模型列表并同步所有目标(cc-switch / dsh)
 - **编辑修复**:模型名 / 名称写错了可用 `edit` 命令修正,自动重新验证并同步
 - **删除还原**:删除条目时自动从各目标移除并还原被热激活覆盖的 provider
+- **生图渠道**:独立的 `image-add` 链路,把 OpenAI 兼容生图 key 注册成 **一个** MCP
+  工具(`generate_image`)供 claude code / codex / opencode 的 agent 调用
+  - 检测到 CPA(CLIProxyAPI)在跑时:key + 模型自动写入 CPA 独立生图条目
+    (`openai-compatibility` 下 `<host>-image`,模型打 `image: true`),渠道指向
+    CPA 常驻端点 —— 多家生图 key 都导进同一个 CPA,多 key 轮询、失效剔除、
+    热重载全由 CPA 接管;agent 调用时传 `model` 参数即可跨渠道路由,工具侧
+    永远只有一个 `keydrop-image` MCP。`--no-cpa` 可强制直连
+  - 生图模型走文本链路(`--add`)时只会被"封存"进模型列表,永远不当激活模型
+    (`preferredChatModel` 兜底),不污染编码工具
 
 ## 安装
 
@@ -70,6 +79,13 @@ KeyDrop delete <ID前缀>
 
 # 重新导入 cc-switch(provider 被删但 key 仍可用时)
 KeyDrop reimport <ID前缀>
+
+# 生图:导入生图 key(自动探测 /images/generations;有 CPA 则写 CPA 并指向其端点)
+KeyDrop image-add sk-xxxx https://api.example.com/v1 --model gpt-image-1
+
+# 生图:命令行直出(图片存 ~/.keydrop/images/,返回文件路径)
+KeyDrop image "一只赛博朋克猫" --size 1024x1024
+# 之后在 claude code / codex / opencode 对话里直接说「画一张…」即可
 ```
 
 ### 支持的粘贴格式

@@ -11,7 +11,7 @@ let args = Array(CommandLine.arguments.dropFirst())
 
 let cliCommands = ["add", "list", "scan", "cpa-sync", "delete", "rm", "parse", "status", "refresh",
                    "reimport", "edit", "self-heal", "picker-test", "help", "h",
-                   "image-add", "image", "mcp-image"]
+                   "image-add", "image", "mcp-image", "proxy-pool"]
 if let first = args.first {
     // 已知子命令/选项 → CLI;未知裸词命令必须报错退出而非静默启动菜单栏:
     // 曾因新子命令漏加白名单,`KeyDrop scan` 静默拉起第二个 app 实例,命令毫无反应

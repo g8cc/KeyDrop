@@ -1,18 +1,36 @@
 import Foundation
 
-/// 生图渠道存储:url/key/默认模型,供 CLI 生图与 MCP server 使用
+/// 生图渠道存储:url/key/默认模型,供 CLI 生图与 MCP server 使用。
+/// via: "direct" = 直连上游;"cpa" = 走 CPA 常驻端点(上游 key 已写进 CPA
+/// openai-compatibility 条目并打 image: true,多渠道按模型名由 CPA 路由)
 public struct ImageChannel: Codable {
     public var url: String
     public var key: String
     public var model: String
     public var keyMasked: String
+    /// 可选字段:旧渠道文件无 via,decodeIfPresent 兜底 "direct"
+    public var via: String
 
-    public init(url: String, key: String, model: String) {
+    public init(url: String, key: String, model: String, via: String = "direct") {
         self.url = url
         self.key = key
         self.model = model
+        self.via = via
         // 短 key 也不能明文返回:masked 字段可能进展示/日志,≤8 位时用星号替代
         self.keyMasked = key.count > 8 ? String(key.prefix(6)) + "…" + String(key.suffix(4)) : String(repeating: "*", count: max(key.count, 6))
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case url, key, model, keyMasked, via
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        url = try c.decode(String.self, forKey: .url)
+        key = try c.decode(String.self, forKey: .key)
+        model = try c.decode(String.self, forKey: .model)
+        keyMasked = try c.decodeIfPresent(String.self, forKey: .keyMasked) ?? ""
+        via = try c.decodeIfPresent(String.self, forKey: .via) ?? "direct"
     }
 }
 

@@ -17,7 +17,12 @@ public struct APITestResult {
     /// key 级判定不再被单个模型的 429 绑架:任一模型可用即 key 可用,
     /// 限流模型交给调用方排除/提示(真实事故:免费模型可用但首选模型 429,整 key 误入额度区)
     public let quotaModels: [String]
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = []) {
+    /// 首个可用模型的 chat 探测端到端延迟(毫秒)。实战监控用:慢网关也是"可用",
+    /// 延迟让用户对体感有预期
+    public let latencyMs: Double?
+    /// 每个已探测模型的独立延迟(模型级监控:new-api 渠道×模型粒度)
+    public let modelLatencies: [String: Double]?
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -28,6 +33,8 @@ public struct APITestResult {
         self.chatDegraded = chatDegraded
         self.workingModels = workingModels
         self.quotaModels = quotaModels
+        self.latencyMs = latencyMs
+        self.modelLatencies = modelLatencies
     }
 }
 
@@ -182,9 +189,11 @@ public enum APITester {
         return usage >= limit ? .zero : .ok
     }
 
-    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil) -> APITestResult {
+    /// - Parameter preferredModel: 用户实际激活的模型(new-api TestModel 思路),探测时优先验证它
+    /// - Parameter modelProbeTimes: 模型 → 上次被探测的时间戳(监控轮换用)。nil=不轮换
+    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil) -> APITestResult {
         // 先按真实环境(直连)测试;直连失败仅当配置了代理时才补测代理,并标记需代理
-        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil)
+        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes)
         if direct.ok || direct.authFailed {
             return direct
         }
@@ -192,7 +201,7 @@ public enum APITester {
         if p == nil || p!.isEmpty {
             return direct
         }
-        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p)
+        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes)
         if via.ok {
             return APITestResult(ok: true, style: via.style, models: via.models,
                                  detail: via.detail + " | 直连失败,需代理,经代理验证通过",
@@ -201,7 +210,7 @@ public enum APITester {
         return via
     }
 
-    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil) -> APITestResult {
+    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil) -> APITestResult {
         let base = url.hasSuffix("/") ? String(url.dropLast()) : url
         let candidates = endpointCandidates(base)
         let s = session(for: proxy)
@@ -249,20 +258,24 @@ public enum APITester {
                 // 任一模型 200/400/404 → key 可用;探测过的模型全部 quota → 才判无额度;
                 // 401/403 → key 失效短路。真实事故:4 模型中首选 composer 429、
                 // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
-                let probeOrder = chatProbeOrder(models)
+                let probeOrder = chatProbeOrder(models, preferred: preferredModel, modelProbeTimes: modelProbeTimes)
                 var working: [String] = []
                 var quotaModels: [String] = []
                 var degradedModel: (String, Int)? = nil
                 var authModel: (String, Int)? = nil
+                var firstWorkingLatency: Double? = nil
+                var modelLatencies: [String: Double] = [:]
                 for probe in probeOrder {
                     let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe)
                     if let st = chat.authStatus { authModel = (probe, st); break }
+                    if let ms = chat.latencyMs { modelLatencies[probe] = ms }
                     if chat.quota != nil { quotaModels.append(probe); continue }
                     if let st = chat.degraded {
                         if degradedModel == nil { degradedModel = (probe, st) }
                         continue
                     }
                     working.append(probe)
+                    if firstWorkingLatency == nil { firstWorkingLatency = chat.latencyMs }
                 }
                 if let (m, st) = authModel {
                     return APITestResult(ok: false, style: style, models: models,
@@ -279,7 +292,9 @@ public enum APITester {
                     return APITestResult(ok: true, style: style, models: reordered,
                                          detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q,
                                          authFailed: false,
-                                         workingModels: hasRealModels ? working : [], quotaModels: hasRealModels ? quotaModels : [])
+                                         workingModels: hasRealModels ? working : [], quotaModels: hasRealModels ? quotaModels : [],
+                                         latencyMs: firstWorkingLatency,
+                                         modelLatencies: hasRealModels && !modelLatencies.isEmpty ? modelLatencies : nil)
                 }
                 if let (m, st) = degradedModel {
                     return APITestResult(ok: false, style: style, models: models,
@@ -318,10 +333,37 @@ public enum APITester {
         return APITestResult(ok: false, style: style, models: [], detail: lastErr, authFailed: authFailed)
     }
 
-    /// chat 探测模型采样:free/试用字样优先(免费档最可能通,真实中转站常按模型限额),
-    /// 其余保序;上限 4 个 —— 模型少全试不加压,模型多也只花 4 次请求
-    static func chatProbeOrder(_ models: [String]) -> [String] {
+    /// chat 探测模型采样:preferredModel(用户实际激活的模型)置顶 —— 显示可用
+    /// 但用户用某个特定模型失败是高频反馈,探测必须优先覆盖它(new-api TestModel 思路);
+    /// 其次 free/试用字样(免费档最可能通,真实中转站常按模型限额),其余保序;
+    /// 上限 4 个 —— 模型少全试不加压,模型多也只花 4 次请求
+    public static func chatProbeOrder(_ models: [String], preferred: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil) -> [String] {
         let capped = models.isEmpty ? ["test"] : models
+        let pref = preferred.map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
+        // 轮换语义:每轮仍只测 4 个(额度/时延下限),但激活模型置顶后,其余槽位按
+        // 「从未测过 > 最久未测」轮换 —— 否则第 5 个以后的模型永远轮不到,灰格永不填
+        // (真实反馈:模型条一直没进度,用户以为模型坏了)。N 个模型 ≈ ⌈(N-1)/3⌉ 轮全覆盖
+        if let times = modelProbeTimes, !times.isEmpty, capped.count > 4 {
+            var rest = capped
+            if let pref, let pi = rest.firstIndex(of: pref) { rest.remove(at: pi) }
+            let freeFirst = rest.filter { $0.lowercased().contains("free") }
+            let others = rest.filter { !$0.lowercased().contains("free") }
+            let pool = freeFirst + others
+            let neverProbed = pool.filter { times[$0] == nil }
+            let probed = pool.filter { times[$0] != nil }
+                .sorted { (times[$0] ?? 0) < (times[$1] ?? 0) }   // 最久未测优先
+            var order: [String] = []
+            if let pref { order.append(pref) }
+            order.append(contentsOf: (neverProbed + probed).prefix(4 - order.count))
+            return order
+        }
+        // preferred 绝对置顶(free 优先规则不得覆盖它),其余按 free 优先排序
+        if let pref, capped.contains(pref) {
+            let rest2 = capped.filter { $0 != pref }
+            let freeFirst = rest2.filter { $0.lowercased().contains("free") }
+            let others = rest2.filter { !$0.lowercased().contains("free") }
+            return Array(([pref] + freeFirst + others).prefix(4))
+        }
         let freeFirst = capped.filter { $0.lowercased().contains("free") }
         let rest = capped.filter { !$0.lowercased().contains("free") }
         return Array((freeFirst + rest).prefix(4))
@@ -333,7 +375,7 @@ public enum APITester {
     /// - authStatus: 401/403(非 HTML 盾页)→ 认证失败/key 失效。/models 常是公共端点(无 key 也 200),
     ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
     ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
-    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> (quota: Int?, degraded: Int?, authStatus: Int?) {
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> (quota: Int?, degraded: Int?, authStatus: Int?, latencyMs: Double?) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
@@ -344,33 +386,46 @@ public enum APITester {
             req.timeoutInterval = timeout
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            // stream:true 按真实使用形态探测:非流式 OK 但流式转换坏的中转站会被识别。
+            // 判定兼容两种响应:SSE(data: 行)与普通 JSON —— 宽松以兼容各网关形态
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
                 "model": model,
                 "max_tokens": 1,
+                "stream": true,
                 "messages": [["role": "user", "content": "ping"]]
             ])
+            let started = Date()
             let o = NetSync.run(session: s, request: req, timeout: timeout)
+            let latencyMs = Date().timeIntervalSince(started) * 1000
             let status = NetSync.statusCode(o)
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             // HTML 盾页(CF 挑战/basic-auth realm)≠ 认证失败,与 /models 探测口径一致:
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
             if status == 401 || status == 403 {
-                if !isHTMLBody(body) { return (nil, nil, status) }
+                if !isHTMLBody(body) { return (nil, nil, status, nil) }
                 continue   // 盾页:跳过本候选,不误判 authFailed
             }
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
-                    return (status, nil, nil)
+                    return (status, nil, nil, nil)
                 }
-                return (nil, status, nil)
+                return (nil, status, nil, nil)
             }
             if status == 424 || (500...599).contains(status) {
-                return (nil, status, nil)
+                return (nil, status, nil, nil)
+            }
+            if status == 200 {
+                // 200 + 非 HTML 响应体才计可用与延迟:流式网关回 SSE(data: 行),
+                // 普通网关回 JSON;空体/前端兜底页不算
+                if isJSONBody(body) || body.contains("data:") {
+                    return (nil, nil, nil, latencyMs)
+                }
+                continue
             }
         }
-        return (nil, nil, nil)
+        return (nil, nil, nil, nil)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {

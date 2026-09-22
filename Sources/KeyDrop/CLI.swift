@@ -215,7 +215,7 @@ enum CLI {
                 return 2
             }
             do {
-                let msg = try Core.shared.refreshModels(entryIDPrefix: target) { models in
+                let msg = try Core.shared.refreshModels(entryIDPrefix: target, proxy: proxy) { models in
                     ModelPicker.pick(from: models, title: "共 \(models.count) 个模型(空格勾选):") ?? models
                 }
                 print(msg)
@@ -292,13 +292,16 @@ enum CLI {
             return 0
 
         case "image-add":
-            return cmdImageAdd(remaining, models: modelsOverride, proxy: proxy)
+            return cmdImageAdd(remaining, models: modelsOverride, proxy: proxy, cpaOverride: cpaOverride)
 
         case "image":
             return cmdImageGenerate(remaining, models: modelsOverride, size: sizeOverride, proxy: proxy)
 
         case "mcp-image":
             return MCPImageServer.run()
+
+        case "proxy-pool":
+            return runProxyPool(remaining)
 
         case "help", "h":
             print(helpText)
@@ -308,6 +311,157 @@ enum CLI {
             print("未知命令: \(cmd)\n")
             print(helpText)
             return 2
+        }
+    }
+
+    /// CPA OAuth 账号 × 代理池自动绑定(CLI 入口)。
+    /// 流程:读代理列表 → 并发测连通 → 粘性计划 → 写回 auth 文件(CPA 热重载生效)。
+    private static func runProxyPool(_ args: [String]) -> Int32 {
+        var file: String?
+        var authDir: String?
+        var types: Set<String>?
+        var target = "https://grok.com"
+        var timeout = 8.0
+        var concurrency = 64
+        var dryRun = false
+        var noCheck = false
+        var jsonOut = false
+        var strict = false
+        var i = 0
+        while i < args.count {
+            let t = args[i]
+            switch t {
+            case "--file":
+                guard i + 1 < args.count else { print("--file 需要参数"); return 2 }
+                file = args[i + 1]; i += 1
+            case "--auth-dir":
+                guard i + 1 < args.count else { print("--auth-dir 需要参数"); return 2 }
+                authDir = args[i + 1]; i += 1
+            case "--type":
+                guard i + 1 < args.count else { print("--type 需要参数"); return 2 }
+                types = Set(args[i + 1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }); i += 1
+            case "--target":
+                guard i + 1 < args.count else { print("--target 需要参数"); return 2 }
+                target = args[i + 1]; i += 1
+            case "--timeout":
+                guard i + 1 < args.count, let v = Double(args[i + 1]), v > 0 else { print("--timeout 需要正数"); return 2 }
+                timeout = v; i += 1
+            case "--concurrency":
+                guard i + 1 < args.count, let v = Int(args[i + 1]), v > 0 else { print("--concurrency 需要正整数"); return 2 }
+                concurrency = v; i += 1
+            case "--dry-run": dryRun = true
+            case "--no-check": noCheck = true
+            case "--json": jsonOut = true
+            case "--strict": strict = true
+            default:
+                print("未知参数: \(t)\n")
+                print("用法: KeyDrop proxy-pool --file <代理列表> [--auth-dir <路径>] [--type xai] [--target <URL>] [--timeout 8] [--concurrency 64] [--dry-run] [--no-check] [--strict] [--json]")
+                return 2
+            }
+            i += 1
+        }
+
+        // 省略 --file 时默认读 ~/.keydrop/proxy-pool.txt(不进 git 的付费凭据,放仓库目录会泄漏)
+        let defaultPoolFile = NSHomeDirectory() + "/.keydrop/proxy-pool.txt"
+        guard let proxyFile = file ?? (FileManager.default.fileExists(atPath: defaultPoolFile) ? defaultPoolFile : nil) else {
+            print("用法: KeyDrop proxy-pool --file <代理列表> [--dry-run] ...\n代理列表: 每行一条,格式 http://host:port 或 socks5://user:pass@host:port,裸 host:port 默认补 http://,# 为注释\n省略 --file 时默认读取 \(defaultPoolFile)")
+            return 2
+        }
+        let dir = authDir ?? ProxyPool.defaultAuthDir()
+        guard let dir, FileManager.default.fileExists(atPath: dir) else {
+            print("未找到 CPA auth-dir(--auth-dir 指定,或 CPA config 同级 auth-dir 目录)")
+            return 1
+        }
+        guard let text = try? String(contentsOfFile: proxyFile, encoding: .utf8) else {
+            print("无法读取代理列表: \(proxyFile)")
+            return 1
+        }
+        let urls = ProxyPool.loadProxyList(text)
+        guard !urls.isEmpty else {
+            print("代理列表为空: \(proxyFile)")
+            return 1
+        }
+        let allAccounts = ProxyPool.scanAccounts(authDir: dir, types: types)
+        guard !allAccounts.isEmpty else {
+            print("auth-dir 无匹配账号: \(dir)")
+            return 1
+        }
+        // 禁用账号不参与分配也不动其文件(用户手动停的,不替他做主)
+        let accounts = allAccounts.filter { !$0.disabled }
+
+        var proxies: [ProxyPool.PoolProxy]
+        if noCheck {
+            // 盲绑:信任列表顺序,全部视为存活;既有池外绑定按存活保留
+            proxies = urls.map { ProxyPool.PoolProxy(url: $0, status: .alive, latencyMs: 0) }
+        } else {
+            print("检查代理池: \(urls.count) 条 → 目标 \(target) · 并发 \(concurrency) · 超时 \(Int(timeout))s")
+            var done = 0
+            let lock = NSLock()
+            let started = Date()
+            proxies = ProxyPool.checkProxies(urls, target: target, timeout: timeout, concurrency: concurrency) { _ in
+                lock.lock()
+                done += 1
+                let n = done
+                lock.unlock()
+                if n % 200 == 0 || n == urls.count {
+                    print("  进度 \(n)/\(urls.count)")
+                }
+            }
+            let alive = proxies.filter { $0.status == .alive }.count
+            let elapsed = Int(Date().timeIntervalSince(started))
+            print("检查完成: 存活 \(alive) / 失效 \(urls.count - alive) · 用时 \(elapsed)s")
+            if alive == 0 {
+                print("池内无存活代理,终止(不改动任何账号)")
+                return 1
+            }
+        }
+
+        let cfg = CPAWriter.locateConfig()
+        let configContent = cfg.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? ""
+        let plan = ProxyPool.planBinding(accounts: accounts, proxies: proxies, strictPoolOnly: strict)
+        let counts = Dictionary(grouping: plan.bindings, by: \.action).mapValues(\.count)
+
+        if jsonOut {
+            let payload: [String: Any] = [
+                "authDir": dir,
+                "accounts": accounts.count,
+                "proxiesTotal": urls.count,
+                "proxiesAlive": proxies.filter { $0.status == .alive }.count,
+                "spares": plan.spares,
+                "bindings": plan.bindings.map { ["account": $0.accountID, "file": $0.fileName, "action": $0.action.rawValue, "old": $0.oldProxy ?? "", "new": $0.newProxy ?? "", "note": $0.note] }
+            ]
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]),
+               let s = String(data: data, encoding: .utf8) {
+                print(s)
+            }
+            return 0
+        }
+
+        let typeDesc = types.map { Array($0).sorted().joined(separator: "/") } ?? "全部"
+        print("账号: \(accounts.count) 个(\(typeDesc)),禁用 \(allAccounts.count - accounts.count) 个不参与分配")
+        print("计划: 保留 \(counts[.kept] ?? 0) · 新绑定 \(counts[.assigned] ?? 0) · 替换 \(counts[.replaced] ?? 0) · 清除 \(counts[.cleared] ?? 0) · 不动 \(counts[.untouched] ?? 0) · 备用余 \(plan.spares.count)")
+
+        let changed = plan.bindings.filter { $0.action == .assigned || $0.action == .replaced || $0.action == .cleared }
+        for b in changed.prefix(30) {
+            let from = b.oldProxy ?? "(无)"
+            let to = b.newProxy ?? "(清除→全局代理)"
+            print("  [\(b.action.rawValue)] \(b.accountID): \(from) → \(to)")
+        }
+        if changed.count > 30 { print("  … 其余 \(changed.count - 30) 条略(--json 可看全量)") }
+
+        if dryRun {
+            print("dry-run:未写入任何文件")
+            return 0
+        }
+        do {
+            let written = try ProxyPool.apply(bindings: plan.bindings, accounts: accounts, configContent: configContent)
+            let isDocker = configContent.contains("host.docker.internal")
+            print("已写入 \(written) 个 auth 文件\(isDocker ? "(docker 部署:loopback 代理已改写为 host.docker.internal)" : "")")
+            print("完成。CPA 会热重载 auth 目录,无需重启容器。")
+            return 0
+        } catch {
+            print("写入失败: \(error.localizedDescription)")
+            return 1
         }
     }
 
@@ -330,9 +484,9 @@ enum CLI {
         return args.joined(separator: " ")
     }
 
-    private static func cmdImageAdd(_ args: [String], models: [String], proxy: String?) -> Int32 {
+    private static func cmdImageAdd(_ args: [String], models: [String], proxy: String?, cpaOverride: Bool? = nil) -> Int32 {
         guard args.count >= 2 else {
-            print("用法: keydrop image-add <key> <url> [--model 名称]")
+            print("用法: keydrop image-add <key> <url> [--model 名称] [--no-cpa 强制直连]")
             return 2
         }
         let key = args[0].trimmingCharacters(in: .whitespaces)
@@ -347,8 +501,33 @@ enum CLI {
             print("✗ 该渠道不支持生图: \(probe.detail)")
             return 1
         }
-        let model = models.first ?? probe.models.first ?? "gpt-image-1"
-        let channel = ImageChannel(url: url, key: key, model: model)
+        // 默认取探测列表里的生图模型(网关 /models 全量列表常混着上百文本模型,
+        // 直接取 first 会把文本模型当选定生图模型);无标识时退回旧行为
+        let imageModels = probe.models.filter { Core.isNonChatModel($0) && $0.contains("image") }
+        let picked = models.isEmpty ? (imageModels.first ?? probe.models.first ?? "gpt-image-1") : models.first!
+        var via = "direct"
+        var epNote = ""
+        // CPA 在跑(能找到 config)且未被 --no-cpa 强制关闭:把 key+模型写进 CPA
+        // 独立生图条目(name=<host>-image, image: true),本地渠道改指向 CPA 常驻
+        // 端点 —— 多 key 轮询/失效剔除/热重载全部由 CPA 接管,后续再 image-add
+        // 另一家,所有工具无需重配,agent 传 model 参数即自动路由
+        if cpaOverride != false, let cfg = CPAWriter.locateConfig() {
+            let writer = CPAWriter(configPath: cfg)
+            do {
+                let msg = try writer.addImageChannel(baseURL: url, key: key,
+                                                     models: [picked], proxy: proxy)
+                print("✓ \(msg)")
+                if let ep = CPAWriter.endpointInfo() {
+                    via = "cpa"
+                    epNote = ep.baseURL
+                }
+            } catch {
+                print("⚠ 写入 CPA 失败(\(error.localizedDescription)),回退直连渠道")
+            }
+        }
+        let channel = ImageChannel(url: via == "cpa" ? epNote + "/v1" : url,
+                                   key: via == "cpa" ? (CPAWriter.endpointInfo()?.clientKey ?? "") : key,
+                                   model: picked, via: via)
         do {
             try ImageChannelStore.save(channel)
         } catch {
@@ -361,19 +540,24 @@ enum CLI {
         } catch {
             print("⚠ MCP 配置写入失败: \(error.localizedDescription)")
         }
-        print("✓ 生图渠道已保存")
-        print("  接口: \(url)/images/generations")
+        print("✓ 生图渠道已保存(\(via == "cpa" ? "经 CPA 聚合端点" : "直连"))")
+        print("  接口: \(channel.url)/images/generations")
         print("  key:  \(channel.keyMasked)")
-        print("  模型: \(model)")
-        if !probe.models.isEmpty {
-            print("  可用模型: \(probe.models.joined(separator: ", "))")
+        print("  模型: \(picked)")
+        if via == "cpa" {
+            print("  上游: \(url)(key 已存 CPA config;换渠道/加 key 直接再跑 image-add)")
+        } else {
+            let shown = imageModels.isEmpty ? probe.models : imageModels
+            if !shown.isEmpty {
+                print("  可用模型: \(shown.joined(separator: ", "))")
+            }
         }
         if !existed.isEmpty {
             let parts = existed.map { k, v in "\(k)=\(v ? "已存在" : "已写入")" }
             print("  MCP 注册: \(parts.joined(separator: " "))")
         }
         print("对话中直接说「画一张…」,agent 会调用 generate_image 工具")
-        print("命令行直出: keydrop image \"一只猫\" --model \(model)")
+        print("命令行直出: keydrop image \"一只猫\" --model \(picked)")
         return 0
     }
 
@@ -414,12 +598,18 @@ enum CLI {
       KeyDrop --parse "<内容>"       只看解析结果,不写入
       KeyDrop --list                 历史记录
       KeyDrop scan                   全量强制健康探测,刷新可用/无余额/待删除区
+      KeyDrop proxy-pool             CPA OAuth 账号 × 代理池粘性自动绑定(--file 必填)
+                                     [--file <代理列表>] [--auth-dir <路径>] [--type xai]
+                                     [--target <检查URL>] [--timeout 8] [--concurrency 64]
+                                     [--dry-run] [--no-check 盲绑] [--strict 接管池外绑定] [--json]
       KeyDrop --delete <ID前缀|片段> 删除该条(自动还原/回退)
       KeyDrop --refresh <ID前缀>     重新测试并更新模型列表
       KeyDrop --status               查看当前状态
       KeyDrop --self-heal            检查并重建丢失的 cc-switch provider
       KeyDrop --image-add <key> <url> 导入生图渠道(探测 /v1/images/generations)
-                                       [--model 名称] → 自动注册 claude/codex MCP
+                                       [--model 名称] [--no-cpa 强制直连] → 自动注册 claude/codex/opencode MCP
+                                       检测到 CPA 配置时:key+模型写入 CPA 独立生图条目
+                                       (image: true),渠道指向 CPA 端点,多 key/多渠道 CPA 聚合路由
       KeyDrop --image "描述"          用已存渠道直接生图 [--model] [--size]
       KeyDrop --mcp-image             MCP stdio server(供 claude/codex agent 调用)
     """

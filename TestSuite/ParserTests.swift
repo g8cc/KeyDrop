@@ -4,6 +4,22 @@ import KeyDropCore
 enum ParserTests {
     static func run(_ h: Harness) {
         h.runSuite("Parser") { t in
+            // 回归:京东云控制台样式「keybase64 : <base64>」—— 冒号两侧带空格。
+            // 曾因只认无空格写法,标签 "keybase64" 被逐词切分漏进模型列表,
+            // 后续用 "keybase64" 当模型名探测必然失败(真实事故:jdcloud 导入报错)
+            do {
+                let jd = try Parser.parse("""
+                    https://modelservice.jdcloud.com/coding/openai/v1
+
+                    keybase64 : cGstZmE3ZGUxM2ItZWQzYy00NmM4LThjNTQtMTUzOWVkMzQ4YjYy
+                    """)
+                t.equal(jd.key, "pk-fa7de13b-ed3c-46c8-8c54-1539ed348b62", "keybase64 标签行正确解码")
+                t.expect(jd.models == nil || jd.models?.isEmpty == true, "标签不得漏进模型列表: \(jd.models ?? [])")
+                t.expect(jd.model == nil, "model 不应是标签名")
+                t.expect(jd.url?.contains("jdcloud") == true, "URL 识别")
+            } catch {
+                t.expect(false, "京东云样式解析失败: \(error)")
+            }
             // 纯 key
             t.equal(try! Parser.parseWithFallback("sk-abc123def456ghi789jkl").key, "sk-abc123def456ghi789jkl", "纯 key 解析")
 
