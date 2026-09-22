@@ -1623,16 +1623,37 @@ struct PanelView: View {
                 targetChip("Grok", on: state.useGrok, color: Color(red: 0.35, green: 0.45, blue: 0.85)) {
                     state.toggleUseGrok()
                 }
-                targetChip("CPA", on: state.useCPA, color: Color(red: 0.28, green: 0.48, blue: 0.82)) {
-                    state.toggleUseCPA()
+                // CPA 芯片:主体点击=开关;齿轮内嵌框内,独立热区=管理 API 配置
+                HStack(spacing: 3) {
+                    Button {
+                        state.toggleUseCPA()
+                    } label: {
+                        Text("CPA")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(state.useCPA ? Color(red: 0.28, green: 0.48, blue: 0.82) : Color.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        state.openCPAAPI()
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(state.useCPA ? Color(red: 0.28, green: 0.48, blue: 0.82).opacity(0.85) : Color.secondary.opacity(0.85))
+                            .padding(.vertical, 2)
+                    }
+                    .buttonStyle(.plain)
+                    .help("CPA 管理 API 配置:密钥化后 KeyDrop 不触碰 CPA 数据目录,根治「文稿」弹窗")
                 }
-                Button { state.openCPAAPI() } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.borderless)
-                .help("CPA 管理 API 配置:密钥化后 KeyDrop 不触碰 CPA 数据目录,根治「文稿」弹窗")
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(state.useCPA ? Color(red: 0.28, green: 0.48, blue: 0.82).opacity(0.14) : Color.primary.opacity(0.05))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5)
+                        .strokeBorder(state.useCPA ? Color(red: 0.28, green: 0.48, blue: 0.82).opacity(0.35) : Color.clear, lineWidth: 1)
+                )
                 targetChip("DSH", on: state.useDSH, color: Color(red: 0.85, green: 0.55, blue: 0.15)) {
                     state.toggleUseDSH()
                 }
