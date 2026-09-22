@@ -370,6 +370,8 @@ final class AppState: ObservableObject {
             return
         }
         busyLabel = "测试 CPA 管理 API…"
+        let prevKey = Prefs.shared.cpaManagementKey
+        let prevBase = Prefs.shared.cpaAPIBase
         Task { @MainActor in
             defer { busyLabel = "" }
             let ok: Bool = await Task.detached(priority: .userInitiated) { () -> Bool in
@@ -380,9 +382,15 @@ final class AppState: ObservableObject {
             }.value
             cpaAPIOk = ok
             if ok {
+                // 真实事故(2026-09-22):此前漏调 Prefs.save(),密钥只存在内存,
+                // prefs.json 无记录,重启即丢——用户保存成功后查文件发现没有。
+                try? Prefs.shared.save()
                 // 成功即关窗:设置已持久化,下次打开此面板可再次查看状态
                 cpaAPISheetShown = false
             } else {
+                // 测试失败不落盘,并回滚内存值,避免半生效状态
+                Prefs.shared.cpaManagementKey = prevKey
+                Prefs.shared.cpaAPIBase = prevBase
                 cpaAPIStatus = "连接失败:检查 CPA 是否运行、密钥是否为管理面板口令"
             }
         }
@@ -390,6 +398,7 @@ final class AppState: ObservableObject {
     func clearCPAAPI() {
         Prefs.shared.cpaManagementKey = nil
         Prefs.shared.cpaAPIBase = nil
+        try? Prefs.shared.save()   // 清除同样必须落盘,否则重启后旧密钥“复活”
         cpaAPIKeyInput = ""
         cpaAPIBaseInput = ""
         cpaAPIOk = false

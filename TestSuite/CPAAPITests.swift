@@ -150,6 +150,22 @@ enum CPAAAPITests {
             } catch {
                 t.expect(false, "apply 失败: \(error)")
             }
+
+            // 11. 真实事故(2026-09-22):UI saveCPAAPI 漏调 Prefs.save(),
+            // 密钥只在内存、prefs.json 无记录,重启即丢。回归:save() 后
+            // 磁盘 $KEYDROP_HOME/prefs.json 必须含 cpaManagementKey。
+            do {
+                Prefs.shared.cpaManagementKey = "persist-roundtrip-key"
+                try Prefs.shared.save()
+                defer { Prefs.shared.cpaManagementKey = origKey }
+                let home = ProcessInfo.processInfo.environment["KEYDROP_HOME"]!
+                let text = try String(contentsOfFile: home + "/prefs.json", encoding: .utf8)
+                let obj = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
+                t.equal(obj?["cpaManagementKey"] as? String, "persist-roundtrip-key",
+                        "save() 后密钥已写入磁盘 prefs.json")
+            } catch {
+                t.expect(false, "prefs 持久化回归失败: \(error)")
+            }
         }
     }
 }
