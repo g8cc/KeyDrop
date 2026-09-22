@@ -1231,7 +1231,7 @@ struct HelpView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     section("贴 key 即用", icon: "arrow.down.doc") {
-                        item("粘贴内容后点「添加并激活」,自动解析 URL / key / 模型,并写入开启的通道(cc-switch / CPA)")
+                        item("粘贴内容后点「导入」,自动解析 URL / key / 模型,测试通过后写入开启的通道(cc-switch / CPA 等)")
                         item("支持任意格式:明文 key、API 链接、curl 命令(含 \\ 续行)、订阅地址")
                         item("自动去噪:多余空格、空行、重复 key、平台前缀文案自动清理")
                     }
@@ -1258,7 +1258,7 @@ struct HelpView: View {
                         item("粘贴 Clash 订阅链接或节点列表,自动写入 Clash Party profiles 目录")
                     }
                     section("其他", icon: "info.circle") {
-                        item("快捷键:⌘⏎ 快速添加并激活")
+                        item("快捷键:⌘⏎ 快速导入")
                         item("状态栏显示导入/测试结果;失败时日志在 ~/Library/Logs/KeyDrop/keydrop.log")
                         item("命令行:KeyDrop --help 查看 CLI 用法(适合脚本/批量导入)")
                     }
@@ -1668,7 +1668,7 @@ struct PanelView: View {
                             .controlSize(.small)
                         Text(state.busyLabel.isEmpty ? "处理中…" : state.busyLabel)
                     } else {
-                        Text("添加并激活")
+                        Text("导入")
                     }
                 }
                 .frame(minWidth: 110)
@@ -1682,7 +1682,7 @@ struct PanelView: View {
                 inputFocused = true
             }
             .disabled(state.isBusy)
-            .help("⌘V 粘贴;⌘↩ 添加并激活")
+            .help("⌘V 粘贴;⌘↩ 导入")
             Spacer()
         }
     }
@@ -1762,7 +1762,7 @@ struct PanelView: View {
                     Text("暂无记录")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
-                    Text("粘贴 key 后点「添加并激活」")
+                    Text("粘贴 key 后点「导入」")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }

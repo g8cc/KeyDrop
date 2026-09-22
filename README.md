@@ -61,8 +61,9 @@ cp .build/release/KeyDrop ~/Applications/KeyDrop.app  # 或直接运行 .build/r
 只有当你的 CPA 配置放在 `~/Documents` 下时才会触发授权。重新构建(ad-hoc 签名)会让系统"忘记"
 之前的授权,两种解法任选:
 
-1. 钥匙串访问 → 证书助理 → 创建证书:名称 `KeyDropLocal`、证书类型「代码签名」(make-app.sh
-   检测到即自动使用;签名恒定后,授权一次永久记住);
+1. (可选,仅源码构建者需要)钥匙串访问 → 证书助理 → 创建证书:名称 `KeyDropLocal`、
+   证书类型「代码签名」,有效期建议 3650 天(make-app.sh 检测到即自动使用;签名恒定后,
+   授权一次永久记住;证书只在本机有效,无任何密码存储);
 2. 或者把 CPA 配置目录移出 `~/Documents`,并同步修改 KeyDrop 里的 CPA 配置路径。
 
 ## 使用

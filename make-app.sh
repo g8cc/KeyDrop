@@ -20,8 +20,8 @@ cp .build/release/KeyDrop "$APP_BUNDLE/Contents/MacOS/KeyDrop"
 echo "[3/4] 签名..."
 # 优先用本地固定证书:ad-hoc 签名(-)每次重签指纹都变,macOS TCC 把它当新 App,
 # 之前的文件访问授权全部作废 → 每次 make app 后都重新弹「文稿/其他 App 数据」
-# 隐私弹窗。创建证书(一次性):钥匙串访问 → 证书助理 → 创建证书,
-# 名称 KeyDropLocal,类型:代码签名。找不到该证书时回退 ad-hoc(不影响构建)
+# 隐私弹窗。证书缺失时自动生成(make-cert.sh,免 GUI 免管理员);生成失败仍回退 ad-hoc
+"./make-cert.sh" || true
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "KeyDropLocal"; then
     codesign --force --sign "KeyDropLocal" "$APP_BUNDLE"
 else
