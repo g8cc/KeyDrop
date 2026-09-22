@@ -367,10 +367,13 @@ enum CLI {
             print("用法: KeyDrop proxy-pool --file <代理列表> [--dry-run] ...\n代理列表: 每行一条,格式 http://host:port 或 socks5://user:pass@host:port,裸 host:port 默认补 http://,# 为注释\n省略 --file 时默认读取 \(defaultPoolFile)")
             return 2
         }
+        // API 模式下凭据经管理 API 读写,auth-dir 路径无意义;文件模式仍需本地目录
         let dir = authDir ?? ProxyPool.defaultAuthDir()
-        guard let dir, FileManager.default.fileExists(atPath: dir) else {
-            print("未找到 CPA auth-dir(--auth-dir 指定,或 CPA config 同级 auth-dir 目录)")
-            return 1
+        if !CPAAPI.apiMode {
+            guard let dir, FileManager.default.fileExists(atPath: dir) else {
+                print("未找到 CPA auth-dir(--auth-dir 指定,或 CPA config 同级 auth-dir 目录;或在 KeyDrop 里配置 CPA 管理 API 密钥走 API 模式)")
+                return 1
+            }
         }
         guard let text = try? String(contentsOfFile: proxyFile, encoding: .utf8) else {
             print("无法读取代理列表: \(proxyFile)")
@@ -381,9 +384,9 @@ enum CLI {
             print("代理列表为空: \(proxyFile)")
             return 1
         }
-        let allAccounts = ProxyPool.scanAccounts(authDir: dir, types: types)
+        let allAccounts = ProxyPool.scanAccounts(authDir: dir ?? "", types: types)
         guard !allAccounts.isEmpty else {
-            print("auth-dir 无匹配账号: \(dir)")
+            print("无匹配账号: \(CPAAPI.apiMode ? "CPA 管理 API" : "auth-dir \(dir ?? "")")")
             return 1
         }
         // 禁用账号不参与分配也不动其文件(用户手动停的,不替他做主)

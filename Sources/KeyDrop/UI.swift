@@ -33,6 +33,12 @@ final class AppState: ObservableObject {
     @Published var highlightID: String?
     @Published var highlightPulse = 0
     @Published var helpShown = false
+    /// CPA 管理 API 配置 sheet(密钥走 prefs.cpaManagementKey,API 模式根治文稿弹窗)
+    @Published var cpaAPISheetShown = false
+    @Published var cpaAPIKeyInput = ""
+    @Published var cpaAPIBaseInput = ""
+    @Published var cpaAPIStatus = ""
+    @Published var cpaAPIOk = false
     /// 监控图 sheet 当前展示的条目 ID(nil=关闭)
     @Published var monitorEntryID: String? = nil
 
@@ -66,6 +72,8 @@ final class AppState: ObservableObject {
         useCPA = Prefs.shared.useCPA
         useDSH = Prefs.shared.useDSH
         proxyText = Prefs.shared.proxy
+        cpaAPIKeyInput = Prefs.shared.cpaManagementKey ?? ""
+        cpaAPIBaseInput = Prefs.shared.cpaAPIBase ?? ""
     }
 
     func doAdd() {
@@ -345,6 +353,44 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    func openCPAAPI() {
+        cpaAPIKeyInput = Prefs.shared.cpaManagementKey ?? ""
+        cpaAPIBaseInput = Prefs.shared.cpaAPIBase ?? ""
+        cpaAPIStatus = CPAAPI.apiMode ? "当前:API 模式(不触碰 CPA 数据目录文件)" : "当前:文件直写模式"
+        cpaAPIOk = CPAAPI.apiMode
+        cpaAPISheetShown = true
+    }
+    func saveCPAAPI() {
+        let key = cpaAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = cpaAPIBaseInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            cpaAPIStatus = "密钥为空:留空并点「清除」可回到文件模式"; cpaAPIOk = false
+            return
+        }
+        busyLabel = "测试 CPA 管理 API…"
+        Task { @MainActor in
+            defer { busyLabel = "" }
+            let ok: Bool = await Task.detached(priority: .userInitiated) { () -> Bool in
+                Prefs.shared.cpaManagementKey = key
+                Prefs.shared.cpaAPIBase = base.isEmpty ? nil : base
+                guard let (_, data) = try? CPAAPI.request("GET", "v0/management/config.yaml") else { return false }
+                return data.count > 0
+            }.value
+            cpaAPIOk = ok
+            cpaAPIStatus = ok
+                ? "已保存并验证通过:API 模式生效(此后不再触碰 CPA 数据目录)"
+                : "连接失败:检查 CPA 是否运行、密钥是否为管理面板口令"
+        }
+    }
+    func clearCPAAPI() {
+        Prefs.shared.cpaManagementKey = nil
+        Prefs.shared.cpaAPIBase = nil
+        cpaAPIKeyInput = ""
+        cpaAPIBaseInput = ""
+        cpaAPIOk = false
+        cpaAPIStatus = "已清除:回到文件直写模式"
     }
 
     func doActivateCPA(_ id: String) {
@@ -1515,6 +1561,9 @@ struct PanelView: View {
                 MonitorView(entry: entry)
             }
         }
+        .sheet(isPresented: $state.cpaAPISheetShown) {
+            CPAAPISheet(state: state)
+        }
         .sheet(isPresented: $state.editShown) {
             EditView(state: state)
         }
@@ -1573,6 +1622,9 @@ struct PanelView: View {
                 }
                 targetChip("CPA", on: state.useCPA, color: Color(red: 0.28, green: 0.48, blue: 0.82)) {
                     state.toggleUseCPA()
+                }
+                .contextMenu {
+                    Button("CPA 管理 API…") { state.openCPAAPI() }
                 }
                 targetChip("DSH", on: state.useDSH, color: Color(red: 0.85, green: 0.55, blue: 0.15)) {
                     state.toggleUseDSH()
@@ -2422,3 +2474,39 @@ struct OverallStatusBanner: View {
     }
 }
 
+
+/// CPA 管理 API 配置:密钥 + 可选地址;保存时实测 GET config.yaml 验证
+struct CPAAPISheet: View {
+    @ObservedObject var state: AppState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("CPA 管理 API").font(.system(size: 13, weight: .semibold))
+            Text("配置后,KeyDrop 对 CPA 的全部读写经管理 API(127.0.0.1:8317),不再直接触碰 CPA 数据目录文件——若该目录在「文稿」下,权限弹窗从此消失。密钥即管理面板登录口令。")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            SecureField("管理密钥", text: $state.cpaAPIKeyInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+            TextField("API 地址(默认 http://127.0.0.1:8317)", text: $state.cpaAPIBaseInput)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11, design: .monospaced))
+            if !state.cpaAPIStatus.isEmpty {
+                Text(state.cpaAPIStatus)
+                    .font(.system(size: 11))
+                    .foregroundStyle(state.cpaAPIOk ? Color.green : Color.red)
+            }
+            HStack {
+                Button("保存并测试") { state.saveCPAAPI() }
+                    .keyboardShortcut(.defaultAction)
+                Button("清除(回到文件模式)") { state.clearCPAAPI() }
+                Spacer()
+                Button("关闭") { state.cpaAPISheetShown = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 400)
+    }
+}

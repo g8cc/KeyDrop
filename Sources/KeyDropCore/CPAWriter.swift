@@ -168,7 +168,7 @@ public final class CPAWriter {
 
     private static func readPortFromConfig() -> String? {
         guard let cfg = locateConfig(),
-              let content = try? String(contentsOfFile: cfg, encoding: .utf8)
+              let content = try? CPAAPI.readConfigText(path: cfg)
         else { return nil }
         for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
             let l = String(line)
@@ -197,12 +197,11 @@ public final class CPAWriter {
         let modelList = models.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         guard !k.isEmpty, !url.isEmpty else { throw WriterError.missingKey }
         guard !modelList.isEmpty else { throw WriterError.file("生图模型列表为空") }
-        guard FileManager.default.fileExists(atPath: configPath) else {
+        guard configAvailable() else {
             throw CPAWriteError.notFound(configPath)
         }
-        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
-            try Self.validateYAML(path: configPath)
-            let content = try String(contentsOfFile: configPath, encoding: .utf8)
+        return try withCPASync {
+            let content = try readConfigText()
             let proxy = Self.rewriteProxyForDocker(proxy, configContent: content)
             var lines = content.components(separatedBy: "\n")
             let providerName = aggregatedName(for: url) + "-image"
@@ -346,12 +345,11 @@ public final class CPAWriter {
             if !t.isEmpty, seen.insert(t).inserted { uniq.append(t) }
         }
         guard !uniq.isEmpty else { throw WriterError.file("更新 CPA 模型列表收到空列表") }
-        guard FileManager.default.fileExists(atPath: configPath) else {
+        guard configAvailable() else {
             throw WriterError.file("CPA config 不存在: \(configPath)")
         }
-        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
-            try Self.validateYAML(path: configPath)
-            let content = try String(contentsOfFile: configPath, encoding: .utf8)
+        return try withCPASync {
+            let content = try readConfigText()
             var lines = content.components(separatedBy: "\n")
             let providerName = aggregatedName(for: baseURL)
             guard let entryRange = findAggregatedEntry(in: lines, providerName: providerName) else {
@@ -446,7 +444,7 @@ public final class CPAWriter {
         guard !accepted.isEmpty else {
             throw WriterError.file("多 key 中没有可用 key,已剔除 \(rejected) 个失效 key")
         }
-        let writeMsg = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+        let writeMsg = try withCPASync {
             try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels, proxy: proxy)
         }
         // 回传条目最终 models(已有精选时=精选原列表,新建/补写时=探测结果):
@@ -460,8 +458,8 @@ public final class CPAWriter {
     /// 返回 (消息, 条目最终模型列表)。已有非空 models 的条目视为用户精选:
     /// 再导入只合并 key,绝不追加探测模型(真实反馈:CPA 聚合 /models 混入 22 家
     /// 上游共 100+ 模型,用户只要 SOTA 四件套,KeyDrop 不得把一大堆回填)
-    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy rawProxy: String? = nil) throws -> (String, [String]) {        try Self.validateYAML(path: configPath)
-        let content = try String(contentsOfFile: configPath, encoding: .utf8)
+    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy rawProxy: String? = nil) throws -> (String, [String]) {
+        let content = try readConfigText()
         let proxy = Self.rewriteProxyForDocker(rawProxy, configContent: content)
         var lines = content.components(separatedBy: "\n")
         let providerName = aggregatedName(for: baseURL)
@@ -512,9 +510,9 @@ public final class CPAWriter {
     /// 读取指定 baseURL 聚合条目当前精选的模型列表(锁内读,与写者互斥)。
     /// 条目/段不存在返回 []
     public func entryModels(baseURL: String) -> [String] {
-        guard FileManager.default.fileExists(atPath: configPath) else { return [] }
-        return (try? FileLock.withLock(FileLock.lockPath(for: configPath)) { () -> [String] in
-            guard let content = try? String(contentsOfFile: configPath, encoding: .utf8) else { return [] }
+        guard configAvailable() else { return [] }
+        return (try? withCPASync { () -> [String] in
+            guard let content = try? readConfigText() else { return [] }
             let lines = content.components(separatedBy: "\n")
             guard let range = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL)) else { return [] }
             return Self.entryModels(in: lines, entryRange: range)
@@ -748,15 +746,14 @@ public final class CPAWriter {
         guard FileManager.default.fileExists(atPath: configPath) else {
             return "CPA config 不存在,跳过"
         }
-        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+        return try withCPASync {
             return try removeLocked(apiKeys: apiKeys)
         }
     }
 
-    /// 调用方必须已持有 configPath 的 flock
+    /// 文件模式下调用方必须已持有 configPath 的 flock;API 模式无需 flock
     private func removeLocked(apiKeys: [String]) throws -> String {
-        try Self.validateYAML(path: configPath)
-        let content = try String(contentsOfFile: configPath, encoding: .utf8)
+        let content = try readConfigText()
         var lines = content.components(separatedBy: "\n")
         let targets = Set(apiKeys)
         var removed = Set<String>()   // 至少删掉一处 occurrence 的目标 key
@@ -1015,7 +1012,31 @@ public final class CPAWriter {
         return "\"\(escaped)\""
     }
 
+    // MARK: - 双轨 IO(API 模式 / 文件模式)
+
+    /// 文件模式才需要 flock 与本地 YAML 预检;API 模式下 CPA 服务端自带互斥与写入校验,
+    /// 且 KeyDrop 完全不触碰本地文件 —— flock 的锁文件也在 Documents 下,同样触发 TCC 弹窗
+    private func withCPASync<T>(_ body: () throws -> T) throws -> T {
+        if CPAAPI.apiMode { return try body() }
+        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try Self.validateYAML(path: configPath)
+            return try body()
+        }
+    }
+    private func configAvailable() -> Bool {
+        CPAAPI.apiMode ? true : FileManager.default.fileExists(atPath: configPath)
+    }
+    private func readConfigText() throws -> String {
+        try CPAAPI.readConfigText(path: configPath)
+    }
+
     private func atomicWrite(_ content: String) throws {
+        if CPAAPI.apiMode {
+            // API 模式:PUT 交 CPA 服务端校验+落盘+热重载;KeyDrop 不触碰本地文件。
+            // 服务端校验失败直接 422,原配置不受影响,无需本地备份/回滚
+            try CPAAPI.writeConfigText(content, path: configPath)
+            return
+        }
         let url = URL(fileURLWithPath: configPath)
         let bak = url.appendingPathExtension("keydrop-bak")
         try? FileManager.default.removeItem(at: bak)

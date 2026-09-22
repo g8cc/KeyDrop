@@ -27,6 +27,7 @@ CoreTests.run(harness)
 RegressionTests.run(harness)
 ImportPipelineTests.run(harness)
 ProxyPoolTests.run(harness)
+CPAAAPITests.run(harness)
 
 print("────────────────────────────")
 if harness.failures.isEmpty {

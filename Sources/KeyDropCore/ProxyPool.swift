@@ -97,6 +97,7 @@ public enum ProxyPool {
     /// 扫描 auth-dir 下所有 *.json 凭证文件。types 为 nil 时不筛类型。
     /// 损坏的 json 跳过并记日志,不让一个坏文件废掉整批。
     public static func scanAccounts(authDir: String, types: Set<String>? = nil) -> [PoolAccount] {
+        if CPAAPI.apiMode { return scanAccountsAPI(types: types) }
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: authDir) else { return [] }
         var out: [PoolAccount] = []
@@ -116,6 +117,39 @@ public enum ProxyPool {
             let proxy = [obj["proxy_url"], obj["proxy-url"]].compactMap { $0 as? String }.first { !$0.isEmpty }
             out.append(PoolAccount(
                 path: path,
+                fileName: f,
+                accountID: id,
+                type: type,
+                disabled: obj["disabled"] as? Bool ?? false,
+                existingProxy: proxy
+            ))
+        }
+        return out
+    }
+
+    /// API 模式扫描:文件名列表来自 /auth-files,逐个取原文解析(与文件模式同一套字段逻辑)。
+    /// GET /auth-files 响应不含 proxy_url,取原文是最可靠路径
+    private static func scanAccountsAPI(types: Set<String>?) -> [PoolAccount] {
+        guard let names = try? CPAAPI.listAuthFileNames() else {
+            AppLog.error("代理池: CPA 管理 API 不可达(检查管理密钥与 CPA 是否在运行)")
+            return []
+        }
+        var out: [PoolAccount] = []
+        for f in names.sorted() {
+            guard let data = try? CPAAPI.authFileData(fileName: f),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                AppLog.error("代理池: 无法解析 \(f),已跳过")
+                continue
+            }
+            let type = obj["type"] as? String ?? ""
+            if let types, !types.contains(type) { continue }
+            let email = obj["email"] as? String
+            let name = obj["name"] as? String
+            let sub = obj["sub"] as? String
+            let id = [email, name, sub].compactMap { $0 }.first { !$0.isEmpty } ?? (f as NSString).deletingPathExtension
+            let proxy = [obj["proxy_url"], obj["proxy-url"]].compactMap { $0 as? String }.first { !$0.isEmpty }
+            out.append(PoolAccount(
+                path: "",
                 fileName: f,
                 accountID: id,
                 type: type,
@@ -213,6 +247,25 @@ public enum ProxyPool {
     /// 返回实际写入的文件数。loopback 代理按 docker 部署形态改写(复用 CPAWriter 规则)。
     @discardableResult
     public static func apply(bindings: [PoolBinding], accounts: [PoolAccount], configContent: String) throws -> Int {
+        if CPAAPI.apiMode {
+            // API 模式:PATCH /auth-files/fields;proxy_url 置空串 = 清除(回落全局)
+            var written = 0
+            for b in bindings where b.action == .assigned || b.action == .replaced || b.action == .cleared {
+                let target: String
+                if let p = b.newProxy {
+                    target = CPAWriter.rewriteProxyForDocker(p, configContent: configContent) ?? p
+                } else {
+                    target = ""
+                }
+                do {
+                    try CPAAPI.patchAuthFile(name: b.fileName, fields: ["proxy_url": target])
+                    written += 1
+                } catch {
+                    AppLog.error("代理池: PATCH \(b.fileName) 失败: \(error.localizedDescription)")
+                }
+            }
+            return written
+        }
         let paths = Dictionary(accounts.map { ($0.fileName, $0.path) }, uniquingKeysWith: { a, _ in a })
         let fm = FileManager.default
         var written = 0

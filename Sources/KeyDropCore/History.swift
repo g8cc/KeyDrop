@@ -629,6 +629,19 @@ public final class Prefs {
         get { lock.lock(); defer { lock.unlock() }; return _proxy }
         set { lock.lock(); _proxy = newValue; lock.unlock() }
     }
+    /// CPA 管理 API 密钥(管理面板登录口令);非空 = 全部 CPA 读写走管理 API,
+    /// 不触碰 CPA 数据目录文件(根治 ~/Documents 下的 TCC「文稿」弹窗)
+    private var _cpaManagementKey: String? = nil
+    private var _cpaAPIBase: String? = nil
+    public var cpaManagementKey: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _cpaManagementKey }
+        set { lock.lock(); _cpaManagementKey = newValue; lock.unlock() }
+    }
+    /// CPA 管理 API 地址,默认 http://127.0.0.1:8317
+    public var cpaAPIBase: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _cpaAPIBase }
+        set { lock.lock(); _cpaAPIBase = newValue; lock.unlock() }
+    }
 
     init() { load() }
 
@@ -643,6 +656,8 @@ public final class Prefs {
             if let v = obj["cpaResident"] as? Bool { _cpaResident = v }
             _cpaConfigPath = obj["cpaConfigPath"] as? String
             if let v = obj["proxy"] as? String { _proxy = v }
+            _cpaManagementKey = obj["cpaManagementKey"] as? String
+            _cpaAPIBase = obj["cpaAPIBase"] as? String
         }
     }
 
@@ -669,12 +684,16 @@ public final class Prefs {
         let resident = _cpaResident
         let path = _cpaConfigPath
         let proxy = _proxy
+        let mgmtKey = _cpaManagementKey
+        let apiBase = _cpaAPIBase
         lock.unlock()
         // flock 串行化跨进程写:app 与 CLI 并发 save 时,固定 tmp 路径会被对方
         // replaceItemAt 拽走导致写失败,并发覆盖也会丢掉对方的设置变更
         try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
             var obj: [String: Any] = ["useCC": cc, "useGrok": grok, "useCPA": cpa, "useDSH": dsh, "cpaResident": resident, "proxy": proxy]
             if let path, !path.isEmpty { obj["cpaConfigPath"] = path }
+            if let mgmtKey, !mgmtKey.isEmpty { obj["cpaManagementKey"] = mgmtKey }
+            if let apiBase, !apiBase.isEmpty { obj["cpaAPIBase"] = apiBase }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true

@@ -24,7 +24,18 @@ final class MockHTTPServer {
         case dottedModels // /models → 200,7 个 stepfun 式模型(5 个含点、会被 looksLikeModel 域名规则误杀)
         case selectiveAuth // Authorization 含 invalid 的 key 返回 401,其余正常
         case selectiveModelQuota // /models 返回 4 模型(1 个 *-free + 3 限流);chat 仅 free 模型 200,其余 429 quota
+        case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
     }
+    // cpaMgmt 状态:跨线程访问,统一走锁
+    let mgmtLock = NSLock()
+    var cpaYAML = "# cpa-mgmt-sentinel\nport: 8317\n"
+    var cpaPutBody = ""
+    var cpaPatchBody = ""
+    var cpaPatchName = ""
+    var cpaAuthHeader = ""
+    var cpaAuthFiles: [String: String] = [
+        "acc-a.json": "{\"type\":\"xai\",\"email\":\"a@x.com\",\"proxy_url\":\"\"}"
+    ]
     let mode: Mode
 
     init(mode: Mode = .openAI, proxy: Bool = false) throws {
@@ -57,6 +68,10 @@ final class MockHTTPServer {
         // readUntil 收满 \r\n\r\n 即返回,但 URLSession 常把 header+body 一并送达,
         // 所以先判断分隔符之后是否已有 >= content-length 的字节,已有就不再 recv
         // (否则 readBody 会对着已发完的流死等满 SO_RCVTIMEO,4 模型 × 3s 拖死测试)。
+        if mode == .cpaMgmt {
+            handleCPAMgmt(client, req, method, target)
+            return
+        }
         if mode == .selectiveModelQuota, method == "POST", target.contains("/chat/completions"),
            let r = headerOnly.lowercased().range(of: "content-length:"),
            let n = Int(headerOnly.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -217,6 +232,76 @@ final class MockHTTPServer {
         let resp = "HTTP/1.1 \(status)\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
         client.write(resp)
         client.close()
+    }
+
+    // MARK: - CPA 管理 API mock
+
+    private func respond(_ client: SocketClient, _ code: Int, _ reason: String, _ body: String, contentType: String = "application/json") {
+        let resp = "HTTP/1.1 \(code) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        client.write(resp)
+        client.close()
+    }
+
+    private func handleCPAMgmt(_ client: SocketClient, _ req: String, _ method: String, _ target: String) {
+        mgmtLock.lock()
+        defer { mgmtLock.unlock() }
+        cpaAuthHeader = req.components(separatedBy: "\r\n").first { $0.lowercased().hasPrefix("authorization:") } ?? ""
+        guard cpaAuthHeader.lowercased().hasPrefix("authorization: bearer test-key") else {
+            respond(client, 401, "Unauthorized", "{\"error\":\"bad key\"}")
+            return
+        }
+        // 读 body(PUT/PATCH):URLSession 常把 header+body 一并送达,先看分隔符后已有多少
+        var bodyStr = ""
+        if method == "PUT" || method == "PATCH" {
+            if let sep = req.range(of: "\r\n\r\n") {
+                bodyStr = String(req[sep.upperBound...])
+            }
+            if let r = req.lowercased().range(of: "content-length:"),
+               let n = Int(req.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                   .prefix(while: { $0.isNumber })), n > 0, bodyStr.utf8.count < n {
+                bodyStr += client.readBody(toLength: n - bodyStr.utf8.count)
+            }
+        }
+        let path = target.split(separator: "?").first.map(String.init) ?? target
+        switch (method, path) {
+        case ("GET", "/v0/management/config.yaml"):
+            let yaml = cpaYAML
+            mgmtLock.unlock()
+            respond(client, 200, "OK", yaml, contentType: "text/yaml")
+            mgmtLock.lock()
+        case ("PUT", "/v0/management/config.yaml"):
+            cpaPutBody = bodyStr
+            cpaYAML = bodyStr
+            respond(client, 200, "OK", "{\"ok\":true}")
+        case ("GET", "/v0/management/auth-files"):
+            let items = cpaAuthFiles.keys.sorted().map { "{\"name\":\"\($0)\"}" }
+            respond(client, 200, "OK", "{\"files\":[\(items.joined(separator: ","))]}")
+        case ("GET", "/v0/management/auth-files/download"):
+            if let q = target.range(of: "name=") {
+                let name = target[q.upperBound...].removingPercentEncoding ?? ""
+                if let data = cpaAuthFiles[name] {
+                    respond(client, 200, "OK", data)
+                    return
+                }
+            }
+            respond(client, 404, "Not Found", "{\"error\":\"no file\"}")
+        case ("PATCH", "/v0/management/auth-files/fields"):
+            cpaPatchBody = bodyStr
+            if let obj = try? JSONSerialization.jsonObject(with: Data(bodyStr.utf8)) as? [String: Any],
+               let name = obj["name"] as? String, cpaAuthFiles[name] != nil {
+                cpaPatchName = name
+                if let pu = obj["proxy_url"] as? String,
+                   var fileObj = try? JSONSerialization.jsonObject(with: Data(cpaAuthFiles[name]!.utf8)) as? [String: Any] {
+                    fileObj["proxy_url"] = pu
+                    cpaAuthFiles[name] = String(data: try! JSONSerialization.data(withJSONObject: fileObj), encoding: .utf8)
+                }
+                respond(client, 200, "OK", "{\"ok\":true}")
+            } else {
+                respond(client, 404, "Not Found", "{\"error\":\"auth file not found\"}")
+            }
+        default:
+            respond(client, 404, "Not Found", "{}")
+        }
     }
 }
 
