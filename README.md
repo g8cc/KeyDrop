@@ -52,6 +52,19 @@ cp .build/release/KeyDrop ~/Applications/KeyDrop.app  # 或直接运行 .build/r
 ./make-dmg.sh     # 生成 dmg(带 Applications 拖拽)
 ```
 
+### 首次运行说明
+
+**被 Gatekeeper 拦截("无法验证开发者")**:本项目没有付费开发者证书,首次打开请右键 →「打开」,
+或到 系统设置 → 隐私与安全性 → 点「仍要打开」;命令行方式:`xattr -cr /Applications/KeyDrop.app`。
+
+**"文稿"授权弹窗**:KeyDrop 本身只读写家目录(`~/.keydrop`、`~/.cc-switch` 等),不碰受保护目录;
+只有当你的 CPA 配置放在 `~/Documents` 下时才会触发授权。重新构建(ad-hoc 签名)会让系统"忘记"
+之前的授权,两种解法任选:
+
+1. 钥匙串访问 → 证书助理 → 创建证书:名称 `KeyDropLocal`、证书类型「代码签名」(make-app.sh
+   检测到即自动使用;签名恒定后,授权一次永久记住);
+2. 或者把 CPA 配置目录移出 `~/Documents`,并同步修改 KeyDrop 里的 CPA 配置路径。
+
 ## 使用
 
 启动后出现在菜单栏,粘贴 key 内容点击导入即可。也可用命令行:
