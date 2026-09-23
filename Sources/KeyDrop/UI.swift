@@ -1675,7 +1675,7 @@ struct PanelView: View {
             case .available(let v, _, _):
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color(red: 0.28, green: 0.48, blue: 0.82))
+                    .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
                     .help("新版本 v\(v) 可更新!点击查看并更新")
             case .downloading(_, let p):
                 Text("\(Int(p * 100))%")
@@ -1683,7 +1683,7 @@ struct PanelView: View {
                     .foregroundStyle(Color(red: 0.28, green: 0.48, blue: 0.82))
                     .help("正在下载更新…点击查看详情")
             case .ready(let v):
-                Image(systemName: "arrow.up.circle.fill")
+                Image(systemName: "checkmark.seal.fill")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
                     .help("v\(v) 已下载就绪,点击重启完成更新")
@@ -2308,7 +2308,7 @@ struct UpdateSheet: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 6) {
                         Image(systemName: "arrow.up.circle.fill")
-                            .foregroundStyle(Color(red: 0.28, green: 0.48, blue: 0.82))
+                            .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
                         Text("v\(version) 可更新")
                             .font(.system(size: 13, weight: .semibold))
                     }
