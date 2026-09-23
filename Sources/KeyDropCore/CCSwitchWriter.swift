@@ -300,69 +300,17 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     }
 
     /// 计算 opencode 模型显示名的权威映射(modelKey -> {"name": displayName})。
-    /// cc-switch DB settings_config 与 opencode.json 两个写入路径必须共用同一份映射,
-    /// 否则各自随机后缀必然 drift(https://... 例:DB 里 3BEFE594 / opencode.json 里 FA4FEB90)。
-    /// 优先级:opencode.json 现有同名条目(保留用户已复制的名字)> 新随机后缀。
-    /// 匹配顺序:同 providerID > 同 baseURL(去重重建换 ID 时旧条目仍在 opencode.json)> 旧版聚合键 KeyDrop。
+    /// cc-switch DB settings_config 与 opencode.json 两个写入路径必须共用同一份映射。
+    /// 真实反馈(dc403556, 2026-09-23):旧版无条件加随机后缀(z-ai/glm-5.3-04FD84DE),
+    /// 用户复制后拿去中转站/其他客户端根本不认。v1.4.19 彻底移除后缀机制:
+    /// 显示名恒等于 API 真名 —— claude 目标走 ANTHROPIC_*_MODEL env(真 id),
+    /// opencode 的 /model 按 provider 命名空间天然消歧,后缀名从未解决过真问题。
+    /// 历史随机名在下次写入本条目时自动迁移回真名。
     /// 调用方:add() / repairMissingProvider() / syncModelsAfterRefresh() 必须只算一次,把结果传给两个 writer。
     func opencodeModelDict(providerID: String, baseURL: String?, models: [String]) -> [String: Any] {
-        var existing: [String: String] = [:]
-        // 异 provider 占用表:模型 ID → 对方显示名(缺省=ID)。同名模型在别的
-        // provider 里存在 → opencode /model 会撞名,才需要唯一后缀名
-        var foreignName: [String: String] = [:]
-        let normalizedTarget = baseURL.map { opencodeBaseURL($0) }
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: Self.opencodeConfigPath)),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let providers = obj["provider"] as? [String: Any] {
-            // 三路命中:精确 providerID(3)> 同 baseURL(2)> 旧版 KeyDrop 聚合键(1);高 level 先填
-            let levelOf: (String, Any) -> Int = { key, raw in
-                if key == providerID { return 3 }
-                if let target = normalizedTarget,
-                   let pd = raw as? [String: Any],
-                   let opts = pd["options"] as? [String: Any],
-                   let base = opts["baseURL"] as? String,
-                   base == target { return 2 }
-                if key == "KeyDrop" { return 1 }
-                return 0
-            }
-            let sorted = providers.sorted { levelOf($0.key, $0.value) > levelOf($1.key, $1.value) }
-            for (key, raw) in sorted {
-                guard levelOf(key, raw) > 0,
-                      let pd = raw as? [String: Any],
-                      let ms = pd["models"] as? [String: Any] else { continue }
-                for (mk, mv) in ms {
-                    if let name = (mv as? [String: Any])?["name"] as? String, !name.isEmpty,
-                       existing[mk] == nil {
-                        existing[mk] = name
-                    }
-                }
-            }
-            // 异 provider 占用扫描(level 0 = 非本条目、非同 baseURL、非旧聚合键)
-            for (key, raw) in providers where levelOf(key, raw) == 0 {
-                guard let pd = raw as? [String: Any],
-                      let ms = pd["models"] as? [String: Any] else { continue }
-                for (mk, mv) in ms {
-                    let dn = (mv as? [String: Any])?["name"] as? String
-                    if foreignName[mk] == nil { foreignName[mk] = dn ?? mk }
-                }
-            }
-        }
         var out: [String: Any] = [:]
         for m in models {
-            // 真实反馈(dc403556, 2026-09-23):无同名冲突也无条件加随机后缀,
-            // 用户复制的 z-ai/glm-5.3-04FD84DE 拿到中转站根本不认 —— 复制名必须
-            // 等于 API 真名。只有其它 provider 真的占用了同名模型才生成/沿用唯一名
-            let name: String
-            if let fd = foreignName[m] {
-                if let prev = existing[m], prev != fd {
-                    name = prev        // 冲突:沿用本条目已被复制过的唯一名(不折腾)
-                } else {
-                    name = Self.suffixedModelID(m)   // 冲突且无旧名:新生成唯一名
-                }
-            } else {
-                name = m               // 唯一:真名(历史随机名下次写入自动迁移)
-            }
-            out[m] = ["name": name]
+            out[m] = ["name": m]
         }
         return out
     }
@@ -598,36 +546,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         }
     }
 
-    /// 全局唯一的模型显示名: kimi-k3-<8位随机>。id 不动,名字唯一,opencode /model 直接搜名字即定位
-    static func suffixedModelID(_ m: String) -> String {
-        let rnd = String(UUID().uuidString.filter { $0.isHexDigit }.prefix(8))
-        return "\(m)-\(rnd)"
-    }
+    /// (已废弃)旧版唯一后缀名生成器,v1.4.19 起显示名恒为 API 真名
 
-    /// 复制用:模型显示名。唯一模型 = API 真名(拿到中转站/任意客户端都能用);
-    /// 在 opencode 里与其他 provider 撞名的模型 = 唯一后缀名(opencode /model 可唯一定位);
-    /// 不在 opencode 里则回退真名(直接拿去调 API 最有用)
+    /// 复制用:模型显示名 = API 真名(opencode.json 里的历史随机名会在下次写入时迁移;
+    /// 读取时若仍是旧后缀名,优先回退真名 —— 拿去任意客户端/中转站都能直接用)
     public static func copyModelName(for entry: HistoryEntry, model: String) -> String {
-        let path = opencodeConfigPath
-        if FileManager.default.fileExists(atPath: path),
-           let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let providers = obj["provider"] as? [String: Any] {
-            if let key = opencodeProviderKey(for: entry, model: model),
-               let pd = providers[key] as? [String: Any],
-               let models = pd["models"] as? [String: Any],
-               let me = models[model] as? [String: Any],
-               let name = me["name"] as? String {
-                return name
-            }
-            // 兼容旧版固定 KeyDrop provider key
-            if let pd = providers["KeyDrop"] as? [String: Any],
-               let models = pd["models"] as? [String: Any],
-               let me = models[model] as? [String: Any],
-               let name = me["name"] as? String {
-                return name
-            }
-        }
         return model
     }
 

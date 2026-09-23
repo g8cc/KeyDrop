@@ -449,19 +449,16 @@ enum CCSwitchWriterTests {
             t.equal(extractModelName(oc2, providerBase: "relay2.test", model: "kimi-k3"), "kimi-k3",
                     "迁移后显示名=真名")
 
-            // 3. 真撞名:另一 provider 占用同名 → 唯一后缀,且跨次写入稳定
+            // 3. 真撞名:另一 provider 占用同名 → 仍用真名(opencode /model 按 provider
+            // 命名空间展示,天然消歧;v1.4.19 彻底移除随机后缀机制)
             var p3 = ParsedKey()
             p3.key = "sk-name-003"
             p3.url = "https://relay3.test/v1"
-            let r3a = try! w.add(p3, appType: "opencode", models: ["kimi-k3"], proxy: nil)
-            let oc3 = env.read("opencode.json")
-            t.expect(oc3.contains("kimi-k3-"), "撞名时生成唯一后缀名")
-            let name3a = extractModelName(oc3, providerBase: "relay3.test", model: "kimi-k3")
             _ = try! w.add(p3, appType: "opencode", models: ["kimi-k3"], proxy: nil)
-            let name3b = extractModelName(env.read("opencode.json"), providerBase: "relay3.test", model: "kimi-k3")
-            t.expect(name3a != nil && name3a == name3b, "撞名后缀跨次写入稳定(不折腾用户)\(name3a ?? "?")")
-            t.expect(name3a != "kimi-k3", "撞名者的名字与真名不同")
-            _ = r3a
+            let oc3 = env.read("opencode.json")
+            t.expect(!oc3.contains("kimi-k3-"), "撞名也不加后缀:机制整体移除")
+            t.equal(extractModelName(oc3, providerBase: "relay3.test", model: "kimi-k3"), "kimi-k3",
+                    "撞名者显示名仍=真名")
         }
     }
 }
