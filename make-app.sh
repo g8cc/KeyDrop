@@ -32,6 +32,10 @@ echo "[4/4] 安装到 $INSTALL ..."
 rm -rf "$INSTALL"
 cp -R "$APP_BUNDLE" "$INSTALL"
 
+# 记录旧 pid:重启验证必须确认「旧进程消失 + 新进程出现」,
+# 否则 pkill 失效时旧进程会被 pgrep 误判成"新版本已启动"(真实事故 2026-09-24)
+OLD_PID="$(pgrep -f "$APP.app/Contents/MacOS" | head -1 || true)"
+
 pkill -f "$APP.app" 2>/dev/null || true
 # 等旧进程完全退出(最多 5s):进程残留时 LaunchServices 可能拒绝/静默丢弃新实例
 for _ in $(seq 1 10); do
@@ -48,19 +52,33 @@ echo "完成: $INSTALL"
 echo "启动: open $INSTALL"
 open "$INSTALL"
 
-# 启动验证(最多 5s),失败自动重试一次
+# 启动验证(最多 5s),失败自动重试一次。
+# 验证口径必须是「旧 pid 消失 + 新 pid 出现」:只看"有进程在跑"会把没杀掉的
+# 旧进程误判成新版本(真实事故 2026-09-24,v1.4.24 发布时重启静默失效)
+NEW_PID=""
 for _ in $(seq 1 10); do
-    pgrep -f "$APP.app/Contents/MacOS" >/dev/null 2>&1 && break
+    NEW_PID="$(pgrep -f "$APP.app/Contents/MacOS" | head -1 || true)"
+    if [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ]; then break; fi
     sleep 0.5
 done
-if pgrep -f "$APP.app/Contents/MacOS" >/dev/null 2>&1; then
-    echo "✓ 新版本已启动并运行"
+INSTALLED_VER="$(defaults read "$INSTALL/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo '?')"
+
+check_new() {
+    [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ]
+}
+
+if check_new; then
+    echo "✓ v$INSTALLED_VER 已启动并运行 (pid $NEW_PID)"
 else
     echo "启动验证失败,重试一次..."
     open "$INSTALL"
     sleep 2
-    if pgrep -f "$APP.app/Contents/MacOS" >/dev/null 2>&1; then
-        echo "✓ 新版本已启动(重试成功)"
+    NEW_PID="$(pgrep -f "$APP.app/Contents/MacOS" | head -1 || true)"
+    if check_new; then
+        echo "✓ v$INSTALLED_VER 已启动(重试成功, pid $NEW_PID)"
+    elif [ -n "$NEW_PID" ]; then
+        echo "⚠ 运行中的仍是旧进程 (pid $NEW_PID, 旧 $OLD_PID)——重启未生效,请手动退出后重开" >&2
+        exit 1
     else
         echo "✗ 启动失败,请手动执行: open $INSTALL" >&2
         exit 1

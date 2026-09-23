@@ -326,7 +326,7 @@ public final class CPAWriter {
         guard FileManager.default.fileExists(atPath: configPath) else {
             throw WriterError.file("CPA config 不存在: \(configPath)")
         }
-        let writeMsg = try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+        let writeMsg = try withWriteLock {
             try addMultiLocked(baseURL: baseURL, keys: [k], models: models, proxy: proxy)
         }
         return writeMsg.0
@@ -1018,11 +1018,23 @@ public final class CPAWriter {
     /// 且 KeyDrop 完全不触碰本地文件 —— flock 的锁文件也在 Documents 下,同样触发 TCC 弹窗
     private func withCPASync<T>(_ body: () throws -> T) throws -> T {
         if CPAAPI.apiMode { return try body() }
-        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+        return try withWriteLock {
             try Self.validateYAML(path: configPath)
             return try body()
         }
     }
+    /// 写路径统一锁入口。API 模式不取本地文件锁:写入经 CPA 服务端 PUT 串行化,
+    /// KeyDrop 对 Documents 下的 config.yaml 系文件零触碰 —— 无条件 open
+    /// config.yaml.keydrop-lock 正是 API 模式下仍弹「文稿」授权的残余源头
+    /// (真实事故:2026-09-24,导入时 addAggregated 无条件取锁,重新编译使
+    /// TCC 授权作废后,这次 open 即触发弹窗)
+    private func withWriteLock<T>(_ body: () throws -> T) rethrows -> T {
+        if CPAAPI.apiMode { return try body() }
+        return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
+            try body()
+        }
+    }
+
     private func configAvailable() -> Bool {
         CPAAPI.apiMode ? true : FileManager.default.fileExists(atPath: configPath)
     }
