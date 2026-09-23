@@ -874,7 +874,8 @@ public final class Core {
                 let px = self.proxyForHealth()
                 let test = APITester.test(url: e.url!, key: e.key!, timeout: 10,
                                           proxy: px, preferredModel: e.model,
-                                          modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t })
+                                          modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t },
+                                          importedModels: e.models)
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 let (h, d) = Self.healthFor(test)
                 var updated = e
@@ -1092,7 +1093,7 @@ public final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
         let px = proxyForHealth()
-        let test = APITester.test(url: url, key: key, proxy: px)
+        let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model, importedModels: entry.models)
         noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
         if test.ok {
@@ -1264,7 +1265,8 @@ public final class Core {
         guard let url = entry.url, let key = entry.key, !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
-        let test = APITester.test(url: url, key: key, proxy: effProxy)
+        let test = APITester.test(url: url, key: key, proxy: effProxy,
+                                  preferredModel: entry.model, importedModels: entry.models)
         guard test.ok else {
             let h = Self.healthFor(test)
             // 只改 health 不动 status:status="dead" 会让条目从 UI 全部列表消失,

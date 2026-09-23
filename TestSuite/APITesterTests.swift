@@ -444,6 +444,47 @@ enum APITesterTests {
             t.equal(Set(r3), Set(small), "[≤4] 全量探测")
         }
 
+        h.runSuite("APITester.导入模型优先") { t in
+            // 真实事故(dc403556, 2026-09-23):用户只导入 3 个模型,探测却拿站点全量
+            // 113 个模型轮换,两个导入的 GLM 排在 110 个未选模型后迟迟测不到,监控
+            // 一直灰格;而中转站面板“看着是好的”。回归:导入模型必须排在目录发现之前
+            let catalog = (["moonshotai/kimi-k3", "z-ai/glm-5.3-flash", "z-ai/glm-5.3"]
+                           + (1...110).map { "other-\($0)" })
+            let imported = ["moonshotai/kimi-k3", "z-ai/glm-5.3-flash", "z-ai/glm-5.3"]
+            let now: TimeInterval = 1_000_000
+
+            // 首轮(无历史):pref=kimi 置顶,两个 GLM 紧随其后,不得被目录模型挤掉
+            let r0 = APITester.chatProbeOrder(catalog, preferred: "moonshotai/kimi-k3",
+                                              importedModels: imported)
+            t.equal(r0.first, "moonshotai/kimi-k3", "[首轮] 激活模型置顶")
+            t.equal(Array(r0.suffix(3).prefix(2)), ["z-ai/glm-5.3-flash", "z-ai/glm-5.3"],
+                    "[首轮] 导入模型占据 2、3 槽,优先于 110 个目录模型")
+            t.expect(r0.count == 4 && r0[3].hasPrefix("other-"), "[首轮] 第 4 槽留给目录发现")
+
+            // 轮换轮(有历史):GLM 仍未测 → 仍最优先;已测的目录模型不得插队
+            let times = Dictionary(uniqueKeysWithValues: (1...110).map { ("other-\($0)", now - TimeInterval($0)) })
+            let r1 = APITester.chatProbeOrder(catalog, preferred: "moonshotai/kimi-k3",
+                                              modelProbeTimes: times, importedModels: imported)
+            t.equal(Array(r1.prefix(3)), ["moonshotai/kimi-k3", "z-ai/glm-5.3-flash", "z-ai/glm-5.3"],
+                    "[轮换] 从未测的导入模型压过 110 个从未测目录模型")
+
+            // GLM 已测后:不再重复占槽,槽位让给目录轮换
+            var times2 = times
+            times2["z-ai/glm-5.3-flash"] = now - 10
+            times2["z-ai/glm-5.3"] = now - 10
+            let r2 = APITester.chatProbeOrder(catalog, preferred: "moonshotai/kimi-k3",
+                                              modelProbeTimes: times2, importedModels: imported)
+            t.expect(!r2.contains("z-ai/glm-5.3-flash") && !r2.contains("z-ai/glm-5.3"),
+                    "[已测] 导入模型不重复占槽,目录轮换继续")
+
+            // 站点列表里已下架的导入模型:不探测(站点列表为准),也不占槽
+            let off = ["moonshotai/kimi-k3", "z-ai/glm-5.3", "removed-model"]
+            let r3 = APITester.chatProbeOrder(catalog, preferred: "moonshotai/kimi-k3",
+                                              importedModels: off)
+            t.expect(!r3.contains("removed-model"), "[下架] 已下架的导入模型不探测")
+            t.equal(r3[1], "z-ai/glm-5.3", "[下架] 在架导入模型仍优先")
+        }
+
         h.runSuite("APITester") { t in
             guard let server = try? MockHTTPServer() else {
                 t.expect(false, "mock server 启动失败")

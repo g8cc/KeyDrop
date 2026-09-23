@@ -191,9 +191,9 @@ public enum APITester {
 
     /// - Parameter preferredModel: 用户实际激活的模型(new-api TestModel 思路),探测时优先验证它
     /// - Parameter modelProbeTimes: 模型 → 上次被探测的时间戳(监控轮换用)。nil=不轮换
-    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil) -> APITestResult {
+    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil) -> APITestResult {
         // 先按真实环境(直连)测试;直连失败仅当配置了代理时才补测代理,并标记需代理
-        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes)
+        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
         if direct.ok || direct.authFailed {
             return direct
         }
@@ -201,7 +201,7 @@ public enum APITester {
         if p == nil || p!.isEmpty {
             return direct
         }
-        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes)
+        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
         if via.ok {
             return APITestResult(ok: true, style: via.style, models: via.models,
                                  detail: via.detail + " | 直连失败,需代理,经代理验证通过",
@@ -210,7 +210,7 @@ public enum APITester {
         return via
     }
 
-    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil) -> APITestResult {
+    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil) -> APITestResult {
         let base = url.hasSuffix("/") ? String(url.dropLast()) : url
         let candidates = endpointCandidates(base)
         let s = session(for: proxy)
@@ -258,7 +258,7 @@ public enum APITester {
                 // 任一模型 200/400/404 → key 可用;探测过的模型全部 quota → 才判无额度;
                 // 401/403 → key 失效短路。真实事故:4 模型中首选 composer 429、
                 // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
-                let probeOrder = chatProbeOrder(models, preferred: preferredModel, modelProbeTimes: modelProbeTimes)
+                let probeOrder = chatProbeOrder(models, preferred: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
                 var working: [String] = []
                 var quotaModels: [String] = []
                 var degradedModel: (String, Int)? = nil
@@ -335,20 +335,30 @@ public enum APITester {
 
     /// chat 探测模型采样:preferredModel(用户实际激活的模型)置顶 —— 显示可用
     /// 但用户用某个特定模型失败是高频反馈,探测必须优先覆盖它(new-api TestModel 思路);
-    /// 其次 free/试用字样(免费档最可能通,真实中转站常按模型限额),其余保序;
+    /// 其次用户显式导入的模型(真实事故 dc403556 反馈:只导入 3 个模型,探测却拿站
+    /// 点全量 113 个模型轮换,两个导入的 GLM 排在 110 个未选模型后面迟迟测不到);
+    /// 再次 free/试用字样(免费档最可能通,真实中转站常按模型限额),其余保序;
     /// 上限 4 个 —— 模型少全试不加压,模型多也只花 4 次请求
-    public static func chatProbeOrder(_ models: [String], preferred: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil) -> [String] {
+    public static func chatProbeOrder(_ models: [String], preferred: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil) -> [String] {
         let capped = models.isEmpty ? ["test"] : models
         let pref = preferred.map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
+        // 导入模型提升优先级:去重、且只保留站点当前列表里仍存在的(站方下架后不再探,
+        // 与「站点列表为准」一致);激活模型若同时在导入列表里,它已由 pref 置顶,不重复占槽
+        var importedInList: [String] = []
+        if let importedModels, !importedModels.isEmpty {
+            let seen = Set(importedModels)
+            importedInList = capped.filter { seen.contains($0) && $0 != pref }
+        }
         // 轮换语义:每轮仍只测 4 个(额度/时延下限),但激活模型置顶后,其余槽位按
         // 「从未测过 > 最久未测」轮换 —— 否则第 5 个以后的模型永远轮不到,灰格永不填
         // (真实反馈:模型条一直没进度,用户以为模型坏了)。N 个模型 ≈ ⌈(N-1)/3⌉ 轮全覆盖
         if let times = modelProbeTimes, !times.isEmpty, capped.count > 4 {
             var rest = capped
             if let pref, let pi = rest.firstIndex(of: pref) { rest.remove(at: pi) }
+            rest = rest.filter { !importedInList.contains($0) }
             let freeFirst = rest.filter { $0.lowercased().contains("free") }
             let others = rest.filter { !$0.lowercased().contains("free") }
-            let pool = freeFirst + others
+            let pool = importedInList + freeFirst + others
             let neverProbed = pool.filter { times[$0] == nil }
             let probed = pool.filter { times[$0] != nil }
                 .sorted { (times[$0] ?? 0) < (times[$1] ?? 0) }   // 最久未测优先
@@ -357,16 +367,20 @@ public enum APITester {
             order.append(contentsOf: (neverProbed + probed).prefix(4 - order.count))
             return order
         }
-        // preferred 绝对置顶(free 优先规则不得覆盖它),其余按 free 优先排序
+        // preferred 绝对置顶(free 优先规则不得覆盖它),导入模型次之,其余按 free 优先排序
         if let pref, capped.contains(pref) {
             let rest2 = capped.filter { $0 != pref }
-            let freeFirst = rest2.filter { $0.lowercased().contains("free") }
-            let others = rest2.filter { !$0.lowercased().contains("free") }
-            return Array(([pref] + freeFirst + others).prefix(4))
+            let importedRest = rest2.filter { importedInList.contains($0) }
+            let others = rest2.filter { !importedInList.contains($0) }
+            let freeFirst = others.filter { $0.lowercased().contains("free") }
+            let rest3 = others.filter { !$0.lowercased().contains("free") }
+            return Array(([pref] + importedRest + freeFirst + rest3).prefix(4))
         }
-        let freeFirst = capped.filter { $0.lowercased().contains("free") }
-        let rest = capped.filter { !$0.lowercased().contains("free") }
-        return Array((freeFirst + rest).prefix(4))
+        let importedOnly = capped.filter { importedInList.contains($0) }
+        let rest = capped.filter { !importedInList.contains($0) }
+        let freeFirst = rest.filter { $0.lowercased().contains("free") }
+        let others = rest.filter { !$0.lowercased().contains("free") }
+        return Array((importedOnly + freeFirst + others).prefix(4))
     }
 
     /// POST chat 健康检查结果
