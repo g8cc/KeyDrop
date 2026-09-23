@@ -256,18 +256,28 @@ public enum APITester {
                 // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
                 // chat 探测多模型(上限 4,free 字样模型优先):单个模型 429 不代表整 key 无额度。
                 // 任一模型 200/400/404 → key 可用;探测过的模型全部 quota → 才判无额度;
-                // 401/403 → key 失效短路。真实事故:4 模型中首选 composer 429、
+                // 401/403 仅在没有任何可用模型时才判 key 失效(见下方 gatedModels 注释)。
+                // 真实事故:4 模型中首选 composer 429、
                 // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
                 let probeOrder = chatProbeOrder(models, preferred: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
                 var working: [String] = []
                 var quotaModels: [String] = []
                 var degradedModel: (String, Int)? = nil
                 var authModel: (String, Int)? = nil
+                var gatedModels: [String] = []
                 var firstWorkingLatency: Double? = nil
                 var modelLatencies: [String: Double] = [:]
                 for probe in probeOrder {
                     let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe)
-                    if let st = chat.authStatus { authModel = (probe, st); break }
+                    if let st = chat.authStatus {
+                        // 401/403 曾经一律判「key 失效」短路。真实事故(vyceai, 2026-09-23):
+                        // 站点按模型限权 —— 同一把 key,deepseek-v4.1 chat 200,而
+                        // qwen3.8-flash 403;首选模型已探活时,403 只说明该模型不对这把
+                        // key 开放,不是 key 死了。有可用模型就继续,403 只记账
+                        if working.isEmpty { authModel = (probe, st); break }
+                        gatedModels.append(probe)
+                        continue
+                    }
                     if let ms = chat.latencyMs { modelLatencies[probe] = ms }
                     if chat.quota != nil { quotaModels.append(probe); continue }
                     if let st = chat.degraded {
@@ -286,11 +296,12 @@ public enum APITester {
                 let hasRealModels = !models.isEmpty
                 if !working.isEmpty {
                     let q = quotaModels.isEmpty ? "" : ",其中 \(quotaModels.count) 个模型限流(\(quotaModels.prefix(3).joined(separator: "、"))\(quotaModels.count > 3 ? " 等" : ""))"
+                    let g = gatedModels.isEmpty ? "" : ",\(gatedModels.count) 个模型本 key 无权限(\(gatedModels.prefix(2).joined(separator: "、"))\(gatedModels.count > 2 ? " 等" : ""))"
                     let reordered = hasRealModels
                         ? (working + models.filter { !Set(working + quotaModels).contains($0) } + quotaModels)
                         : models
                     return APITestResult(ok: true, style: style, models: reordered,
-                                         detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q,
+                                         detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q + g,
                                          authFailed: false,
                                          workingModels: hasRealModels ? working : [], quotaModels: hasRealModels ? quotaModels : [],
                                          latencyMs: firstWorkingLatency,

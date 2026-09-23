@@ -27,7 +27,7 @@ enum UpdateError: LocalizedError {
 final class Updater {
     static let shared = Updater()
 
-    private let repo = "g8cc/KeyDrop"
+    private static let repo = "g8cc/KeyDrop"
     private let apiURL: URL? = URL(string: "https://api.github.com/repos/g8cc/KeyDrop/releases/latest")
 
     enum State: Equatable {
@@ -87,6 +87,16 @@ final class Updater {
                 if http.statusCode == 404 {
                     self.defaults.set(Date().timeIntervalSince1970, forKey: self.lastCheckKey)
                     self.setState(.upToDate)
+                    return
+                }
+                // GitHub API 匿名配额按出口 IP 计(60 次/时),共享代理出口 IP 常被
+                // 同节点用户耗光 → 403/429(真实事故:2026-09-23,代理 146.70.x.x)。
+                // 兜底:github.com/<repo>/releases/latest 的 302 Location 自带版本号,
+                // 不走 api.github.com 配额。失败才报错,报错文案带上限流语义。
+                if http.statusCode == 403 || http.statusCode == 429 {
+                    Self.fetchLatestByRedirect(proxy: Prefs.shared.proxy) { [weak self] version, err in
+                        self?.handleRedirectCheck(version, err: err)
+                    }
                     return
                 }
                 self.setState(.failed("检查更新失败: HTTP \(http.statusCode)"))
@@ -363,18 +373,84 @@ final class Updater {
     /// 代理为空 → 系统默认会话
     private static func urlSession(proxy: String?) -> URLSession {
         guard let p = proxy?.trimmingCharacters(in: .whitespaces), !p.isEmpty,
-              let u = URL(string: p), let host = u.host,
-              u.scheme?.lowercased().hasPrefix("http") == true else { return .shared }
-        let port = u.port ?? (u.scheme?.lowercased() == "https" ? 443 : 80)
+              URL(string: p)?.host != nil, URL(string: p)?.scheme?.lowercased().hasPrefix("http") == true
+        else { return .shared }
+        return URLSession(configuration: proxyConfig(proxy))
+    }
+
+    private static func proxyConfig(_ proxy: String?) -> URLSessionConfiguration {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 30
-        cfg.connectionProxyDictionary = [
-            kCFNetworkProxiesHTTPProxy as String: host,
-            kCFNetworkProxiesHTTPPort as String: port,
-            kCFNetworkProxiesHTTPSProxy as String: host,
-            kCFNetworkProxiesHTTPSPort as String: port,
-        ]
-        return URLSession(configuration: cfg)
+        if let p = proxy?.trimmingCharacters(in: .whitespaces), !p.isEmpty,
+           let u = URL(string: p), let host = u.host,
+           u.scheme?.lowercased().hasPrefix("http") == true {
+            let port = u.port ?? (u.scheme?.lowercased() == "https" ? 443 : 80)
+            cfg.connectionProxyDictionary = [
+                kCFNetworkProxiesHTTPProxy as String: host,
+                kCFNetworkProxiesHTTPPort as String: port,
+                kCFNetworkProxiesHTTPSProxy as String: host,
+                kCFNetworkProxiesHTTPSPort as String: port,
+            ]
+        }
+        return cfg
+    }
+
+    /// 只取 302 的目标 URL 就停,不跟进重定向(release 页面没必要拉下来)
+    private final class RedirectCapture: NSObject, URLSessionDataDelegate {
+        var target: URL?
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            target = request.url
+            completionHandler(nil)
+        }
+    }
+
+    /// 限流兜底:GET releases/latest 拿 302 Location 里的 tag,不占 API 配额
+    private static func fetchLatestByRedirect(proxy: String?, completion: @escaping (_ version: String?, _ err: String?) -> Void) {
+        guard let base = URL(string: "https://github.com/\(repo)/releases/latest") else {
+            completion(nil, "URL 无效"); return
+        }
+        var req = URLRequest(url: base)
+        req.timeoutInterval = 10
+        req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
+        let cap = RedirectCapture()
+        let sess = URLSession(configuration: proxyConfig(proxy), delegate: cap, delegateQueue: nil)
+        sess.dataTask(with: req) { _, resp, err in
+            sess.invalidateAndCancel()
+            if let err { completion(nil, err.localizedDescription); return }
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+            guard (300...399).contains(status), let loc = cap.target else {
+                completion(nil, "HTTP \(status),无重定向")
+                return
+            }
+            guard let v = Version.fromTagPath(loc.path) else {
+                completion(nil, "重定向路径解析不出版本: \(loc.path)")
+                return
+            }
+            completion(v, nil)
+        }.resume()
+    }
+
+    /// 兜底检查结果落状态。此通道拿不到发布说明与 sha256 digest:
+    /// notes 置空、pendingDigest 置 nil,安装前仍靠 codesign 严格校验把关
+    private func handleRedirectCheck(_ version: String?, err: String?) {
+        guard let version else {
+            setState(.failed("检查更新失败: GitHub API 限流(403),兜底通道也失败: \(err ?? "未知")"))
+            return
+        }
+        defaults.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
+        guard Version.compare(version, Self.currentVersion()) == .orderedDescending else {
+            setState(.upToDate); return
+        }
+        // 资产名由 make release 固定为 KeyDrop-v<版本>.zip;若改命名需同步这里
+        guard let asset = URL(string: "https://github.com/\(Self.repo)/releases/download/v\(version)/KeyDrop-v\(version).zip") else {
+            setState(.failed("检查更新失败: 兜底安装包地址无效"))
+            return
+        }
+        pendingDigest = nil
+        setState(.available(version: version, url: asset, notes: ""))
     }
 
     private func setState(_ s: State) {

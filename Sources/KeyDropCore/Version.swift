@@ -2,6 +2,17 @@ import Foundation
 
 /// 版本号解析与比较:纯逻辑,供应用更新与测试共用
 public enum Version {
+    /// 从 GitHub releases/latest 的 302 重定向路径抠版本号:
+    /// "/g8cc/KeyDrop/releases/tag/v1.4.24" → "1.4.24";非版本 tag 路径 → nil。
+    /// 用于 API 限流(HTTP 403)时的兜底检查通道 —— 302 Location 不占 api.github.com 配额
+    public static func fromTagPath(_ path: String) -> String? {
+        guard let r = path.range(of: "/releases/tag/") else { return nil }
+        var v = String(path[r.upperBound...])
+        if v.hasPrefix("v") { v = String(v.dropFirst()) }
+        guard let f = v.first, f.isNumber else { return nil }
+        return v
+    }
+
     /// 语义化版本比较:a > b → .orderedDescending;支持 v 前缀与多段数字(1.0.0.1),忽略 -后缀
     public static func compare(_ a: String, _ b: String) -> ComparisonResult {
         func nums(_ s: String) -> [Int] {

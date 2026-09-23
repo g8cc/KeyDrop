@@ -223,7 +223,13 @@ public final class Core {
         var addHealth: (health: String, detail: String)? = nil
         var probedNeedsProxy = false
         if !force {
-            let test = APITester.test(url: url, key: key, proxy: proxyURL)
+            // 必须带上解析出的模型做优先探测。真实事故(vyceai, 2026-09-23):粘贴块里
+            // 带了模型 deepseek-v4.1,但这里没传 preferredModel,探测按站点目录轮换,
+            // 第二个就撞上该站对部分模型按 key 限权(qwen3.8-flash 403),整次导入被误判
+            // 失败;手测 deepseek-v4.1 chat 200 完全正常。v1.4.17 修了监控/重测/单条目
+            // 三处调用,唯独漏了导入这条路径。
+            let test = APITester.test(url: url, key: key, proxy: proxyURL,
+                                      preferredModel: parsed.model, importedModels: parsed.models)
             noteProxyWorked(needsProxy: test.needsProxy, used: proxyURL)
             if !test.ok {
                 throw ParseError.io("测试失败,未写入。\(test.detail)\n(确认真实或 --force 跳过测试)")

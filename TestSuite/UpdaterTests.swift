@@ -18,5 +18,17 @@ enum UpdaterTests {
             t.equal(Version.compare("1.foo.5", "1.2.0"), .orderedAscending, "非数字段按 0 保留段位")
             t.equal(Version.compare("1.2.0", "1.foo.5"), .orderedDescending, "非数字段比较对称")
         }
+
+        h.runSuite("Updater.403兜底") { t in
+            // 真实事故(2026-09-23):共享代理出口 IP 匿名配额耗光,api.github.com 403,
+            // 检查更新直接报错。兜底通道从 releases/latest 的 302 路径抠版本号
+            t.equal(Version.fromTagPath("/g8cc/KeyDrop/releases/tag/v1.4.24"), "1.4.24", "标准 tag 路径")
+            t.equal(Version.fromTagPath("https://github.com/g8cc/KeyDrop/releases/tag/2.0.0"),
+                    "2.0.0", "绝对 URL 串按子串匹配照样解析")
+            t.expect(Version.fromTagPath("/g8cc/KeyDrop/releases/tag/latest") == nil, "非版本 tag 不误判")
+            t.expect(Version.fromTagPath("/g8cc/KeyDrop/releases") == nil, "无 tag 段返回 nil")
+            t.expect(Version.fromTagPath("/releases/tag/") == nil, "空 tag 返回 nil")
+            t.expect(Version.fromTagPath("/releases/tag/v") == nil, "裸 v 前缀返回 nil")
+        }
     }
 }
