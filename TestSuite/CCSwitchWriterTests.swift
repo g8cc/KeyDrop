@@ -27,6 +27,21 @@ enum CCSwitchWriterTests {
     }
 
     static func run(_ h: Harness) {
+        // 从 opencode.json 里抠出指定 provider(按 baseURL 片段定位)某模型的显示名
+        func extractModelName(_ json: String, providerBase: String, model: String) -> String? {
+            guard let cfg = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
+                  let provs = cfg["provider"] as? [String: Any] else { return nil }
+            for (_, raw) in provs {
+                guard let pd = raw as? [String: Any],
+                      let opts = pd["options"] as? [String: Any],
+                      let base = opts["baseURL"] as? String,
+                      base.contains(providerBase),
+                      let ms = pd["models"] as? [String: Any],
+                      let mv = ms[model] as? [String: Any] else { continue }
+                return mv["name"] as? String
+            }
+            return nil
+        }
         h.runSuite("CCSwitchWriter") { t in
             let env = try! TestEnv("cc")
             defer { env.cleanup() }
@@ -383,6 +398,70 @@ enum CCSwitchWriterTests {
             t.contains(keep, "shangtang", "用户手写的 shangtang 模型保留(曾被整行覆盖过)")
             t.expect(!keep.contains("zzz-new"), "未把新模型塞进用户行")
             // localhost 与 127.0.0.1 归一:同一端点即认定为用户手写
+        }
+
+        h.runSuite("CCSwitchWriter.导入名唯一性") { t in
+            // 真实反馈(dc403556, 2026-09-23):唯一模型也被无条件加随机后缀,
+            // 用户复制 z-ai/glm-5.3-04FD84DE 去中转站根本不认。回归:
+            // 无撞名 → 真名(历史随机名迁移);有撞名 → 唯一后缀且跨次写入稳定
+            let env = try! TestEnv("cc-name")
+            defer { env.cleanup() }
+            try! createSchema(env)
+            let w = CCSwitchWriter()
+
+            // 1. 唯一模型:显示名 = 真名,无随机后缀
+            var p1 = ParsedKey()
+            p1.key = "sk-name-001"
+            p1.url = "https://relay1.test/v1"
+            _ = try! w.add(p1, appType: "opencode", models: ["z-ai/glm-5.3"], proxy: nil)
+            let oc1 = env.read("opencode.json")
+            t.contains(oc1, "\"z-ai/glm-5.3\"", "唯一模型写入 opencode.json")
+            t.expect(!oc1.contains("z-ai/glm-5.3-"), "唯一模型无随机后缀,复制名=真名")
+
+            // 2. 历史随机名迁移:模拟旧版 KeyDrop 写入的后缀名,同 key+URL 重导入后回真名
+            var p2 = ParsedKey()
+            p2.key = "sk-name-002"
+            p2.url = "https://relay2.test/v1"
+            _ = try! w.add(p2, appType: "opencode", models: ["kimi-k3"], proxy: nil)
+            // 把 opencode.json 里该 provider 的显示名改成旧版生成的随机后缀(模拟历史状态)
+            let before2 = env.read("opencode.json")
+            var cfg2 = (try! JSONSerialization.jsonObject(with: Data(before2.utf8))) as! [String: Any]
+            var provs2 = cfg2["provider"] as! [String: Any]
+            for (k, raw) in provs2 {
+                guard var pd = raw as? [String: Any],
+                      let opts = pd["options"] as? [String: Any],
+                      let base = opts["baseURL"] as? String,
+                      base.contains("relay2.test"),
+                      var ms = pd["models"] as? [String: Any],
+                      var mv = ms["kimi-k3"] as? [String: Any] else { continue }
+                mv["name"] = "kimi-k3-04FD84DE"
+                ms["kimi-k3"] = mv
+                pd["models"] = ms
+                provs2[k] = pd
+            }
+            cfg2["provider"] = provs2
+            let out2 = try! JSONSerialization.data(withJSONObject: cfg2)
+            env.write("opencode.json", String(data: out2, encoding: .utf8)!)
+            t.expect(env.read("opencode.json").contains("kimi-k3-04FD84DE"), "预埋旧后缀名成功")
+            _ = try! w.add(p2, appType: "opencode", models: ["kimi-k3"], proxy: nil)
+            let oc2 = env.read("opencode.json")
+            t.expect(!oc2.contains("kimi-k3-04FD84DE"), "历史随机名已被迁移")
+            t.equal(extractModelName(oc2, providerBase: "relay2.test", model: "kimi-k3"), "kimi-k3",
+                    "迁移后显示名=真名")
+
+            // 3. 真撞名:另一 provider 占用同名 → 唯一后缀,且跨次写入稳定
+            var p3 = ParsedKey()
+            p3.key = "sk-name-003"
+            p3.url = "https://relay3.test/v1"
+            let r3a = try! w.add(p3, appType: "opencode", models: ["kimi-k3"], proxy: nil)
+            let oc3 = env.read("opencode.json")
+            t.expect(oc3.contains("kimi-k3-"), "撞名时生成唯一后缀名")
+            let name3a = extractModelName(oc3, providerBase: "relay3.test", model: "kimi-k3")
+            _ = try! w.add(p3, appType: "opencode", models: ["kimi-k3"], proxy: nil)
+            let name3b = extractModelName(env.read("opencode.json"), providerBase: "relay3.test", model: "kimi-k3")
+            t.expect(name3a != nil && name3a == name3b, "撞名后缀跨次写入稳定(不折腾用户)\(name3a ?? "?")")
+            t.expect(name3a != "kimi-k3", "撞名者的名字与真名不同")
+            _ = r3a
         }
     }
 }

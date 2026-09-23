@@ -307,6 +307,9 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     /// 调用方:add() / repairMissingProvider() / syncModelsAfterRefresh() 必须只算一次,把结果传给两个 writer。
     func opencodeModelDict(providerID: String, baseURL: String?, models: [String]) -> [String: Any] {
         var existing: [String: String] = [:]
+        // 异 provider 占用表:模型 ID → 对方显示名(缺省=ID)。同名模型在别的
+        // provider 里存在 → opencode /model 会撞名,才需要唯一后缀名
+        var foreignName: [String: String] = [:]
         let normalizedTarget = baseURL.map { opencodeBaseURL($0) }
         if let data = try? Data(contentsOf: URL(fileURLWithPath: Self.opencodeConfigPath)),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -334,10 +337,31 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                     }
                 }
             }
+            // 异 provider 占用扫描(level 0 = 非本条目、非同 baseURL、非旧聚合键)
+            for (key, raw) in providers where levelOf(key, raw) == 0 {
+                guard let pd = raw as? [String: Any],
+                      let ms = pd["models"] as? [String: Any] else { continue }
+                for (mk, mv) in ms {
+                    let dn = (mv as? [String: Any])?["name"] as? String
+                    if foreignName[mk] == nil { foreignName[mk] = dn ?? mk }
+                }
+            }
         }
         var out: [String: Any] = [:]
         for m in models {
-            let name = existing[m] ?? Self.suffixedModelID(m)
+            // 真实反馈(dc403556, 2026-09-23):无同名冲突也无条件加随机后缀,
+            // 用户复制的 z-ai/glm-5.3-04FD84DE 拿到中转站根本不认 —— 复制名必须
+            // 等于 API 真名。只有其它 provider 真的占用了同名模型才生成/沿用唯一名
+            let name: String
+            if let fd = foreignName[m] {
+                if let prev = existing[m], prev != fd {
+                    name = prev        // 冲突:沿用本条目已被复制过的唯一名(不折腾)
+                } else {
+                    name = Self.suffixedModelID(m)   // 冲突且无旧名:新生成唯一名
+                }
+            } else {
+                name = m               // 唯一:真名(历史随机名下次写入自动迁移)
+            }
             out[m] = ["name": name]
         }
         return out
@@ -580,7 +604,9 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         return "\(m)-\(rnd)"
     }
 
-    /// 复制用:模型在 opencode 里实际存的显示名;不在 opencode 里则回退 模型-条目ID前8位(稳定)
+    /// 复制用:模型显示名。唯一模型 = API 真名(拿到中转站/任意客户端都能用);
+    /// 在 opencode 里与其他 provider 撞名的模型 = 唯一后缀名(opencode /model 可唯一定位);
+    /// 不在 opencode 里则回退真名(直接拿去调 API 最有用)
     public static func copyModelName(for entry: HistoryEntry, model: String) -> String {
         let path = opencodeConfigPath
         if FileManager.default.fileExists(atPath: path),
@@ -602,7 +628,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 return name
             }
         }
-        return "\(model)-\(entry.id.prefix(8))"
+        return model
     }
 
     /// 找出该条目对应的模型在 opencode.json 中实际归属的 provider key
