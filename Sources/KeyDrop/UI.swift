@@ -736,23 +736,18 @@ final class AppState: ObservableObject {
 // MARK: - History row
 
 struct HistoryRow: View {
-    /// 单模型监控格条:该模型的采集轨迹;未采集显示浅灰待采格
+    /// 单模型监控格条:该模型的采集轨迹;未采集显示浅灰待采格。
+    /// 两种状态都用固定格宽 → 总宽恒定,不随模型名长短/记录数变化(用户反馈:有的宽有的窄)
     @ViewBuilder
     private func modelSparkline(_ m: String) -> some View {
         let log = entry.modelProbeLog?[m] ?? []
         if log.isEmpty {
-            HStack(spacing: 2) {
-                ForEach(0..<12, id: \.self) { _ in
-                    RoundedRectangle(cornerRadius: 1.5)
-                        .fill(Color.secondary.opacity(0.10))
-                        .frame(width: 6, height: 10)
-                }
-            }
-            .help("该模型尚未被探测(每轮只测 4 个:激活模型置顶,其余按「从未测过→最久未测」轮换,几轮内全覆盖);灰=无证据,≠不可用")
+            MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6)
+                .help("该模型尚未被探测(每轮只测 4 个:激活模型置顶,其余按「从未测过→最久未测」轮换,几轮内全覆盖);灰=无证据,≠不可用")
         } else {
             let okc = log.filter { $0.ok }.count
             let up = Int((Double(okc) / Double(log.count) * 100).rounded())
-            MonitorSparkline(log: log, slots: 14, height: 14)
+            MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6)
                 .help("绿=通过<3s · 黄=通过3-8s · 紫=通过≥8s(慢) · 红=失败;悬停单格看当次详情")
             Text("\(up)%")
                 .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
@@ -2155,6 +2150,9 @@ struct MonitorSparkline: View {
     var height: CGFloat = 20
     /// 最新格脉冲动画(status page 惯例:当前采集周期呼吸闪烁)—— 总览大图用
     var pulseLatest = false
+    /// 固定格宽:设置后所有格(含未采集灰格)等宽固定,总宽 = slots×cellWidth+(slots-1)×spacing,
+    /// 不随行内其他元素/记录数变化(用户反馈:监控条有的宽有的窄)
+    var cellWidth: CGFloat? = nil
     @State private var pulsing = false
 
     var body: some View {
@@ -2164,14 +2162,15 @@ struct MonitorSparkline: View {
             ForEach(0..<max(pad, 0), id: \.self) { _ in
                 RoundedRectangle(cornerRadius: 2)
                     .fill(Color.secondary.opacity(0.13))
-                    .frame(maxWidth: .infinity)
-                    .frame(height: height)
+                    .frame(width: cellWidth, height: height)
+                    .frame(maxWidth: cellWidth == nil ? .infinity : nil)
                     .help("该周期未采集(随自动扫描/↻ 重测逐渐填满)")
             }
             ForEach(Array(points.enumerated()), id: \.offset) { i, p in
                 let isLatest = i == points.count - 1
                 StatusCell(point: p, uptime: uptimePercent, height: height,
-                           pulse: pulseLatest && isLatest, pulsing: $pulsing)
+                           pulse: pulseLatest && isLatest, pulsing: $pulsing,
+                           cellWidth: cellWidth)
             }
         }
     }
@@ -2191,11 +2190,14 @@ struct StatusCell: View {
     let height: CGFloat
     let pulse: Bool
     @Binding var pulsing: Bool
+    /// 固定格宽(nil = 弹性填满,总览大图用)
+    var cellWidth: CGFloat? = nil
 
     var body: some View {
         let base = RoundedRectangle(cornerRadius: 2)
             .fill(Self.cellColor(point))
-            .frame(maxWidth: .infinity)
+            .frame(width: cellWidth, height: height)
+            .frame(maxWidth: cellWidth == nil ? .infinity : nil)
             .frame(height: height)
         Group {
             if pulse {
