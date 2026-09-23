@@ -30,7 +30,7 @@ final class Updater {
     private let repo = "g8cc/KeyDrop"
     private let apiURL: URL? = URL(string: "https://api.github.com/repos/g8cc/KeyDrop/releases/latest")
 
-    enum State {
+    enum State: Equatable {
         case idle
         case checking
         case available(version: String, url: URL, notes: String)
@@ -46,6 +46,9 @@ final class Updater {
     private var downloadTask: URLSessionDownloadTask?
     /// 发布资产声明的 sha256(GitHub asset.digest)。若存在,安装前校验下载包完整性
     private var pendingDigest: String?
+    /// 已下载就绪的更新包(.ready 态):用户确认重启后才真正替换安装
+    private var pendingArchive: (url: URL, version: String)?
+    private var progressTimer: Timer?
     private let lastCheckKey = "updateLastCheckAt"
     private let promptedVersionKey = "updatePromptedVersion"
 
@@ -70,7 +73,7 @@ final class Updater {
         var req = URLRequest(url: apiURL)
         req.timeoutInterval = 10
         req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+        Self.urlSession(proxy: Prefs.shared.proxy).dataTask(with: req) { [weak self] data, resp, err in
             guard let self else { return }
             if let err {
                 self.setState(.failed("检查更新失败: \(err.localizedDescription)"))
@@ -131,14 +134,15 @@ final class Updater {
         return true
     }
 
-    /// 下载 zip → 解压 → 替换运行中的 app → 重启
-    func downloadAndInstall() {
+    /// 自动下载新包;完成停在 .ready,等用户确认后 applyUpdate() 才替换重启。
+    /// (产品决策:自动下载可以,静默重启不行 —— 重启会打断用户正在用的会话)
+    func startDownload() {
         guard case .available(let version, let url, _) = state else { return }
         state = .downloading(version: version, progress: 0)
         var req = URLRequest(url: url)
         req.timeoutInterval = 300
         req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
-        let task = URLSession.shared.downloadTask(with: req) { [weak self] fileURL, resp, err in
+        let task = Self.urlSession(proxy: Prefs.shared.proxy).downloadTask(with: req) { [weak self] fileURL, resp, err in
             guard let self else { return }
             self.downloadTask = nil
             if let err {
@@ -161,15 +165,36 @@ final class Updater {
                 self.setState(.failed("更新包过大(\(size / 1_000_000)MB),已取消"))
                 return
             }
-            self.install(archive: fileURL, version: version)
+            self.progressTimer?.invalidate()
+            self.pendingArchive = (url: fileURL, version: version)
+            self.setState(.ready(version: version))
         }
         downloadTask = task
         task.resume()
+        // 轮询下载进度(downloadTask 回调式 API 不推进度;面板/菜单都要展示百分比)
+        progressTimer?.invalidate()
+        let v = version
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self, let t = self.downloadTask else { return }
+            let total = t.countOfBytesExpectedToReceive
+            let got = t.countOfBytesReceived
+            guard total > 0 else { return }
+            self.setState(.downloading(version: v, progress: min(Double(got) / Double(total), 1.0)))
+        }
+    }
+
+    /// 用户确认后:替换运行中的 app 并重启(只有 .ready 态可用)
+    func applyUpdate() {
+        guard case .ready = state, let a = pendingArchive else { return }
+        progressTimer?.invalidate()
+        install(archive: a.url, version: a.version)
     }
 
     func cancelDownload() {
+        progressTimer?.invalidate()
         downloadTask?.cancel()
         downloadTask = nil
+        pendingArchive = nil
         // 取消后必须把状态清掉,否则 UI 永远停在「下载中」
         setState(.idle)
     }
@@ -332,6 +357,24 @@ final class Updater {
 
     private static func shellEscape(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// 更新请求走用户配置的本机代理(GitHub API/资产下载在部分网络直连不可达);
+    /// 代理为空 → 系统默认会话
+    private static func urlSession(proxy: String?) -> URLSession {
+        guard let p = proxy?.trimmingCharacters(in: .whitespaces), !p.isEmpty,
+              let u = URL(string: p), let host = u.host,
+              u.scheme?.lowercased().hasPrefix("http") == true else { return .shared }
+        let port = u.port ?? (u.scheme?.lowercased() == "https" ? 443 : 80)
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 30
+        cfg.connectionProxyDictionary = [
+            kCFNetworkProxiesHTTPProxy as String: host,
+            kCFNetworkProxiesHTTPPort as String: port,
+            kCFNetworkProxiesHTTPSProxy as String: host,
+            kCFNetworkProxiesHTTPSPort as String: port,
+        ]
+        return URLSession(configuration: cfg)
     }
 
     private func setState(_ s: State) {

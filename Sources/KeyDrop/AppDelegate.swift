@@ -300,6 +300,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let item = NSMenuItem(title: "⬇︎ 下载 v\(version) \(pct)%", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
+        case .ready(let version):
+            let item = NSMenuItem(
+                title: "✅ v\(version) 已下载 · 点击重启完成更新",
+                action: #selector(applyUpdateAction),
+                keyEquivalent: ""
+            )
+            item.target = self
+            menu.addItem(item)
         case .installing:
             let item = NSMenuItem(title: "正在安装,即将重启…", action: nil, keyEquivalent: "")
             item.isEnabled = false
@@ -320,6 +328,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updater.checkForUpdates(force: true)
     }
 
+    @objc private func applyUpdateAction() {
+        updater.applyUpdate()
+    }
+
     @objc private func promptUpdate() {
         guard case .available(let version, _, _) = updater.state else { return }
         let alert = NSAlert()
@@ -330,11 +342,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         alert.addButton(withTitle: "以后再说")
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertFirstButtonReturn {
-            updater.downloadAndInstall()
+            updater.startDownload()
         }
     }
 
     private func handleUpdateState(_ state: Updater.State) {
+        // 同步到面板:更新图标/更新 sheet 从这里感知状态
+        self.state.updateState = state
         switch state {
         case .available(let version, _, _):
             AppLog.info("发现新版本 v\(version)")
