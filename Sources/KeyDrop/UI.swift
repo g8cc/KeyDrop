@@ -1669,6 +1669,14 @@ struct PanelView: View {
     @ViewBuilder
     private var updateIndicator: some View {
         Button {
+            // 无更新/失败态:点击 = 立即强制检查,面板同步打开实时看结果。
+            // (真实反馈:用户点「刷新样子的图标」预期就是检查,只开面板不查
+            // 会让人对着旧的「已最新」发懵)
+            switch state.updateState {
+            case .idle, .upToDate, .failed:
+                Updater.shared.checkForUpdates(force: true)
+            default: break
+            }
             state.updateSheetShown = true
         } label: {
             switch state.updateState {
