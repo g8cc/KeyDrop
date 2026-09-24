@@ -1649,7 +1649,9 @@ struct PanelView: View {
                 ))
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 10, design: .monospaced))
-                .frame(width: 132)
+                // 150 = 「http://127.0.0.1:7890」21 字符 10pt 等宽全宽 + 余量;
+                // 132 时末位数字被裁(真实反馈:7890 只显示到 789)
+                .frame(width: 150)
                 .focused($proxyFieldFocused)
                 .onSubmit { state.commitProxy() }
                 .onChange(of: proxyFieldFocused) { _, focused in
