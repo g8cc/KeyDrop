@@ -29,6 +29,12 @@ else
 fi
 
 echo "[4/4] 安装到 $INSTALL ..."
+if [ "${KEYDROP_SKIP_INSTALL:-0}" = "1" ]; then
+    # 发布模式:只出包,不装本机。用户面板的绿色↑会亮,由用户通过
+    # 更新流程自行升级 —— 开发机不该偷偷绕过自己做的更新确认
+    echo "跳过本地安装与重启(KEYDROP_SKIP_INSTALL=1,仅出包)"
+    exit 0
+fi
 rm -rf "$INSTALL"
 cp -R "$APP_BUNDLE" "$INSTALL"
 
