@@ -1664,48 +1664,49 @@ struct PanelView: View {
         .padding(.bottom, 8)
     }
 
-    /// 软件更新指示器:有新版本时亮蓝色上箭头(用户要的“界面自动显示更新 icon”),
-    /// 下载中显示百分比,就绪显示绿色重启;无更新时是最不显眼的检查入口
+    /// 软件更新指示器:cc-switch 风格 —— 无更新时不显示任何东西,
+    /// 有新版本才亮绿色 ↑(下载中=百分比,就绪=绿色对勾印章)。
+    /// 用户确认的口径:「有新版本的时候才显示」;手动检查走菜单栏「检查更新…」
     @ViewBuilder
     private var updateIndicator: some View {
-        Button {
-            // 无更新/失败态:点击 = 立即强制检查,面板同步打开实时看结果。
-            // (真实反馈:用户点「刷新样子的图标」预期就是检查,只开面板不查
-            // 会让人对着旧的「已最新」发懵)
-            switch state.updateState {
-            case .idle, .upToDate, .failed:
-                Updater.shared.checkForUpdates(force: true)
-            default: break
-            }
-            state.updateSheetShown = true
-        } label: {
-            switch state.updateState {
-            case .available(let v, _, _):
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
-                    .help("新版本 v\(v) 可更新!点击查看并更新")
-            case .downloading(_, let p):
+        switch state.updateState {
+        case .available(let v, _, _):
+            updateIconButton(
+                systemName: "arrow.up.circle.fill",
+                color: Color(red: 0.22, green: 0.58, blue: 0.40),
+                help: "新版本 v\(v) 可更新!点击查看并更新")
+        case .downloading(_, let p):
+            Button {
+                state.updateSheetShown = true
+            } label: {
                 Text("\(Int(p * 100))%")
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Color(red: 0.28, green: 0.48, blue: 0.82))
-                    .help("正在下载更新…点击查看详情")
-            case .ready(let v):
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
-                    .help("v\(v) 已下载就绪,点击重启完成更新")
-            case .installing:
-                ProgressView().controlSize(.mini)
-            default:
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Color.secondary.opacity(0.55))
-                    .help("检查更新(当前 v\(Updater.currentVersion()))")
             }
+            .buttonStyle(.borderless)
+            .help("正在下载更新…点击查看详情")
+        case .ready(let v):
+            updateIconButton(
+                systemName: "checkmark.seal.fill",
+                color: Color(red: 0.22, green: 0.58, blue: 0.40),
+                help: "v\(v) 已下载就绪,点击重启完成更新")
+        case .installing:
+            ProgressView().controlSize(.mini)
+        default:
+            EmptyView()
+        }
+    }
+
+    private func updateIconButton(systemName: String, color: Color, help: String) -> some View {
+        Button {
+            state.updateSheetShown = true
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(color)
         }
         .buttonStyle(.borderless)
-        .disabled(state.updateState == .installing)
+        .help(help)
     }
 
     private func targetChip(_ title: String, on: Bool, color: Color, action: @escaping () -> Void) -> some View {
