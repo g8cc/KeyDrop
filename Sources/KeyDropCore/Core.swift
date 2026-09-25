@@ -216,10 +216,20 @@ public final class Core {
         var name = parsed.name?.isEmpty == false ? parsed.name! : cc.defaultName(for: url)
         parsed.name = name
 
+        let requestedModels = (models ?? parsed.models ?? parsed.model.map { [$0] } ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        var requestedChatModels: [String] = []
+        for model in requestedModels
+        where !Core.isNonChatModel(model) && !requestedChatModels.contains(model) {
+            requestedChatModels.append(model)
+        }
         var selectedModels: [String] = []
         // 结果是否来自 picker(用户在弹窗里从真实 /models 列表勾选或手输)。
         // picker 结果不得再过 looksLikeModel 去噪(见下方 strict 过滤处注释)
         var pickedViaPicker = false
+        // 已被真实 chat 请求验证可用的模型:同理不得再被 looksLikeModel 启发式误杀
+        var chatVerifiedModels: Set<String> = []
         var addHealth: (health: String, detail: String)? = nil
         var probedNeedsProxy = false
         if !force {
@@ -230,38 +240,96 @@ public final class Core {
             // 三处调用,唯独漏了导入这条路径。
             let test = APITester.test(url: url, key: key, proxy: proxyURL,
                                       preferredModel: parsed.model, importedModels: parsed.models)
-            noteProxyWorked(needsProxy: test.needsProxy, used: proxyURL)
-            if !test.ok {
+            let hasProxy = proxyURL?.isEmpty == false
+            var explicitSelectedModels: [String]? = nil
+            var explicitCanRescue = false
+            var explicitNeedsProxy = false
+            var pastedModelsFailed = false
+            if !requestedModels.isEmpty {
+                if requestedChatModels.isEmpty {
+                    explicitSelectedModels = requestedModels
+                } else {
+                    var verified: [String] = []
+                    var failures: [String] = []
+                    let alreadyWorking = Set(test.ok ? test.workingModels : [])
+                    for model in requestedChatModels {
+                        // 探测阶段已 chat 验证过的模型不再重复打一遍(每个模型最多 2 路径×12s)
+                        if alreadyWorking.contains(model) {
+                            verified.append(model)
+                            continue
+                        }
+                        // 已确认需代理的网关直连必然超时,先直连只会白等;
+                        // 其余情况先直连:验证端点拿到代理就只走代理(无直连回退),
+                        // 本机代理对回环 mock/内网目标会返 502,反而把验证搞挂(真实回归事故)
+                        if !(test.needsProxy && hasProxy) {
+                            let direct = APITester.testModelChat(base: url, key: key, model: model)
+                            if direct.ok {
+                                verified.append(model)
+                                continue
+                            }
+                            if !hasProxy {
+                                failures.append("\(model) → \(direct.detail)")
+                                continue
+                            }
+                        }
+                        let viaProxy = APITester.testModelChat(base: url, key: key, model: model, proxy: proxyURL)
+                        if viaProxy.ok {
+                            verified.append(model)
+                            explicitNeedsProxy = true
+                            continue
+                        }
+                        failures.append("\(model) → \(viaProxy.detail)")
+                    }
+                    if verified.isEmpty {
+                        let failText = failures.joined(separator: "; ")
+                        // key 本身都不通:原测试失败原因(鉴权/网络)比模型验证更有信息量
+                        if !test.ok {
+                            throw ParseError.io("测试失败,未写入。\(test.detail)\n贴入模型验证也失败: \(failText)\n(确认真实或 --force 跳过测试)")
+                        }
+                        // --model 显式指定:用户明确要这些模型,全挂就不能偷换成别的;
+                        // 站点也没有模型目录时同样无可回落
+                        if models != nil || test.models.isEmpty {
+                            throw ParseError.io("贴入的 \(requestedChatModels.count) 个模型均验证失败: \(failText)")
+                        }
+                        // 仅来自粘贴文本的模型(可能是过期名/解析噪声),而 key 本身可用:
+                        // 回落到按站点目录选模型的正常流程,不因一个旧模型名整次导入失败
+                        pastedModelsFailed = true
+                        notes.append("贴入模型均验证失败,改用站点模型目录(\(failures.prefix(2).joined(separator: "; "))\(failures.count > 2 ? " 等" : ""))")
+                    } else {
+                        explicitCanRescue = true
+                        chatVerifiedModels = Set(verified)
+                        explicitSelectedModels = requestedModels.filter {
+                            !requestedChatModels.contains($0) || verified.contains($0)
+                        }
+                        if failures.isEmpty {
+                            notes.append("模型验证通过: \(verified.count) 个全部可用")
+                        } else {
+                            notes.append("模型验证: \(verified.count) 个通过,\(failures.count) 个失败已跳过(\(failures.prefix(2).joined(separator: "; "))\(failures.count > 2 ? " 等" : ""))")
+                        }
+                    }
+                }
+            }
+            noteProxyWorked(needsProxy: test.needsProxy || explicitNeedsProxy, used: proxyURL)
+            if !test.ok && !explicitCanRescue {
                 throw ParseError.io("测试失败,未写入。\(test.detail)\n(确认真实或 --force 跳过测试)")
             }
-            addHealth = Self.healthFor(test)
-            probedNeedsProxy = test.needsProxy
+            if test.ok {
+                addHealth = Self.healthFor(test)
+            } else {
+                let verified = explicitSelectedModels?.joined(separator: ", ") ?? ""
+                addHealth = ("ok", "模型验证通过: \(verified)")
+            }
+            probedNeedsProxy = test.needsProxy || explicitNeedsProxy
             // 直连已通时不给模型验证传代理:验证端点拿到代理就直接用(无直连回退),
             // 本机代理对回环 mock/内网目标会返 502,反而把验证搞挂(真实回归事故)
             let verifyProxy = probedNeedsProxy ? proxyURL : nil
             notes.append("测试: \(test.detail)")
-            if let m = models, !m.isEmpty {
+            if let explicitSelectedModels {
+                selectedModels = explicitSelectedModels
+            } else if let m = models, !m.isEmpty {
                 selectedModels = m
             } else if test.models.isEmpty {
-                // 端点无模型列表:依次尝试贴入模型 / picker 手输
-                let pastedModels = parsed.models ?? (parsed.model.map { [$0] } ?? [])
-                if !pastedModels.isEmpty {
-                    var tried: [String] = []
-                    var lastFail = ""
-                    for m in pastedModels {
-                        tried.append(m)
-                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy)
-                        if check.ok {
-                            selectedModels = [m]
-                            notes.append("模型验证通过: \(m)(贴入 \(tried.count) 个,逐一验证)")
-                            break
-                        }
-                        lastFail = "\(m) → \(check.detail)"
-                    }
-                    if selectedModels.isEmpty {
-                        throw ParseError.io("贴入的 \(tried.count) 个模型均验证失败: \(tried.joined(separator: ", "))。最后失败: \(lastFail)")
-                    }
-                } else if let picker = pickModels {
+                if let picker = pickModels {
                     let picked = picker([])
                     if picked.isEmpty {
                         throw ParseError.io("已取消选择模型")
@@ -316,9 +384,10 @@ public final class Core {
                 }
                 pickedViaPicker = true
                 selectedModels = picked
-            } else if let pm = parsed.model, !pm.isEmpty {
+            } else if !pastedModelsFailed, let pm = parsed.model, !pm.isEmpty {
                 selectedModels = [pm]
             } else {
+                // 贴入模型刚验证失败时不能再回落到它(会把已知不可用的模型写进配置)
                 selectedModels = test.models
             }
         } else if let m = models, !m.isEmpty {
@@ -334,7 +403,8 @@ public final class Core {
         // stepfun step_plan 网关)。刷新路径 refreshModels 早已「保留用户勾选/手输,
         // 不因启发式误杀」,此处对齐同一原则
         if models == nil, !pickedViaPicker {
-            let strict = selectedModels.filter { Parser.looksLikeModel($0) }
+            // 已 chat 验证可用的模型是实证,不参与启发式去噪
+            let strict = selectedModels.filter { chatVerifiedModels.contains($0) || Parser.looksLikeModel($0) }
             if !strict.isEmpty {
                 selectedModels = strict
             }
@@ -1020,15 +1090,20 @@ public final class Core {
                 let test = APITester.test(url: url, key: key, timeout: 10, proxy: px)
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 var updated = e
+                // ccMissing 条目的 provider 仍不存在,每轮对账都会再次命中:备注只追加一次,
+                // 否则 note 每轮扫描无限变长(「…可手动重新导入; …可手动重新导入; …」)
+                func appendNote(_ text: String) {
+                    if updated.note?.contains(text) == true { return }
+                    updated.note = ([updated.note].compactMap { $0 } + [text]).joined(separator: "; ")
+                }
+                let alreadyMissing = e.ccMissing == true
                 if test.authFailed {
                     updated.targets.removeAll { $0.hasPrefix("ccswitch") }
                     if updated.targets.isEmpty { updated.status = "deleted" }
-                    updated.note = ([updated.note].compactMap { $0 }
-                        + ["cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记"]).joined(separator: "; ")
+                    appendNote("cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记")
                 } else {
                     updated.ccMissing = true
-                    updated.note = ([updated.note].compactMap { $0 }
-                        + ["cc-switch provider 缺失,key 仍可用,可手动重新导入"]).joined(separator: "; ")
+                    appendNote("cc-switch provider 缺失,key 仍可用,可手动重新导入")
                 }
                 updated.health = test.authFailed ? "dead" : (test.ok ? "ok" : "err")
                 updated.healthDetail = test.detail
@@ -1036,7 +1111,8 @@ public final class Core {
                 outLock.lock()
                 if test.authFailed {
                     out.append("同步: 标记「\(e.name ?? String(e.id.prefix(8)))」为已删除(cc-switch 中 provider 不存在,key 失效)")
-                } else {
+                } else if !alreadyMissing {
+                    // 已标记过的不再每轮重复播报
                     out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」provider 缺失但可用,已标记可重新导入")
                 }
                 outLock.unlock()
@@ -1360,7 +1436,7 @@ public final class Core {
                         models: models,
                         removing: previousModels
                     )
-                    entry.targets.append("grok")
+                    if !entry.targets.contains("grok") { entry.targets.append("grok") }
                     entry.grokConfigPath = writer.configPath
                     entry.models = models
                     entry.model = models.first
@@ -1391,29 +1467,36 @@ public final class Core {
                 catch { return "⚠ cc-switch 同步失败: \(error.localizedDescription)" }
                 return nil
             }
-            // 家族变化:删旧建新。newTag 仅替换 ccswitch* 前缀,其他 targets(dsh/cpa/clash)原样保留
+            // 家族变化:先建新、再删旧。newTag 仅替换 ccswitch* 前缀,其他 targets(dsh/cpa/clash)原样保留。
+            // 旧实现「先 try? 删旧再建新」:建新失败时旧 provider 已没了,回滚用的 try? add 再失败
+            // 就两头落空,且账本仍指向已删 pid;删旧失败被 try? 吞掉时又照样摘牌 → cc-switch 孤儿。
+            // 先建新:建新失败 = 什么都没动,旧 provider 与账本原样可用
             let newTag = "ccswitch" + (newAppType == "claude" ? "" : "-\(newAppType)")
             var p = ParsedKey()
             p.url = url; p.key = key; p.model = models.first ?? entry.model
-            _ = try? cc.remove(providerID: oldPid, renamedFrom: nil, renamedTo: nil, appType: oldAppType)
+            let r: CCAddResult
             do {
-                let r = try cc.add(p, nameOverride: entry.name, appType: newAppType, models: models, proxy: effProxy)
-                entry.targets = entry.targets.filter { !$0.hasPrefix("ccswitch") } + [newTag]
-                entry.ccProviderID = r.providerID
-                entry.models = models
-                entry.model = models.first
-                return "已迁移: \(oldAppType) → \(newAppType)\(r.warnings.isEmpty ? "" : " (\(r.warnings.joined(separator: "; ")))")"
+                r = try cc.add(p, nameOverride: entry.name, appType: newAppType, models: models, proxy: effProxy)
             } catch {
-                // 迁移失败比 sync 失败严重:旧 provider 已删,新 provider 没建出来 → 该 entry 在 cc-switch 里孤儿。
-                // 重建旧 app_type 的 provider 尽力补救(旧 pid 不可复用——remove 已删且 cc-switch 内存可能仍持有),
-                // 把 entry 指回新建的回滚 provider 并提示 reimport。
-                var p2 = ParsedKey()
-                p2.url = url; p2.key = key; p2.model = models.first ?? entry.model
-                if let rb = try? cc.add(p2, nameOverride: entry.name, appType: oldAppType, models: models, proxy: effProxy) {
-                    entry.ccProviderID = rb.providerID
-                }
-                return "⚠ 迁移失败已回滚: \(error.localizedDescription);建议重新导入该 key"
+                return "⚠ 迁移 \(oldAppType) → \(newAppType) 失败,已保持原 provider 不变: \(error.localizedDescription)"
             }
+            var removeNote = ""
+            do {
+                _ = try cc.remove(providerID: oldPid, renamedFrom: entry.ccRenamedFrom,
+                                  renamedTo: entry.ccRenamedTo, appType: oldAppType)
+                entry.targets = entry.targets.filter { !$0.hasPrefix("ccswitch") } + [newTag]
+            } catch {
+                // 旧 provider 删除失败:新 provider 已建出并接管账本 pid,旧 provider 残留在
+                // cc-switch(账本不再持有其 pid,无法自动清理),明确提示用户手动删
+                entry.targets = entry.targets.filter { !$0.hasPrefix("ccswitch") } + [newTag]
+                removeNote = ";⚠ 旧 \(oldAppType) provider 删除失败,请在 cc-switch 手动删除: \(error.localizedDescription)"
+            }
+            entry.ccProviderID = r.providerID
+            entry.ccRenamedFrom = r.renamedFrom
+            entry.ccRenamedTo = r.renamedTo
+            entry.models = models
+            entry.model = models.first
+            return "已迁移: \(oldAppType) → \(newAppType)\(r.warnings.isEmpty ? "" : " (\(r.warnings.joined(separator: "; ")))")\(removeNote)"
         }
 
         func grokSyncOrMigrate(_ entry: inout HistoryEntry, models: [String]) -> String? {
@@ -1462,9 +1545,10 @@ public final class Core {
                 var grokNote = ""
                 if let path = entry.grokConfigPath {
                     do {
+                        // 必须用迁移前的模型:entry.models 上面已改成新家族模型,拿它去按内容
+                        // 匹配旧 [model.*] 段永远匹配不到 → 旧 grok 段残留却被摘牌
                         _ = try GrokBuildWriter(configPath: path).remove(
-                            baseURL: url, key: key,
-                            models: entry.models ?? (entry.model.map { [$0] } ?? [])
+                            baseURL: url, key: key, models: previousModels
                         )
                         entry.targets.removeAll { $0 == "grok" }
                     } catch {
@@ -1532,8 +1616,15 @@ public final class Core {
         syncWarn = grokSyncOrMigrate(&entry, models: filtered)
             ?? ccSyncOrMigrate(&entry, models: filtered)
 
+        // DSH 同步失败只告警:此时 cc/grok 可能已迁移(就地改了 entry.targets/ccProviderID),
+        // 直接 throw 会跳过下面的 history.update → 账本仍指向已删的旧 provider
+        var dshNote = ""
         if entry.targets.contains("dsh") {
-            _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: filtered)
+            do {
+                _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: filtered)
+            } catch {
+                dshNote = "\n⚠ DSH 同步失败: \(error.localizedDescription)"
+            }
         }
         // CPA 聚合条目同步:filtered 是用户在弹窗里重新确认的模型列表,与
         // cc-switch/grok/dsh 同一账本口径。缺失此步时刷新只更新 cc 系目标,
@@ -1558,7 +1649,7 @@ public final class Core {
         try history.update(entry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
-        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(cpaNote)"
+        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
     }
 
     /// 编辑条目:改模型列表/名称,重新验证模型并同步所有目标(cc-switch/dsh)
@@ -1584,9 +1675,15 @@ public final class Core {
         if let models, !models.isEmpty {
             var verified: [String] = []
             var failures: [String] = []
+            let verifyProxy = proxyForHealth()
             for m in models {
                 if verify {
-                    let check = APITester.testModelChat(base: url, key: key, model: m, proxy: proxyForHealth())
+                    // 先直连再代理:验证端点拿到代理就只走代理(无直连回退),本机代理对
+                    // 回环/内网网关会返 502,直接传代理会把本可直连的模型全判失败(与 add() 同口径)
+                    var check = APITester.testModelChat(base: url, key: key, model: m)
+                    if !check.ok, let verifyProxy, !verifyProxy.isEmpty {
+                        check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy)
+                    }
                     if check.ok {
                         verified.append(m)
                     } else {
@@ -1612,7 +1709,9 @@ public final class Core {
             lines.append("✓ 名称已更新: \(name)")
         }
 
-        if newModels.isEmpty && name == nil {
+        // 旧判断 newModels.isEmpty && name == nil:newModels 默认就是 previousModels(几乎总非空),
+        // 什么都没传也会走完整同步流程;name == "" 也漏判
+        if (models ?? []).isEmpty && (name ?? "").isEmpty {
             return "无变更"
         }
 
@@ -1631,20 +1730,30 @@ public final class Core {
             do {
                 let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
                 let msg = try writer.sync(baseURL: url, key: key, models: newModels, removing: [])
+                if !entry.targets.contains("grok") { entry.targets.append("grok") }
+                entry.grokConfigPath = writer.configPath
+                lines.append("✓ Grok Build: \(msg)")
+                // 旧 cc provider 删除成功才摘牌(先建后删):try? 吞掉失败照样摘 ccswitch
+                // 标签+pid,provider 仍活在 cc-switch 却无人认领,delete/reconcile 都清不到
+                var ccReleased = entry.ccProviderID == nil
                 if let pid = entry.ccProviderID {
                     let oldTag = entry.targets.first(where: { $0.hasPrefix("ccswitch") }) ?? "ccswitch"
                     let oldApp = oldTag.hasPrefix("ccswitch-")
                         ? String(oldTag.dropFirst("ccswitch-".count)) : "claude"
-                    _ = try? cc.remove(providerID: pid, renamedFrom: entry.ccRenamedFrom,
-                                       renamedTo: entry.ccRenamedTo, appType: oldApp)
+                    do {
+                        _ = try cc.remove(providerID: pid, renamedFrom: entry.ccRenamedFrom,
+                                          renamedTo: entry.ccRenamedTo, appType: oldApp)
+                        ccReleased = true
+                    } catch {
+                        lines.append("⚠ 旧 \(oldApp) provider 清理失败,账本仍认领它可再删: \(error.localizedDescription)")
+                    }
                 }
-                entry.targets.removeAll { $0.hasPrefix("ccswitch") }
-                if !entry.targets.contains("grok") { entry.targets.append("grok") }
-                entry.ccProviderID = nil
-                entry.ccRenamedFrom = nil
-                entry.ccRenamedTo = nil
-                entry.grokConfigPath = writer.configPath
-                lines.append("✓ Grok Build: \(msg)")
+                if ccReleased {
+                    entry.targets.removeAll { $0.hasPrefix("ccswitch") }
+                    entry.ccProviderID = nil
+                    entry.ccRenamedFrom = nil
+                    entry.ccRenamedTo = nil
+                }
             } catch {
                 lines.append("⚠ Grok Build 同步失败: \(error.localizedDescription)")
             }
@@ -1670,25 +1779,34 @@ public final class Core {
             do {
                 let r = try cc.add(p, nameOverride: entry.name,
                                    appType: desiredAppType, models: newModels, proxy: proxyForHealth())
-                if let path = entry.grokConfigPath {
-                    _ = try? GrokBuildWriter(configPath: path).remove(
-                        baseURL: url, key: key,
-                        models: previousModels
-                    )
-                }
-                entry.targets.removeAll { $0 == "grok" }
                 entry.targets.append(desiredAppType == "claude" ? "ccswitch" : "ccswitch-\(desiredAppType)")
                 entry.ccProviderID = r.providerID
                 entry.ccRenamedFrom = r.renamedFrom
                 entry.ccRenamedTo = r.renamedTo
                 lines.append("✓ 已迁移: Grok Build → \(desiredAppType)")
+                // 旧 grok 段删除成功才摘 grok 牌:失败时 [model.*] 表仍在,保留标签让 delete 继续清理
+                if let path = entry.grokConfigPath {
+                    do {
+                        _ = try GrokBuildWriter(configPath: path).remove(
+                            baseURL: url, key: key,
+                            models: previousModels
+                        )
+                        entry.targets.removeAll { $0 == "grok" }
+                    } catch {
+                        lines.append("⚠ 旧 grok 段清理失败,账本仍认领: \(error.localizedDescription)")
+                    }
+                } else {
+                    entry.targets.removeAll { $0 == "grok" }
+                }
             } catch {
                 lines.append("⚠ Grok Build → \(desiredAppType) 迁移失败: \(error.localizedDescription)")
             }
         }
 
-        // 同步 cc-switch
-        if entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
+        // 同步 cc-switch。目标家族是 grok 时跳过:此时仍带 ccswitch 标签只可能是旧 provider
+        // 清理失败的残留,再往里同步 grok 模型只会把旧 provider 写坏
+        if desiredAppType != "grok",
+           entry.targets.contains(where: { $0.hasPrefix("ccswitch") }),
            let pid = entry.ccProviderID {
             let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
                 .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"

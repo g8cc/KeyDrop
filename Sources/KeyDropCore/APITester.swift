@@ -186,7 +186,10 @@ public enum APITester {
         let hardLimit = (try? JSONSerialization.jsonObject(with: o.data ?? Data()) as? [String: Any])?["hard_limit_usd"] as? Double
         guard NetSync.statusCode(o) == 200, let limit = hardLimit else { return nil }
         guard let usage = fetch("/dashboard/billing/usage") else { return nil }
-        return usage >= limit ? .zero : .ok
+        // 单位不一致:hard_limit_usd 是美元,total_usage 沿用 OpenAI 旧 billing 口径是「美分」
+        // (new-api/one-api 均返回 amount*100)。直接比较会把「$100 额度用了 $5」算成
+        // 500 >= 100 → 误判无余额
+        return usage / 100 >= limit ? .zero : .ok
     }
 
     /// - Parameter preferredModel: 用户实际激活的模型(new-api TestModel 思路),探测时优先验证它
@@ -203,9 +206,15 @@ public enum APITester {
         }
         let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
         if via.ok {
+            // 必须透传探测明细:只拷 ok/models/detail 会把 workingModels/quotaModels/延迟/
+            // quotaExhausted 全部丢掉 → 需代理的 key 导入时限流模型不被排除、监控图无延迟、
+            // 无额度被误判为可用
             return APITestResult(ok: true, style: via.style, models: via.models,
                                  detail: via.detail + " | 直连失败,需代理,经代理验证通过",
-                                 authFailed: false, needsProxy: true)
+                                 authFailed: false, needsProxy: true,
+                                 quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
+                                 workingModels: via.workingModels, quotaModels: via.quotaModels,
+                                 latencyMs: via.latencyMs, modelLatencies: via.modelLatencies)
         }
         return via
     }
@@ -606,10 +615,12 @@ public enum APITester {
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
-            if status == 200 {
+            // 200 + HTML 是前端兜底页(SPA 对任意路径都回 200),不是模型可用的证据;
+            // 与 chatHealthCheck/testOnce 的「200 必须非 HTML」口径一致
+            if status == 200, !isHTMLBody(body) {
                 return (true, "POST \(base)\(path) → 200")
             }
-            if status == 404 || status == 405 {
+            if status == 200 || status == 404 || status == 405 {
                 continue
             }
             if status != 0 {

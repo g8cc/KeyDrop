@@ -1246,6 +1246,13 @@ openai-compatibility:
             t.expect(e.ccMissing == true, "provider 缺失已标记 ccMissing")
             t.expect((e.probeLog ?? []).isEmpty == false, "对账测试结果必须写入 probeLog(修复前为空)")
             t.equal(e.health, "ok", "mock 探测通过")
+            // 第二轮对账:provider 仍缺失会再次命中,备注不得每轮重复追加
+            let done2 = DispatchSemaphore(value: 0)
+            core.scanHealth(staleAfter: 3600) { _ in done2.signal() }
+            _ = done2.wait(timeout: .now() + 60)
+            let e2 = core.history.find(idPrefix: "recon-probe")!
+            t.equal((e2.note ?? "").components(separatedBy: "可手动重新导入").count - 1, 1,
+                    "ccMissing 备注只追加一次: \(e2.note ?? "")")
         }
 
         // 实战监控 v1:延迟测量 / 失败防抖 / CPA 链路探测

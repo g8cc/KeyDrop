@@ -563,7 +563,9 @@ public final class HistoryStore {
                 return  // 已有同 key 条目:不插入
             }
             _items.insert(e, at: 0)
-            if _items.count > 500 { _items = Array(_items.prefix(500)) }
+            // 与 append() 同走 applyCap:硬截 prefix(500) 会把尾部仍持有 cc-switch/CPA/Grok
+            // 产物的 active 老条目直接丢掉,外部产物成孤儿(删不掉、对账不认领)
+            _items = Self.applyCap(_items)
             // 内部直接用 NoFlock 版:外层已持 flock,再走 saveLocked 会二次 flock 自锁
             try saveLockedNoFlock(dirtyIDs: [e.id])
         }

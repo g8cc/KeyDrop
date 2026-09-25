@@ -24,6 +24,10 @@ final class MockHTTPServer {
         case dottedModels // /models → 200,7 个 stepfun 式模型(5 个含点、会被 looksLikeModel 域名规则误杀)
         case selectiveAuth // Authorization 含 invalid 的 key 返回 401,其余正常
         case selectiveModelQuota // /models 返回 4 模型(1 个 *-free + 3 限流);chat 仅 free 模型 200,其余 429 quota
+        case partialCatalog
+        case billingCentsOK    // /auth/key 404;new-api billing:hard_limit_usd=100($),total_usage=500(美分=$5)→ 有余额
+        case billingCentsSpent // 同上但 total_usage=10000(美分=$100)→ 用尽
+        case html200All        // 任意路径 200 + HTML 兜底页(SPA),chat 也不例外
         case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
     }
     // cpaMgmt 状态:跨线程访问,统一走锁
@@ -72,7 +76,7 @@ final class MockHTTPServer {
             handleCPAMgmt(client, req, method, target)
             return
         }
-        if mode == .selectiveModelQuota, method == "POST", target.contains("/chat/completions"),
+        if (mode == .selectiveModelQuota || mode == .partialCatalog), method == "POST", target.contains("/chat/completions"),
            let r = headerOnly.lowercased().range(of: "content-length:"),
            let n = Int(headerOnly.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
                 .prefix(while: { $0.isNumber })), n > 0 {
@@ -97,7 +101,7 @@ final class MockHTTPServer {
         if let re = try? NSRegularExpression(pattern: "\"model\"\\s*:\\s*\"([^\"]*)\""),
            let m = re.firstMatch(in: req, range: NSRange(req.startIndex..., in: req)), m.numberOfRanges >= 2,
            let gr = Range(m.range(at: 1), in: req) {
-            requestedModel = String(req[gr])
+            requestedModel = String(req[gr]).replacingOccurrences(of: "\\/", with: "/")
         }
 
         if method == "GET" && target.hasPrefix("http://") {
@@ -139,6 +143,16 @@ final class MockHTTPServer {
                     body = "{\"error\":{\"code\":\"429\",\"message\":\"quota exhausted\"}}"
                 }
             }
+        } else if mode == .partialCatalog {
+            if target.hasSuffix("/models") {
+                body = "{\"data\":[{\"id\":\"other-model\",\"object\":\"model\"}]}"
+            } else if target.contains("/chat/completions") {
+                if requestedModel == "z-ai/glm-5.3" {
+                    body = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+                } else {
+                    body = "{\"error\":{\"code\":\"424\",\"message\":\"model unavailable\"}}"
+                }
+            }
         } else if mode == .selectiveAuth && invalidKey {
             body = "{\"error\":{\"message\":\"Unauthorized\"}}"
         } else if mode == .selectiveAuth {
@@ -159,6 +173,14 @@ final class MockHTTPServer {
             } else {
                 body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
             }
+        } else if mode == .billingCentsOK || mode == .billingCentsSpent {
+            if target.hasSuffix("/dashboard/billing/subscription") {
+                body = "{\"object\":\"billing_subscription\",\"hard_limit_usd\":100}"
+            } else if target.hasSuffix("/dashboard/billing/usage") {
+                body = "{\"object\":\"list\",\"total_usage\":\(mode == .billingCentsOK ? 500 : 10000)}"
+            }
+        } else if mode == .html200All {
+            body = "<!doctype html><html><body>app</body></html>"
         } else if mode == .balanceNoInfo {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
         } else if mode == .html200 {
@@ -224,7 +246,13 @@ final class MockHTTPServer {
             status = "401 Unauthorized"
         } else if mode == .chat524 && (target.contains("/chat/completions") || target.contains("/responses")) {
             status = "424 Failed Dependency"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .partialCatalog && target.contains("/chat/completions") {
+            status = requestedModel == "z-ai/glm-5.3" ? "200 OK" : "424 Failed Dependency"
+        } else if (mode == .billingCentsOK || mode == .billingCentsSpent) && target.contains("/dashboard/billing/") {
+            status = "200 OK"
+        } else if mode == .html200All {
+            status = "200 OK"
+        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || mode == .partialCatalog && target.hasSuffix("/models") || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"
@@ -483,6 +511,30 @@ enum APITesterTests {
                                               importedModels: off)
             t.expect(!r3.contains("removed-model"), "[下架] 已下架的导入模型不探测")
             t.equal(r3[1], "z-ai/glm-5.3", "[下架] 在架导入模型仍优先")
+        }
+
+        // new-api/one-api 的 total_usage 是美分、hard_limit_usd 是美元:旧实现直接比较,
+        // 「$100 额度用了 $5」被算成 500 >= 100 → 误判无余额
+        h.runSuite("APITester.billing 余额单位") { t in
+            guard let okSrv = try? MockHTTPServer(mode: .billingCentsOK),
+                  let spentSrv = try? MockHTTPServer(mode: .billingCentsSpent) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            t.expect(APITester.checkBalance(url: "http://127.0.0.1:\(okSrv.port)", key: "sk-bill-1", timeout: 5) == .ok,
+                     "用了 $5/$100 → 有余额")
+            t.expect(APITester.checkBalance(url: "http://127.0.0.1:\(spentSrv.port)", key: "sk-bill-2", timeout: 5) == .zero,
+                     "用了 $100/$100 → 无余额")
+        }
+
+        // SPA 兜底页对任意路径回 200 HTML:不能当作模型 chat 验证通过
+        h.runSuite("APITester.chat 200 HTML 非可用") { t in
+            guard let srv = try? MockHTTPServer(mode: .html200All) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let r = APITester.testModelChat(base: "http://127.0.0.1:\(srv.port)", key: "sk-html-1", model: "gpt-5.6-sol", timeout: 5)
+            t.expect(!r.ok, "200 HTML 不算模型可用: \(r.detail)")
         }
 
         h.runSuite("APITester") { t in

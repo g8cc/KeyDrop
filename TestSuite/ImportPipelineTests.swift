@@ -273,6 +273,78 @@ enum ImportPipelineTests {
             t.contains(e4.read("codex.toml"), "model = \"gpt-5.6-sol\"", "[chatOK] 落盘 codex")
         }
 
+        h.runSuite("导入管线.显式模型不在目录") { t in
+            let (env, core) = makeEnv("pipe-partial-catalog")
+            defer { env.cleanup() }
+            guard let srv = try? MockHTTPServer(mode: .partialCatalog) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            do {
+                let r = try core.add(raw: "http://127.0.0.1:\(srv.port)/v1 sk-partialcatalog0001 z-ai/glm-5.3",
+                                    ccOverride: true, cpaOverride: false, dshOverride: false, force: false)
+                t.equal(r.entry.models, ["z-ai/glm-5.3"], "目录缺模型时导入手填模型")
+            } catch {
+                t.expect(false, "目录缺模型但 chat 可用时应导入: \(error.localizedDescription)")
+            }
+            guard let srv2 = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock2 启动失败")
+                return
+            }
+            do {
+                let r = try core.add(raw: "http://127.0.0.1:\(srv2.port) sk-partialcatalog0002 z-ai/glm-5.3",
+                                    ccOverride: true, cpaOverride: false, dshOverride: false, force: false)
+                t.equal(r.entry.models, ["z-ai/glm-5.3"], "目录可用时仍优先导入手填模型")
+            } catch {
+                t.expect(false, "目录可用但手填模型应导入: \(error.localizedDescription)")
+            }
+        }
+
+        // 粘贴文本里的模型名过期/是噪声,但 key 本身可用:不能因它整次导入失败,
+        // 应回落到站点目录(此 mock 下 CLI 自动排除限流模型,只剩 free 模型)
+        h.runSuite("导入管线.贴入模型失效回落目录") { t in
+            let (env, core) = makeEnv("pipe-stale-pasted")
+            defer { env.cleanup() }
+            guard let srv = try? MockHTTPServer(mode: .selectiveModelQuota) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            do {
+                let r = try core.add(raw: "http://127.0.0.1:\(srv.port)/v1 sk-stalepasted0001 gpt-5.1-retired",
+                                    ccOverride: true, cpaOverride: false, dshOverride: false, force: false)
+                t.equal(r.entry.models, ["z-ai/glm-5.3-free"], "回落目录并排除限流模型")
+                t.expect(!(r.entry.models ?? []).contains("gpt-5.1-retired"), "已验证失败的贴入模型不得写入")
+            } catch {
+                t.expect(false, "key 可用时贴入模型失效应回落目录: \(error.localizedDescription)")
+            }
+            // --model 显式指定则不偷换:全挂必须报错
+            do {
+                _ = try core.add(raw: "http://127.0.0.1:\(srv.port)/v1 sk-stalepasted0002",
+                                 ccOverride: true, cpaOverride: false, dshOverride: false,
+                                 models: ["gpt-5.1-retired"], force: false)
+                t.expect(false, "--model 全部验证失败应报错")
+            } catch {
+                t.contains(error.localizedDescription, "均验证失败", "--model 失败报验证错误")
+            }
+        }
+
+        // 什么都没改的编辑不应触发整套同步
+        h.runSuite("导入管线.编辑无变更") { t in
+            let (env, core) = makeEnv("pipe-edit-noop")
+            defer { env.cleanup() }
+            guard let srv = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            guard let r = try? core.add(raw: "http://127.0.0.1:\(srv.port)/v1 sk-editnoop000001 gpt-5.6-sol",
+                                        ccOverride: true, cpaOverride: false, dshOverride: false, force: false) else {
+                t.expect(false, "导入失败")
+                return
+            }
+            t.equal(try? core.editEntry(entryIDPrefix: r.entry.id), "无变更", "无参数编辑 → 无变更")
+            t.equal(try? core.editEntry(entryIDPrefix: r.entry.id, models: [], name: ""), "无变更", "空参数编辑 → 无变更")
+        }
+
         // MARK: - 点分模型名不误杀(真实事故:stepfun step_plan 7 选 5 只剩 1)
 
         h.runSuite("导入管线.点分模型名不误杀") { t in
