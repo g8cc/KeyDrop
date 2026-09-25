@@ -1510,5 +1510,89 @@ openai-compatibility:
             core.noteProxyWorked(needsProxy: false, used: hit)
             t.equal(Prefs.shared.proxy, "", "直连成功不需要代理,不写")
         }
+
+        // MARK: - 回写污染自愈:cc-switch 把陈旧 loopback live 环境回写进托管 claude 行 → 对账修复
+        // 2026-09-25 sub.tidalrelay 事故:用户此前把 Claude 直连 CPA(127.0.0.1:8317 +
+        // clientKey),导入新网关后 live 仍是 CPA 环境;cc-switch 按 DB is_current 回写,
+        // 新 provider 行的 baseURL/key 被整块换成 CPA 的。签名 = loopback + clientKey 同时命中。
+        h.runSuite("Regression.回写污染自愈") { t in
+            setenv("KEYDROP_LLM_KEY", "sk-cpaclientkey999999", 1)
+            defer { setenv("KEYDROP_LLM_KEY", "", 1) }
+            let env = try! TestEnv("reg-cc-heal")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let w = CCSwitchWriter()
+            func db() -> DB { try! DB(path: env.dir + "/cc-switch.db") }
+
+            var p = ParsedKey()
+            p.url = "https://gw-heal.example.com/v1"
+            p.key = "sk-gwheal1111111111"
+            let r = try! w.add(p, appType: "claude", models: ["claude-sonnet-4-5"], proxy: nil)
+            let pid = r.providerID
+
+            // ① 未污染(行内 key == 条目 key)→ 不动
+            var msg = try! w.repairClobberedClaudeRow(providerID: pid, url: p.url!, key: p.key!,
+                                                      models: ["claude-sonnet-4-5"],
+                                                      cpaClientKey: "sk-cpaclientkey999999")
+            t.equal(msg, "", "未污染行不修复")
+
+            // ② 用户手改(非 loopback 网关 + 新 key)→ 不碰,避免覆盖合法编辑
+            let userEdit = "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"sk-useredit22222222\",\"ANTHROPIC_BASE_URL\":\"https://other.example.com/v1\"}}"
+            try! db().run("UPDATE providers SET settings_config=? WHERE id=?", [userEdit, pid])
+            msg = try! w.repairClobberedClaudeRow(providerID: pid, url: p.url!, key: p.key!,
+                                                  models: ["claude-sonnet-4-5"],
+                                                  cpaClientKey: "sk-cpaclientkey999999")
+            t.equal(msg, "", "非 loopback 手改不误修")
+            t.contains(try! db().scalar("SELECT settings_config FROM providers WHERE id=?", [pid]) ?? "",
+                       "sk-useredit22222222", "用户手改内容保持原样")
+
+            // ③ 事故签名(loopback + CPA clientKey)→ 用条目 url/key 还原
+            let clobbered = "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"sk-cpaclientkey999999\",\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:8317\"}}"
+            try! db().run("UPDATE providers SET settings_config=? WHERE id=?", [clobbered, pid])
+            msg = try! w.repairClobberedClaudeRow(providerID: pid, url: p.url!, key: p.key!,
+                                                  models: ["claude-sonnet-4-5"],
+                                                  cpaClientKey: "sk-cpaclientkey999999")
+            t.contains(msg, "已修复", "污染行被修复")
+            let healed = try! db().scalar("SELECT settings_config FROM providers WHERE id=?", [pid]) ?? ""
+            t.contains(healed, "sk-gwheal1111111111", "行内 key 还原为条目 key")
+            t.contains(healed, "gw-heal.example.com", "行内 base_url 还原为条目 URL")
+            t.expect(!healed.contains("sk-cpaclientkey999999"), "污染 token 已清除")
+
+            // ④ 当前行 + live 同污染 → 连 live 一起修(否则下次回写又盖回来)
+            env.write("claude.json", "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"sk-cpaclientkey999999\",\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:8317\"}}")
+            try! db().run("UPDATE providers SET settings_config=? WHERE id=?", [clobbered, pid])
+            try! db().run("UPDATE providers SET is_current=1 WHERE id=?", [pid])
+            msg = try! w.repairClobberedClaudeRow(providerID: pid, url: p.url!, key: p.key!,
+                                                  models: ["claude-sonnet-4-5"],
+                                                  cpaClientKey: "sk-cpaclientkey999999")
+            t.contains(msg, "live", "行+live 双修复播报")
+            t.contains(env.read("claude.json"), "sk-gwheal1111111111", "live 同步还原为条目 key")
+            t.expect(!env.read("claude.json").contains("sk-cpaclientkey999999"), "live 污染 token 已清除")
+        }
+
+        // MARK: - 自愈接线:reconcileWithCCSwitch 周期对账自动修复(Core 全链路,纯本地无网络)
+        h.runSuite("Regression.回写污染自愈接线") { t in
+            setenv("KEYDROP_LLM_KEY", "sk-cpaclientkey999999", 1)
+            defer { setenv("KEYDROP_LLM_KEY", "", 1) }
+            let env = try! TestEnv("reg-cc-heal-core")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let core = Core()
+            let r = try! core.add(raw: "https://gw-wire.example.com/v1 sk-gwwire111111111",
+                                  ccOverride: true, cpaOverride: false, dshOverride: false,
+                                  models: ["claude-sonnet-4-5"], force: true,
+                                  appType: "claude", appTypeForced: true)
+            t.expect(r.ok, "导入成功")
+            let pid = r.entry.ccProviderID!
+            let clobbered = "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"sk-cpaclientkey999999\",\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:8317\"}}"
+            try! DB(path: env.dir + "/cc-switch.db").run(
+                "UPDATE providers SET settings_config=? WHERE id=?", [clobbered, pid])
+            let lines = core.reconcileWithCCSwitch()
+            t.contains(lines.joined(separator: "\n"), "自愈", "对账播报修复")
+            let healed = try! DB(path: env.dir + "/cc-switch.db").scalar(
+                "SELECT settings_config FROM providers WHERE id=?", [pid]) ?? ""
+            t.contains(healed, "sk-gwwire111111111", "对账后行内 key 已还原")
+            t.expect(!healed.contains("sk-cpaclientkey999999"), "对账后污染 token 已清除")
+        }
     }
 }

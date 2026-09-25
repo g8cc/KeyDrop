@@ -1060,8 +1060,11 @@ public final class Core {
     /// cc-switch 中被删除的条目。
     /// - key 失效(401/403) → 同步标记为删除(用户在 cc-switch 侧清理了失效 key)
     /// - key 可用 → 标记 ccMissing,保留记录,由用户手动重新导入(避免自动复活循环)
-    func reconcileWithCCSwitch() -> [String] {
+    /// 另含回写污染自愈:cc-switch 把陈旧 live 环境整块回写进 KeyDrop 托管 claude 行的
+    /// 修复(见 repairClobberedClaudeRow;2026-09-25 sub.tidalrelay 事故)。
+    public func reconcileWithCCSwitch() -> [String] {
         var out: [String] = []
+        out.append(contentsOf: repairClobberedCCRows())
         let outLock = NSLock()
         let candidates = history.snapshot()
             .filter {
@@ -1134,6 +1137,29 @@ public final class Core {
         }
         // 等全部对账完成,保持「返回时对账已生效」的既有语义(逐条已在并发任务内即时落盘)
         group.wait()
+        return out
+    }
+
+    /// 回写污染自愈:遍历 active 且导入到 Claude Code 的条目,检测其 cc-switch 行是否
+    /// 被「陈旧 loopback live 环境」整块回写覆盖(签名判定见 repairClobberedClaudeRow)。
+    /// 纯本地 DB 读校验,无网络请求,不参与并发对账。未配置 CPA(无 clientKey 可比)
+    /// 时签名不成立,整段跳过。
+    private func repairClobberedCCRows() -> [String] {
+        guard let ep = CPAWriter.endpointInfo() else { return [] }
+        var out: [String] = []
+        for e in history.snapshot() where e.status == "active" && e.targets.contains("ccswitch") {
+            guard let pid = e.ccProviderID, let url = e.url, let key = e.key, !key.isEmpty else { continue }
+            let models = e.models ?? (e.model.map { [$0] } ?? [])
+            do {
+                let msg = try cc.repairClobberedClaudeRow(providerID: pid, url: url, key: key,
+                                                          models: models, cpaClientKey: ep.clientKey)
+                if !msg.isEmpty {
+                    out.append("自愈: 「\(e.name ?? String(e.id.prefix(8)))」\(msg)")
+                }
+            } catch {
+                out.append("⚠ 自愈失败(「\(e.name ?? String(e.id.prefix(8)))」): \(error.localizedDescription)")
+            }
+        }
         return out
     }
 

@@ -444,46 +444,64 @@ enum ImportPipelineTests {
             t.expect(!env.read("codex.toml").contains("model = \"gpt-5.6-sol\""), "[幂等后] 旧模型无残留")
         }
 
-        // MARK: - live 门控:cc-switch 运行状态决定 KeyDrop 是否直写 live claude.json
-        // 事故修复:cc-switch 运行时 KeyDrop 写 live 会被 cc-switch 回写进陈旧 current 的
-        // settings_config,整块覆盖旧 provider 的 url/key/models。运行时交给 cc-switch 应用,
-        // KeyDrop 只写 DB;未运行时 KeyDrop 独占 live。
+        // MARK: - live 一致性:导入即把 live 写成与 DB current 相同的 env(运行态无关)
+        // 两类回写事故对称,根源都是「live 与 DB current 漂移」:
+        // 事故一:运行中写 live → cc-switch 回写进陈旧内存 current(旧 provider 行);
+        // 事故二(2026-09-25 sub.tidalrelay):运行中只写 DB → live 停留在旧环境(用户此前
+        //   直连 CPA 127.0.0.1:8317),用户激活新 provider 时 cc-switch 按 DB is_current
+        //   把过期 live 整块回写进新行,baseURL/key 直接变成 CPA 的。
+        // 修复:无论运行态,导入即同步 live,使 live ≡ DB current → 回写退化为 no-op。
+        // PROXY_MANAGED(cc-switch 本地代理接管)仍不得直写。
 
-        h.runSuite("导入管线.live 门控") { t in
-            // cc-switch 运行(FAKE=1,harness 默认)→ 不写 live claude.json
+        h.runSuite("导入管线.live 一致性") { t in
+            // cc-switch 运行(FAKE=1,harness 默认)→ live 与 DB 同步写入
             let (e1, c1) = makeEnv("pipe-livegate-running")
             defer { e1.cleanup() }
             _ = try! c1.add(raw: "https://gate.example.com/v1 sk-gaterun1111111111",
                              ccOverride: true, cpaOverride: false, dshOverride: false,
                              models: ["claude-sonnet-4-5"], force: true, appType: "claude", appTypeForced: true)
-            t.expect(!FileManager.default.fileExists(atPath: e1.dir + "/claude.json"),
-                     "[运行] 不写 live claude.json(交给 cc-switch 应用)")
+            t.contains(e1.read("claude.json"), "sk-gaterun1111111111",
+                       "[运行] live claude.json 同步写入(与 DB current 一致)")
             let cfgRun = (try? db(e1).scalar("SELECT settings_config FROM providers WHERE app_type='claude' LIMIT 1")) ?? "{}"
             t.contains(cfgRun, "sk-gaterun1111111111", "[运行] DB settings_config 仍写入")
+            let oldPID = try! db(e1).scalar("SELECT id FROM providers WHERE settings_config LIKE '%sk-gaterun1111111111%'") ?? ""
 
-            // 回归复现:旧 cc-switch 进程可能仍缓存旧 current provider,随后会把 live
-            // 配置回写到旧 provider。导入新 key 后 live 必须为空,否则旧 provider 会被
-            // 新 key/base_url/model 整块污染。
-            let oldPID = try! db(e1).scalar("SELECT id FROM providers WHERE is_current=1 AND app_type='claude'") ?? ""
-            let oldConfig = try! db(e1).scalar("SELECT settings_config FROM providers WHERE id=?", [oldPID]) ?? ""
             let second = try! c1.add(raw: "https://gate-new.example.com/v1 sk-gatenew1111111111",
                                      ccOverride: true, cpaOverride: false, dshOverride: false,
                                      models: ["claude-opus-4-1"], force: true,
                                      appType: "claude", appTypeForced: true)
             t.expect(second.ok, "[运行] 导入第二个 provider 成功")
-            t.expect(!e1.fileExists("claude.json"), "[运行] 第二次导入仍不生成 live 配置")
-            // 用测试替身模拟 cc-switch 的旧进程回写动作;没有 live 就不会发生污染。
-            let live = e1.read("claude.json")
-            if !live.isEmpty {
-                try! db(e1).run("UPDATE providers SET settings_config=? WHERE id=?", [live, oldPID])
-            }
-            let oldAfter = try! db(e1).scalar("SELECT settings_config FROM providers WHERE id=?", [oldPID]) ?? ""
-            t.contains(oldAfter, "sk-gaterun1111111111", "[运行] 旧 provider key 保持不变")
-            t.contains(oldAfter, "gate.example.com/v1", "[运行] 旧 provider base_url 保持不变")
-            t.contains(oldAfter, "claude-sonnet-4-5", "[运行] 旧 provider model 保持不变")
-            t.expect(oldAfter == oldConfig, "[运行] 旧 provider settings_config 未被新导入污染")
+            t.contains(e1.read("claude.json"), "sk-gatenew1111111111", "[运行] live 跟随新 current provider")
+            t.contains(e1.read("claude.json"), "gate-new.example.com", "[运行] live base_url 跟随新 provider")
+            t.expect(!e1.read("claude.json").contains("sk-gaterun1111111111"), "[运行] 旧 provider key 不残留在 live")
 
-            // cc-switch 未运行(FAKE=0)→ KeyDrop 独占 live,直接写
+            // 事故二回归复现:cc-switch 按 DB is_current 选目标行,把 live 原样回写进
+            // 当前行。live ≡ current 行 env → 回写是 no-op,新行不被陈旧环境污染。
+            let curPID = try! db(e1).scalar("SELECT id FROM providers WHERE is_current=1 AND app_type='claude'") ?? ""
+            let live = e1.read("claude.json")
+            try! db(e1).run("UPDATE providers SET settings_config=? WHERE id=?", [live, curPID])
+            let curAfter = try! db(e1).scalar("SELECT settings_config FROM providers WHERE id=?", [curPID]) ?? ""
+            t.contains(curAfter, "sk-gatenew1111111111", "[回写模拟] 当前行 key 不变(回写 no-op)")
+            t.contains(curAfter, "gate-new.example.com/v1", "[回写模拟] 当前行 base_url 不变")
+            // live 与 DB 仅 JSON 排版差异(pretty vs 紧凑),语义一致即回写无害
+            t.expect(!curAfter.contains("sk-gaterun1111111111"), "[回写模拟] 陈旧环境未随回写复活")
+            // 旧行(非 current)也不被波及
+            let oldAfter = try! db(e1).scalar("SELECT settings_config FROM providers WHERE id=?", [oldPID]) ?? ""
+            t.contains(oldAfter, "sk-gaterun1111111111", "[回写模拟] 旧 provider 行保持自身环境")
+            t.contains(oldAfter, "gate.example.com/v1", "[回写模拟] 旧行 base_url 不变")
+
+            // PROXY_MANAGED:cc-switch 本地代理接管中,live 不得被直写覆盖
+            e1.write("claude.json", "{\"env\":{\"ANTHROPIC_AUTH_TOKEN\":\"PROXY_MANAGED\",\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:15721\"}}")
+            _ = try! c1.add(raw: "https://gate-third.example.com/v1 sk-gateproxy11111111",
+                            ccOverride: true, cpaOverride: false, dshOverride: false,
+                            models: ["claude-sonnet-4-5"], force: true,
+                            appType: "claude", appTypeForced: true)
+            t.contains(e1.read("claude.json"), "PROXY_MANAGED", "[代理托管] live 保持 PROXY_MANAGED")
+            let cfgProxy = (try? db(e1).scalar(
+                "SELECT settings_config FROM providers WHERE settings_config LIKE '%sk-gateproxy11111111%'")) ?? "{}"
+            t.contains(cfgProxy, "sk-gateproxy11111111", "[代理托管] DB 行仍正常写入")
+
+            // cc-switch 未运行(FAKE=0)→ 同样直写 live(行为不变)
             setenv("KEYDROP_FAKE_CC_RUNNING", "0", 1)
             defer { setenv("KEYDROP_FAKE_CC_RUNNING", "1", 1) }
             let (e2, c2) = makeEnv("pipe-livegate-direct")

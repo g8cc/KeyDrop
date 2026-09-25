@@ -95,8 +95,7 @@ public final class CCSwitchWriter {
         }
 
         // 不要在 DB 事务前缓存运行态:cc-switch 可能恰好在导入期间启动。
-        // Claude live 配置的最终写入点会再次检查当前运行态,避免竞态窗口把新 provider
-        // 的环境写入 cc-switch 仍缓存的旧 current。
+        // PROXY_MANAGED(代理接管)判定必须在最终写入点现读 live,不能用事务前的旧快照。
         let db = try DB(path: Self.dbPath)
         try db.exec("BEGIN IMMEDIATE")
         var dedupReplacedID: String? = nil
@@ -215,19 +214,22 @@ public final class CCSwitchWriter {
                 return result
             }
 
-            // cc-switch 运行时,不直写 live ~/.claude/settings.json。
-            // 事故:KeyDrop 写 live=新 provider env 时,cc-switch 的 in-memory current 还是旧 provider;
-            // cc-switch 在自身事件(UI 切换/启动)会把当前 live 回写进 current 的 settings_config,
-            // 导致旧 provider 的 settings_config 被新 provider 的整块 env 覆盖(url/key/models 全变,
-            // endpoint/name 不动)→ 切回旧 provider 即用错配置(已发生多起)。
-            // cc-switch 不监听外部 switch-settings / DB is_current 改动(实测 25s 无反应),
-            // 所以 KeyDrop 无法靠改 switch-settings 让 cc-switch 应用新 current。
-            // 留给 cc-switch 的 UI 切换去激活:DB 已置新 provider is_current=1、
-            // switch-settings 的 currentProviderClaude 已更新,用户在 cc-switch 点新 provider 即正确应用。
-            // 必须在真正写 live 前再次检查,不能使用 DB 事务开始前的旧快照。
-            if Self.ccSwitchRunning() {
-                return result
-            }
+            // ═══ live 一致性写入(cc-switch 运行与否同策略)═══
+            // 两类回写事故对称发生,根源都是「live 与 DB current 漂移」:
+            // 事故一(旧守卫针对的):KeyDrop 写 live=新 env,而 cc-switch 内存 current 仍指
+            //   旧 provider → cc-switch 在自身事件(UI 切换/启动)把 live 回写进旧 provider 行,
+            //   整块覆盖其 url/key/models。当时修复:运行中不写 live,只写 DB。
+            // 事故二(2026-09-25,sub.tidalrelay.com-0925-0826):DB-only 留下「DB current=新行,
+            //   live=旧环境(用户此前把 Claude 直连到 CPA 127.0.0.1:8317)」的漂移窗口;用户在
+            //   cc-switch 激活新 provider 时,cc-switch 按 DB is_current 选回写目标,把过期
+            //   live 整块盖进新行 → 新 provider 的 baseURL/key 直接变成 CPA 的。实证:被换下
+            //   的旧行在历次 cc-switch DB 备份中始终干净,被污染的只有 is_current=1 的新行。
+            // 统一修复:无论 cc-switch 是否运行,导入即把 live 同步写成新 env,使
+            //   live ≡ DB current —— 回写无论何时触发、命中哪一行,写回的都是该行自己的
+            //   env,退化为 no-op,两类事故同时关死。
+            // PROXY_MANAGED:cc-switch 本地代理接管中,live 不得直写(保持 15721 代理链路)。
+            // 残余风险:极旧版 cc-switch 回写目标若脱离 DB current,由
+            //   reconcileWithCCSwitch 的回写污染自愈(loopback+clientKey 签名)兜底。
             if let claude = readClaudeSettings() {
                 let token = ((claude["env"] as? [String: Any])?["ANTHROPIC_AUTH_TOKEN"] as? String) ?? ""
                 if token != "PROXY_MANAGED" {
@@ -1273,15 +1275,71 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 try mergeCodexConfig(p, models: models, wireApi: wireApi)
             }
         default:
-            // 同 add():cc-switch 运行时不直写 live,避免其把 live 回写进陈旧 current 的
-            // settings_config 造成腐败。仅 KeyDrop 独占 live(cc-switch 未运行)时才写。
-            guard !Self.ccSwitchRunning() else { return }
+            // 同 add() 的 live 一致性策略:刷新的是当前激活 provider,live 若仍是旧环境,
+            // cc-switch 按 DB is_current 回写时会把刷新结果整块盖回旧 env
+            // (2026-09-25 回写污染事故同源)。PROXY_MANAGED(代理接管)不得直写。
+            if let claude = readClaudeSettings(),
+               ((claude["env"] as? [String: Any])?["ANTHROPIC_AUTH_TOKEN"] as? String) == "PROXY_MANAGED" {
+                return
+            }
             try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models))
         }
     }
 
     public func providerExists(_ id: String, appType: String) -> Bool {
         providerExists(id: id, appType: appType)
+    }
+
+    /// 回写污染签名:baseURL 指向本机回环(CPA 常驻 127.0.0.1:8317 等)。
+    /// KeyDrop 托管的直连网关 claude 行/live 不应出现回环端点
+    static func isLoopbackURL(_ url: String) -> Bool {
+        guard let host = URL(string: url)?.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "0.0.0.0"
+    }
+
+    /// 对账自愈:cc-switch 按 DB is_current 把 live 回写进当前 provider 行(2026-09-25
+    /// sub.tidalrelay 事故)。若 live 在导入后漂移(如用户手动把 Claude 切回 CPA),KeyDrop
+    /// 托管的 claude 行会被陈旧 env 整块覆盖。
+    /// 检测签名:行内 ANTHROPIC_BASE_URL 指向 loopback 且 ANTHROPIC_AUTH_TOKEN ==
+    /// CPA clientKey —— 直连网关的托管行绝不应该是本地代理端点(claude 类型 KeyDrop
+    /// 有意不建 CPA 常驻,见 syncCPAResidentEntries)。签名要求两个条件同时命中,
+    /// 用户在 cc-switch 手改 key/换网关(非 loopback)一律不碰。
+    /// 命中则用条目的 url/key/models 重写该行;该行恰为当前激活且 live 同样是
+    /// loopback 陈旧环境时一并修 live,否则用户一切换又把旧 live 写回来。
+    /// - Returns: 修复说明;空串 = 未污染/无需修复
+    public func repairClobberedClaudeRow(providerID: String, url: String, key: String,
+                                         models: [String], cpaClientKey: String) throws -> String {
+        guard FileManager.default.fileExists(atPath: Self.dbPath) else { return "" }
+        let db = try DB(path: Self.dbPath)
+        guard let sc = try db.scalar(
+            "SELECT settings_config FROM providers WHERE id = ? AND app_type = 'claude'", [providerID]),
+              let data = sc.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let env = obj["env"] as? [String: Any]
+        else { return "" }
+        let rowURL = env["ANTHROPIC_BASE_URL"] as? String ?? ""
+        let rowKey = env["ANTHROPIC_AUTH_TOKEN"] as? String ?? ""
+        // 未污染:行内 key 就是条目 key;非 loopback 的手改(换网关/轮换 key)不碰
+        guard rowKey != key, Self.isLoopbackURL(rowURL), rowKey == cpaClientKey else { return "" }
+        var p = ParsedKey()
+        p.url = url
+        p.key = key
+        p.model = models.first
+        let fixed = try claudeSettingsConfig(p, models: models)
+        try db.run(
+            "UPDATE providers SET settings_config = ? WHERE id = ? AND app_type = 'claude'",
+            [fixed, providerID]
+        )
+        // 当前行 + live 同污染:连 live 一起修,否则下次回写又盖回来
+        if let live = readClaudeSettings(),
+           let liveEnv = live["env"] as? [String: Any],
+           let liveKey = liveEnv["ANTHROPIC_AUTH_TOKEN"] as? String,
+           liveKey != key, liveKey == cpaClientKey,
+           Self.isLoopbackURL(liveEnv["ANTHROPIC_BASE_URL"] as? String ?? "") {
+            try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models))
+            return "已修复被回写污染的 provider 行与 live 配置(陈旧 loopback 环境)"
+        }
+        return "已修复被回写污染的 provider 行(陈旧 loopback 环境)"
     }
 
     static public func ccSwitchRunning() -> Bool {
