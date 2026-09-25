@@ -598,13 +598,16 @@ final class AppState: ObservableObject {
             // OAuth 账号代理绑定提醒:只数数 + 落日志,绝不自动改 auth 文件
             // (批量写另一个应用的凭证必须显式触发;粘性设计保证手动重跑永远安全)。
             // 放在 UI 层巡检而非 Core.scanHealth:测试套件跑得到 Core,碰不到 AppState,
-            // 免得测试环境经 docker inspect 触到开发者真实 auth-dir
-            if let dir = ProxyPool.defaultAuthDir() {
-                let unbound = ProxyPool.unboundAccounts(authDir: dir).count
-                if unbound > 0 && unbound != Self.lastLoggedUnboundCount {
-                    Self.lastLoggedUnboundCount = unbound
-                    AppLog.info("CPA: \(unbound) 个 OAuth 账号未绑定独立代理,运行 KeyDrop proxy-pool 一键粘性绑定(默认读 ~/.keydrop/proxy-pool.txt)")
-                }
+            // 免得测试环境经 docker inspect 触到开发者真实 auth-dir。
+            // API 模式扫描走 /auth-files 管理端点;defaultAuthDir 的 locateConfig/fileExists
+            // 会 stat Documents 下的 auth-dir —— TCC「文稿」弹窗来源(2026-09-25:
+            // v1.4.32 上每次巡检即弹),apiMode 下绝不触碰
+            let unbound = ProxyPool.unboundAccounts(
+                authDir: CPAAPI.apiMode ? nil : ProxyPool.defaultAuthDir()
+            ).count
+            if unbound > 0 && unbound != Self.lastLoggedUnboundCount {
+                Self.lastLoggedUnboundCount = unbound
+                AppLog.info("CPA: \(unbound) 个 OAuth 账号未绑定独立代理,运行 KeyDrop proxy-pool 一键粘性绑定(默认读 ~/.keydrop/proxy-pool.txt)")
             }
             Core.shared.scanHealth { msgs in
                 DispatchQueue.main.async { [weak self] in

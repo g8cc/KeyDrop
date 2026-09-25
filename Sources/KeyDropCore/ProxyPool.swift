@@ -96,8 +96,12 @@ public enum ProxyPool {
 
     /// 扫描 auth-dir 下所有 *.json 凭证文件。types 为 nil 时不筛类型。
     /// 损坏的 json 跳过并记日志,不让一个坏文件废掉整批。
-    public static func scanAccounts(authDir: String, types: Set<String>? = nil) -> [PoolAccount] {
+    /// API 模式走 /auth-files 管理端点,authDir 被忽略(传 nil 即可)——
+    /// 绝不 stat 本地目录:Documents 下的 auth-dir 一次 stat 就可能是一次
+    /// TCC「文稿」弹窗(更新换签名使授权作废后)。文件模式需要 authDir。
+    public static func scanAccounts(authDir: String?, types: Set<String>? = nil) -> [PoolAccount] {
         if CPAAPI.apiMode { return scanAccountsAPI(types: types) }
+        guard let authDir else { return [] }
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(atPath: authDir) else { return [] }
         var out: [PoolAccount] = []
@@ -169,7 +173,7 @@ public enum ProxyPool {
     }
 
     /// 未绑定独立代理的活跃账号(纯读,供巡检提醒用;禁用账号不算,用户手动停的不替他做主)。
-    public static func unboundAccounts(authDir: String, types: Set<String>? = nil) -> [PoolAccount] {
+    public static func unboundAccounts(authDir: String?, types: Set<String>? = nil) -> [PoolAccount] {
         scanAccounts(authDir: authDir, types: types).filter { !$0.disabled && $0.existingProxy == nil }
     }
 

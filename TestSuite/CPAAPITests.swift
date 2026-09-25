@@ -216,5 +216,40 @@ enum CPAAAPITests {
             t.equal(ep2?.baseURL, "http://127.0.0.1:18432", "[文件模式] 行为不变")
             t.equal(ep2?.clientKey, "sk-filemode", "[文件模式] clientKey 仍读文件")
         }
+
+        // MARK: - ProxyPool apiMode 扫描零文件触碰(2026-09-25:scanHealth 巡检经
+        // defaultAuthDir stat Documents 下的 auth-dir,更新换签名使 TCC 授权作废后
+        // 每次巡检即弹「文稿」;apiMode 应走 /auth-files 管理端点,本地目录无关)
+        h.runSuite("ProxyPool.apiMode 扫描零文件触碰") { t in
+            guard let server = try? MockHTTPServer(mode: .cpaMgmt) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let origKey = Prefs.shared.cpaManagementKey
+            let origBase = Prefs.shared.cpaAPIBase
+            let origProxy = Prefs.shared.proxy
+            Prefs.shared.proxy = ""
+            Prefs.shared.cpaManagementKey = "test-key"
+            Prefs.shared.cpaAPIBase = "http://127.0.0.1:\(server.port)"
+            defer {
+                Prefs.shared.cpaManagementKey = origKey
+                Prefs.shared.cpaAPIBase = origBase
+                Prefs.shared.proxy = origProxy
+            }
+            server.mgmtLock.lock()
+            server.cpaYAML = "port: 8317\n"
+            server.cpaAuthFiles = ["acc-a.json": "{\"type\":\"xai\",\"email\":\"a@x.com\",\"proxy_url\":\"\"}"]
+            server.mgmtLock.unlock()
+
+            // authDir 传 nil:apiMode 走 /auth-files,本地目录完全无关
+            // (有本地 auth-dir 可 stat 的场景反而会弹 TCC,这正是要防的)
+            let unbound = ProxyPool.unboundAccounts(authDir: nil)
+            t.equal(unbound.count, 1, "[apiMode] 经管理 API 扫到未绑定账号")
+            t.equal(unbound.first?.fileName, "acc-a.json", "[apiMode] 账号来自 /auth-files")
+
+            // 文件模式:authDir nil → 无从扫描,返回空(不崩)
+            Prefs.shared.cpaManagementKey = nil
+            t.equal(ProxyPool.unboundAccounts(authDir: nil).count, 0, "[文件模式] 无 authDir 返回空")
+        }
     }
 }
