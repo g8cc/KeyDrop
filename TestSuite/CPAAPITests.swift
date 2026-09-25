@@ -167,5 +167,54 @@ enum CPAAAPITests {
                 t.expect(false, "prefs 持久化回归失败: \(error)")
             }
         }
+
+        // MARK: - endpointInfo 零文件触碰(2026-09-25 事故:apiMode 下读路径仍 locateConfig
+        // stat Documents 里的 config.yaml,更新换签名使 TCC 授权作废后启动即弹「文稿」;
+        // v1.4.31 起启动对账调 endpointInfo,把偶发变成必弹)
+        h.runSuite("CPAAPI.endpointInfo 零文件触碰") { t in
+            let oldCfg = ProcessInfo.processInfo.environment["KEYDROP_CPA_CONFIG"]
+            let oldLLMKey = ProcessInfo.processInfo.environment["KEYDROP_LLM_KEY"]
+            defer {
+                if let oldCfg { setenv("KEYDROP_CPA_CONFIG", oldCfg, 1) } else { unsetenv("KEYDROP_CPA_CONFIG") }
+                if let oldLLMKey { setenv("KEYDROP_LLM_KEY", oldLLMKey, 1) } else { unsetenv("KEYDROP_LLM_KEY") }
+            }
+            guard let server = try? MockHTTPServer(mode: .cpaMgmt) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let origKey = Prefs.shared.cpaManagementKey
+            let origBase = Prefs.shared.cpaAPIBase
+            let origProxy = Prefs.shared.proxy
+            Prefs.shared.proxy = ""
+            Prefs.shared.cpaManagementKey = "test-key"
+            Prefs.shared.cpaAPIBase = "http://127.0.0.1:\(server.port)"
+            defer {
+                Prefs.shared.cpaManagementKey = origKey
+                Prefs.shared.cpaAPIBase = origBase
+                Prefs.shared.proxy = origProxy
+            }
+
+            // ① apiMode:KEYDROP_CPA_CONFIG 指向不存在的路径 —— 旧实现 locateConfig
+            //    返回 nil → endpointInfo 整体 nil;新实现经管理 API 取文本,零文件依赖
+            setenv("KEYDROP_CPA_CONFIG", "/nonexistent-keydrop-tcc/config.yaml", 1)
+            setenv("KEYDROP_LLM_KEY", "", 1)
+            server.mgmtLock.lock()
+            server.cpaYAML = "port: 18317\napi-keys:\n  - sk-mockclientkey\n"
+            server.mgmtLock.unlock()
+            let ep = CPAWriter.endpointInfo()
+            let e = t.notNil(ep, "[apiMode] 本地无文件也能取到 endpoint")
+            t.equal(e?.baseURL, "http://127.0.0.1:18317", "[apiMode] port 取自管理 API 文本")
+            t.equal(e?.clientKey, "sk-mockclientkey", "[apiMode] clientKey 取自管理 API 文本")
+
+            // ② 文件模式(无管理密钥):行为不变,locateConfig+读文件
+            Prefs.shared.cpaManagementKey = nil
+            let tmpCfg = NSTemporaryDirectory() + "kd-tcc-filemode-\(UUID().uuidString.prefix(6)).yaml"
+            try? "port: 18432\napi-keys:\n  - sk-filemode\n".write(toFile: tmpCfg, atomically: true, encoding: .utf8)
+            defer { try? FileManager.default.removeItem(atPath: tmpCfg) }
+            setenv("KEYDROP_CPA_CONFIG", tmpCfg, 1)
+            let ep2 = CPAWriter.endpointInfo()
+            t.equal(ep2?.baseURL, "http://127.0.0.1:18432", "[文件模式] 行为不变")
+            t.equal(ep2?.clientKey, "sk-filemode", "[文件模式] clientKey 仍读文件")
+        }
     }
 }

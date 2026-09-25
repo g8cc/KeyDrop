@@ -36,11 +36,21 @@ public enum LLMParser {
     }
 
     public static func clientKeyFromConfig() -> String {
-        guard let cfg = CPAWriter.locateConfig(),
-              let content = try? String(contentsOfFile: cfg, encoding: .utf8)
-        else { return "" }
+        // 经 CPAWriter.fetchConfigText:API 模式走管理 API(零文件触碰,TCC 根治),
+        // 文件模式 locateConfig+读文件。原实现无条件读文件,是 API 模式下仍弹
+        // 「文稿」授权的残余源头之一
+        clientKey(fromConfigText: CPAWriter.fetchConfigText())
+    }
+
+    /// 解析 client key:优先 KEYDROP_LLM_KEY env;否则取配置文本顶层 api-keys 段的
+    /// 第一个条目。text 为 nil(配置不可达:API 拉取失败/无文件)→ 空串。
+    public static func clientKey(fromConfigText text: String?) -> String {
+        if let k = ProcessInfo.processInfo.environment["KEYDROP_LLM_KEY"], !k.isEmpty {
+            return k
+        }
+        guard let text, !text.isEmpty else { return "" }
         var inSection = false
-        for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let l = String(line)
             let trimmed = l.trimmingCharacters(in: .whitespaces)
             if !l.hasPrefix(" ") && !l.hasPrefix("\t") {

@@ -222,6 +222,8 @@ KeyDrop 的写入目标是**固定的这几个**:Claude Code、Codex CLI、OpenC
 - **文件模式**(默认):FileLock + 原子写直接改 config.yaml。
 - **API 模式**(设置了 CPA 管理密钥):全部读写走 CPA 管理 API,不触碰数据目录文件(根治 macOS TCC"文稿"弹窗)。
 
+API 模式的零触碰覆盖**读路径**:endpointInfo(端口+客户端 key,供常驻入口/回写自愈/链路探测)也走管理 API 拉配置文本,不 stat 不读文件——config.yaml 在 ~/Documents 下时,任何 stat 都可能是一次"文稿"弹窗(更新换 ad-hoc 签名使 TCC 授权作废后)。v1.4.31 曾因启动对账调 endpointInfo 使弹窗变成"启动必弹",v1.4.32 修复。彻底消除弹窗的另一腿:构建机创建 `KeyDropLocal` 签名证书(make-app.sh 指引),让 TCC 授权跨更新保持。
+
 ---
 
 ## 7. DSH 写入详解(§6.3)

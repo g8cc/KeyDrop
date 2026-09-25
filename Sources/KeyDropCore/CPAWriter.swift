@@ -152,8 +152,14 @@ public final class CPAWriter {
     }
 
     public static func endpointInfo() -> CPAEndpoint? {
+        // 统一经 fetchConfigText 取配置文本:API 模式走管理 API(对 ~/Documents 下的
+        // config.yaml 零触碰 —— 2026-09-25 事故:v1.4.31 起启动对账调 endpointInfo,
+        // locateConfig 对 Documents 路径 stat,更新换签名使 TCC 授权作废后启动即弹窗)。
+        // 一份文本同时供 port 与 clientKey 解析,替代原先的两次独立文件读。
+        let text = fetchConfigText()
         let port = ProcessInfo.processInfo.environment["KEYDROP_CPA_PORT"]
-            ?? readPortFromConfig() ?? "8317"
+            ?? readPort(from: text)
+            ?? "8317"
         let host = ProcessInfo.processInfo.environment["KEYDROP_CPA_HOST"] ?? "127.0.0.1"
         let baseURL: String
         if let envURL = ProcessInfo.processInfo.environment["KEYDROP_LLM_ENDPOINT"], !envURL.isEmpty {
@@ -161,15 +167,26 @@ public final class CPAWriter {
         } else {
             baseURL = "http://\(host):\(port)"
         }
-        let clientKey = LLMParser.apiKey
+        let clientKey = LLMParser.clientKey(fromConfigText: text)
         guard !clientKey.isEmpty else { return nil }
         return CPAEndpoint(baseURL: baseURL, clientKey: clientKey)
     }
 
-    private static func readPortFromConfig() -> String? {
-        guard let cfg = locateConfig(),
-              let content = try? CPAAPI.readConfigText(path: cfg)
-        else { return nil }
+    /// 读 CPA 配置文本的统一入口。API 模式走管理 API(path 参数被忽略,服务端用它
+    /// 自己的配置),对本地文件零触碰;文件模式 locateConfig+读文件(行为不变)。
+    static func fetchConfigText() -> String? {
+        if CPAAPI.apiMode {
+            guard let text = try? CPAAPI.readConfigText(path: Prefs.shared.cpaConfigPath ?? ""),
+                  !text.isEmpty else { return nil }
+            return text
+        }
+        guard let cfg = locateConfig() else { return nil }
+        return try? CPAAPI.readConfigText(path: cfg)
+    }
+
+    /// 从配置文本解析顶层 port: 行(缩进行不算,防止误读嵌套段)
+    static func readPort(from content: String?) -> String? {
+        guard let content else { return nil }
         for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
             let l = String(line)
             let trimmed = l.trimmingCharacters(in: .whitespaces)

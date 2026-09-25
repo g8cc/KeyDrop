@@ -821,8 +821,10 @@ public final class Core {
         var seen = Set<String>()
         var out: [String] = []
         for e in history.snapshot() where e.status == "active" && e.targets.contains("cpa") {
+            // API 模式下对 stored 路径 stat 会触发 TCC「文稿」弹窗(路径在 Documents 时),
+            // 且读取本身走管理 API 不需要文件存在 —— 跳过存在性检查
             guard let cfg = e.cpaConfigPath, let url = e.url,
-                  FileManager.default.fileExists(atPath: cfg) else { continue }
+                  CPAAPI.apiMode || FileManager.default.fileExists(atPath: cfg) else { continue }
             for m in CPAWriter(configPath: cfg).entryModels(baseURL: url) where seen.insert(m).inserted {
                 out.append(m)
             }

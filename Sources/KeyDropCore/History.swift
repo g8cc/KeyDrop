@@ -665,13 +665,18 @@ public final class Prefs {
 
     public func resolvedCPAConfig() -> String? {
         if let override = ProcessInfo.processInfo.environment["KEYDROP_CPA_CONFIG"],
-           FileManager.default.fileExists(atPath: override) {
+           CPAAPI.apiMode || FileManager.default.fileExists(atPath: override) {
             return override
         }
         lock.lock()
         let stored = _cpaConfigPath
         lock.unlock()
-        if let p = stored, FileManager.default.fileExists(atPath: p) {
+        // API 模式:path 只作为管理 API 请求的记录参数(服务端用它自己的配置),
+        // 严禁对 stored 路径 stat —— Documents 下的路径一次 stat 就可能是一次
+        // 「文稿」弹窗(更新换签名使 TCC 授权作废后)。文件模式才需要确认存在。
+        if CPAAPI.apiMode {
+            if let p = stored { return p }
+        } else if let p = stored, FileManager.default.fileExists(atPath: p) {
             return p
         }
         return CPAWriter.locateConfig()
