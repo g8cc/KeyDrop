@@ -50,7 +50,10 @@ enum DSHWriterTests {
             t.contains(settings, "apiKeyEnv: KEYDROP_0219DFA3_API_KEY", "env 引用")
             t.contains(settings, "- id: deepseek-v4-flash-free", "模型写入")
             let creds = env.read("dsh-creds.yaml")
-            t.contains(creds, "KEYDROP_0219DFA3_API_KEY: sk-secret-key-123456", "凭证写入")
+            // dsh 的凭据格式:顶层仅 version/refs,凭据必须缩进嵌在 refs 内
+            // (顶层裸写会被 dsh 解析器拒绝 → 启动崩溃,2026-09-25 07FA1C9C 事故)
+            t.contains(creds, "version: 1\nrefs:\n  KEYDROP_0219DFA3_API_KEY: sk-secret-key-123456",
+                       "凭证写入:骨架 + refs 内缩进")
 
             // 幂等:再次 add 不重复块
             _ = try! DSHWriter.add(
@@ -100,6 +103,77 @@ enum DSHWriterTests {
                      "读失败时 settings 内容不变(未被清空)")
             t.expect(try! Data(contentsOf: URL(fileURLWithPath: badCreds)) == Data([0xFF, 0xFE, 0x00]),
                      "读失败时 credentials 内容不变")
+        }
+
+        // MARK: - refs 结构回归:凭据必须缩进嵌在 refs 内,顶格裸写会让 dsh 启动即崩
+        // 2026-09-25 事故:KEYDROP_07FA1C9C_API_KEY 被顶层裸写(文件被外部手工缩进修复,
+        // 但写入方不感知 refs 的话,下次 upsert 找不到缩进行会再追加顶格重复行 → 复崩)
+        h.runSuite("DSHWriter.refs 结构回归") { t in
+            // ① 事故文件形态:多行标量条目结尾 + 顶格遗留行
+            let env = try! TestEnv("dsh-refs-incident")
+            defer { env.cleanup() }
+            env.write("dsh-creds.yaml", """
+            version: 1
+            refs:
+              DEEPSEEK_API_KEY: sk-existing
+              WORKBUDDY_ACCOUNT_X: '{ "a": "openid
+                profile offline",
+                "b": 1 }'
+
+            KEYDROP_07FA1C9C_API_KEY: sk-legacy-top
+            """)
+            _ = try! DSHWriter.add(
+                providerID: "07fa1c9c-1111-2222-3333-444455556666",
+                key: "sk-healed",
+                url: "https://sub.tidalrelay.com",
+                models: ["deepseek-v4-flash"]
+            )
+            let healed = env.read("dsh-creds.yaml")
+            t.expect(!healed.contains("\nKEYDROP_07FA1C9C_API_KEY:"), "[事故] 顶格遗留行已清除")
+            t.contains(healed, "\n  KEYDROP_07FA1C9C_API_KEY: sk-healed", "[事故] 凭据缩进收敛进 refs")
+            t.contains(healed, "sk-existing", "[事故] 他人凭据保留")
+            t.contains(healed, "WORKBUDDY_ACCOUNT_X", "[事故] 多行标量条目保留")
+            // 插入位置必须在多行标量整个条目之后(块末尾),不得切断标量
+            let scalarEnd = healed.range(of: "\"b\": 1 }")
+            let newEntry = healed.range(of: "\n  KEYDROP_07FA1C9C_API_KEY:")
+            t.expect(scalarEnd != nil && newEntry != nil && scalarEnd!.upperBound < newEntry!.lowerBound,
+                     "[事故] 插入在多行标量之后(块末尾)")
+
+            // ② 缩进行原位更新:不产生重复、不出现顶格行、旧值无残留
+            _ = try! DSHWriter.add(
+                providerID: "07fa1c9c-1111-2222-3333-444455556666",
+                key: "sk-rotated",
+                url: "https://sub.tidalrelay.com",
+                models: ["deepseek-v4-flash"]
+            )
+            let updated = env.read("dsh-creds.yaml")
+            t.equal(updated.components(separatedBy: "KEYDROP_07FA1C9C_API_KEY").count - 1, 1,
+                    "[更新] 单一出现(无重复追加)")
+            t.contains(updated, "\n  KEYDROP_07FA1C9C_API_KEY: sk-rotated", "[更新] 值已换新且保持缩进")
+            t.expect(!updated.contains("sk-healed"), "[更新] 旧值无残留")
+            t.expect(!updated.contains("\nKEYDROP_07FA1C9C_API_KEY:"), "[更新] 无顶格行")
+
+            // ③ remove 清缩进行;他人凭据不受影响
+            try! DSHWriter.remove(providerID: "07fa1c9c-1111-2222-3333-444455556666")
+            let afterDel = env.read("dsh-creds.yaml")
+            t.expect(!afterDel.contains("KEYDROP_07FA1C9C_API_KEY"), "[删除] 缩进行已清")
+            t.contains(afterDel, "DEEPSEEK_API_KEY: sk-existing", "[删除] 他人凭据保留")
+
+            // ④ 只剩自己一条时删空 → refs 收敛为显式空映射(裸 refs: 会被读成 null)
+            let env2 = try! TestEnv("dsh-refs-empty")
+            defer { env2.cleanup() }
+            env2.write("dsh-creds.yaml", "version: 1\nrefs:\n  KEYDROP_BBB22222_API_KEY: sk-only\n")
+            _ = try! DSHWriter.add(
+                providerID: "bbb22222-1111-2222-3333-444455556666",
+                key: "sk-next",
+                url: "https://b.com",
+                models: ["deepseek-v4-flash"]
+            )
+            try! DSHWriter.remove(providerID: "bbb22222-1111-2222-3333-444455556666")
+            let emptied = env2.read("dsh-creds.yaml")
+            t.contains(emptied, "refs: {}", "[删空] refs 收敛为显式空映射")
+            t.expect(!emptied.contains("KEYDROP_BBB22222"), "[删空] 凭据已清")
+            t.contains(emptied, "version: 1", "[删空] 骨架保留")
         }
     }
 }

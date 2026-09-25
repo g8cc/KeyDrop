@@ -252,29 +252,69 @@ public enum DSHWriter {
 
     // MARK: - credentials
 
+    /// .credentials.yaml 结构(dsh 的格式):顶层仅 version/refs,凭据必须以 2 空格缩进
+    /// 嵌在 refs: 映射内 —— dsh 解析器拒绝未知顶层键,顶层裸写会让 dsh 启动即崩。
+    /// (2026-09-25 事故:KEYDROP_07FA1C9C_API_KEY 被顶层裸写;外部只手工缩进了文件,
+    /// 写入方若不感知 refs,下一次 upsert 找不到缩进行会再追加一条顶格重复行 → 复崩)
+    /// 行为:
+    /// - 已有该 env 缩进行 → 原位更新(不动其他条目,含多行标量);
+    /// - 顶格遗留行(旧版 bug 产物)→ 顺带清除,凭据统一收敛进 refs;
+    /// - 无该 env → 插到 refs 块末尾(下一个顶层键之前/EOF)。块边界按「第一个顶格
+    ///   非空行」判定,多行标量的续行(更深缩进)不会误判成边界 → 绝不插进标量中间;
+    /// - 空文件/新建 → 落 version:1 + refs: 骨架;非空但无 refs 段(外来文件)→
+    ///   末尾补一段 refs 块,不改动既有内容。
     private static func upsertCredential(_ text: inout String, env: String, value: String) throws {
-        let line = "\(env): \(yamlScalar(value))"
-        let lines = text.components(separatedBy: "\n")
+        let entry = "  \(env): \(yamlScalar(value))"
+        var lines = text.components(separatedBy: "\n")
+
         var replaced = false
-        var out: [String] = []
+        var cleaned: [String] = []
         for l in lines {
-            if l.hasPrefix("\(env):") || l.hasPrefix("\(env): ") {
-                out.append(line)
-                replaced = true
+            if l.hasPrefix("  \(env):") {
+                // 只留一份:重复行(历史遗留)一并去重
+                if !replaced { cleaned.append(entry); replaced = true }
+            } else if l.hasPrefix("\(env):") {
+                continue  // 顶格遗留:不保留任何顶格形态
             } else {
-                out.append(l)
+                cleaned.append(l)
             }
         }
+        lines = cleaned
+
         if !replaced {
-            if !text.isEmpty, !text.hasSuffix("\n") { out.append("") }
-            out.append(line)
+            guard let refsIdx = lines.firstIndex(where: { $0.hasPrefix("refs:") }) else {
+                if lines.allSatisfy({ $0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                    lines = ["version: 1", "refs:", entry]
+                } else {
+                    while lines.last?.isEmpty == true { lines.removeLast() }
+                    lines.append("refs:")
+                    lines.append(entry)
+                }
+                text = lines.joined(separator: "\n")
+                return
+            }
+            if lines[refsIdx] == "refs: {}" { lines[refsIdx] = "refs:" }
+            let blockEnd = lines[(refsIdx + 1)...].firstIndex {
+                !$0.isEmpty && !$0.hasPrefix(" ")
+            } ?? lines.count
+            lines.insert(entry, at: blockEnd)
         }
-        text = out.joined(separator: "\n")
+        text = lines.joined(separator: "\n")
     }
 
+    /// 删除该 env 的凭据行:同时匹配 refs 内缩进行与顶格遗留行(冒号收尾保证
+    /// 不会误命中更长 env 名)。refs 块删空时收敛为显式空映射 `refs: {}` ——
+    /// 裸 `refs:` 会被 YAML 读成 null,撞 dsh 的映射类型 schema 风险更高。
     private static func removeCredential(_ text: inout String, env: String) {
-        let lines = text.components(separatedBy: "\n")
-        text = lines.filter { !($0.hasPrefix("\(env):") || $0.hasPrefix("\(env): ")) }
-            .joined(separator: "\n")
+        var lines = text.components(separatedBy: "\n")
+        lines.removeAll { $0.hasPrefix("  \(env):") || $0.hasPrefix("\(env):") }
+        if let refsIdx = lines.firstIndex(where: { $0 == "refs:" }) {
+            let blockEnd = lines[(refsIdx + 1)...].firstIndex {
+                !$0.isEmpty && !$0.hasPrefix(" ")
+            } ?? lines.count
+            let hasEntry = lines[(refsIdx + 1)..<blockEnd].contains { !$0.isEmpty }
+            if !hasEntry { lines[refsIdx] = "refs: {}" }
+        }
+        text = lines.joined(separator: "\n")
     }
 }
