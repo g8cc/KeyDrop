@@ -76,14 +76,25 @@ public final class CCSwitchWriter {
         let supportsResponses = appType == "codex" && !fakeRunning
             ? APITester.supportsResponsesAPI(base: url, key: key, proxy: proxy) : true
         let apiFormat = supportsResponses ? "openai_responses" : "openai_chat"
-        let meta = appType == "codex"
-            ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"\(apiFormat)\"}"
-            : "{}"
 
         // opencode 双写(DB settings_config + opencode.json)必须共用同一份 modelDict,
         // 否则两路随机后缀会 drift。firstModel 保留用户传入顺序优先级。
         let opencodeModels = models.isEmpty ? (p.model.map { [$0] } ?? []) : models
         let opencodeDict = opencodeModelDict(providerID: id, baseURL: url, models: opencodeModels)
+
+        // 导入来源标记:reconcile 的孤儿收养凭此识别「KeyDrop 临时导入的 provider」。
+        // 更新重启 kill 的毫秒级窗口可能留下「产物在、账本无」的孤儿(产物写入先于
+        // history.append),收养时 url/key 取自行内、模型取自标记,无需反向解析配置。
+        // 常驻入口(syncCPAResident* 的 meta="{}")与用户手写行没有此标记,永不触碰。
+        var metaObj: [String: Any] = [
+            "keydrop": ["origin": "import", "models": opencodeModels]
+        ]
+        if appType == "codex" {
+            metaObj["commonConfigEnabled"] = false
+            metaObj["endpointAutoSelect"] = true
+            metaObj["apiFormat"] = apiFormat
+        }
+        let meta = try jsonString(metaObj)
 
         let settingsConfig: String
         if appType == "opencode" {
@@ -1340,6 +1351,58 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             return "已修复被回写污染的 provider 行与 live 配置(陈旧 loopback 环境)"
         }
         return "已修复被回写污染的 provider 行(陈旧 loopback 环境)"
+    }
+
+    /// 孤儿导入:cc.add 已写入 provider、但 history.append 尚未执行时进程被 kill
+    /// (更新重启的毫秒级窗口)→ 产物在、账本无,删除/刷新/对账都不再认领它。
+    /// 识别凭据是 cc.add 写入 meta 的 keydrop.origin=import 标记 —— 常驻入口与
+    /// 用户手写行没有标记,绝不进入本结果;claimed = 账本全部条目(含已删除)的
+    /// ccProviderID,已认领的不算孤儿。url/key 取自行内且都必须存在,缺一跳过。
+    public struct CCOrphanImport {
+        public let providerID: String
+        public let name: String?
+        public let appType: String
+        public let url: String
+        public let key: String
+        public let models: [String]
+        public let createdAt: TimeInterval?
+    }
+
+    public func orphanImports(claimed: Set<String>) throws -> [CCOrphanImport] {
+        guard FileManager.default.fileExists(atPath: Self.dbPath) else { return [] }
+        let db = try DB(path: Self.dbPath)
+        let rows = try db.query("""
+            SELECT p.id, p.name, p.app_type, p.meta, p.created_at, p.settings_config, e.url
+            FROM providers p JOIN provider_endpoints e ON p.id = e.provider_id
+            """)
+        var out: [CCOrphanImport] = []
+        for row in rows {
+            guard row.count > 6,
+                  let pid = row[0], !claimed.contains(pid),
+                  let appType = row[2],
+                  let metaStr = row[3],
+                  let sc = row[5],
+                  let url = row[6], !url.isEmpty
+            else { continue }
+            guard let metaData = metaStr.data(using: .utf8),
+                  let metaObj = try? JSONSerialization.jsonObject(with: metaData) as? [String: Any],
+                  let marker = metaObj["keydrop"] as? [String: Any],
+                  (marker["origin"] as? String) == "import"
+            else { continue }
+            guard let key = Self.providerAPIKey(from: sc, appType: appType), !key.isEmpty else { continue }
+            let models = (marker["models"] as? [Any])?.compactMap { $0 as? String } ?? []
+            let createdAtMs = row[4].flatMap(Double.init)
+            out.append(CCOrphanImport(
+                providerID: pid,
+                name: row[1],
+                appType: appType,
+                url: url,
+                key: key,
+                models: models,
+                createdAt: createdAtMs.map { $0 / 1000 }
+            ))
+        }
+        return out
     }
 
     static public func ccSwitchRunning() -> Bool {

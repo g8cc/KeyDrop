@@ -1064,6 +1064,7 @@ public final class Core {
     /// 修复(见 repairClobberedClaudeRow;2026-09-25 sub.tidalrelay 事故)。
     public func reconcileWithCCSwitch() -> [String] {
         var out: [String] = []
+        out.append(contentsOf: adoptOrphanImports())
         out.append(contentsOf: repairClobberedCCRows())
         let outLock = NSLock()
         let candidates = history.snapshot()
@@ -1140,12 +1141,73 @@ public final class Core {
         return out
     }
 
+    /// 孤儿收养(更新重启打断导入的兜底):cc.add 写入 provider 后、history.append
+    /// 前被 kill 的毫秒级窗口会留下「产物在、账本无」的孤儿——删除/刷新/对账都不再
+    /// 认领它。收养 = 凭 cc.add 写入的 meta 导入标记识别孤儿(常驻/用户手写行无标记,
+    /// 永不触碰),从 provider 行重建账本条目:url/key 取自行内、模型取自标记、健康
+    /// 直接置 ok(能建行说明导入时已通过可用性测试)。收养而非删除:配置是完好的,
+    /// 删掉等于丢一把已验证的 key;收养后删除/刷新全部恢复可用。
+    /// key 已在账本(换了 URL 的场景)时跳过并告警——绝不静默制造重复凭据。
+    /// CPA/DSH 产物若在崩溃前已写入则保留(无害),重新导入一次(幂等)即可补齐 tag。
+    private func adoptOrphanImports() -> [String] {
+        var out: [String] = []
+        let snapshot = history.snapshot()
+        let claimed = Set(snapshot.compactMap { $0.ccProviderID })
+        let knownKeys = Set(snapshot.compactMap { $0.key })
+        let orphans: [CCSwitchWriter.CCOrphanImport]
+        do {
+            orphans = try cc.orphanImports(claimed: claimed)
+        } catch {
+            return ["⚠ 孤儿扫描失败: \(error.localizedDescription)"]
+        }
+        for o in orphans {
+            let label = o.name ?? String(o.providerID.prefix(8))
+            if knownKeys.contains(o.key) {
+                out.append("⚠ 孤儿 provider「\(label)」的 key 已存在于账本(URL 不同),未收养,请人工处理")
+                continue
+            }
+            let appTag = o.appType == "claude" ? "ccswitch" : "ccswitch-\(o.appType)"
+            let keyMasked = o.key.count > 8
+                ? String(o.key.prefix(6)) + "…" + String(o.key.suffix(4))
+                : String(repeating: "*", count: max(o.key.count, 6))
+            var entry = HistoryEntry(
+                id: UUID().uuidString.lowercased(),
+                ts: o.createdAt ?? Date().timeIntervalSince1970,
+                raw: "orphan-adopt: \(o.appType) \(o.url)",
+                format: "orphan-adopt",
+                name: o.name,
+                url: o.url,
+                model: o.models.first,
+                models: o.models.isEmpty ? nil : o.models,
+                key: o.key,
+                keyMasked: keyMasked,
+                targets: [appTag],
+                ccProviderID: o.providerID,
+                ccRenamedFrom: nil,
+                ccRenamedTo: nil,
+                cpaConfigPath: nil,
+                status: "active",
+                clashFile: nil
+            )
+            entry.health = "ok"
+            entry.healthDetail = "启动自愈: 收养自更新中断的孤儿 provider(导入时已通过可用性测试)"
+            entry.healthAt = Date().timeIntervalSince1970
+            entry.note = "孤儿收养: 更新重启打断了本次导入的记账,已从 provider 行重建条目;如需 CPA/DSH 通道,重新导入一次(幂等)即可补齐"
+            do {
+                try history.append(entry)
+                out.append("自愈: 收养孤儿 provider「\(label)」(\(appTag)),已补记账本")
+            } catch {
+                out.append("⚠ 孤儿收养落盘失败(「\(label)」): \(error.localizedDescription)")
+            }
+        }
+        return out
+    }
+
     /// 回写污染自愈:遍历 active 且导入到 Claude Code 的条目,检测其 cc-switch 行是否
     /// 被「陈旧 loopback live 环境」整块回写覆盖(签名判定见 repairClobberedClaudeRow)。
     /// 纯本地 DB 读校验,无网络请求,不参与并发对账。未配置 CPA(无 clientKey 可比)
     /// 时签名不成立,整段跳过。
-    private func repairClobberedCCRows() -> [String] {
-        guard let ep = CPAWriter.endpointInfo() else { return [] }
+    private func repairClobberedCCRows() -> [String] {        guard let ep = CPAWriter.endpointInfo() else { return [] }
         var out: [String] = []
         for e in history.snapshot() where e.status == "active" && e.targets.contains("ccswitch") {
             guard let pid = e.ccProviderID, let url = e.url, let key = e.key, !key.isEmpty else { continue }

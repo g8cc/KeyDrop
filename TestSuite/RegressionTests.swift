@@ -1594,5 +1594,88 @@ openai-compatibility:
             t.contains(healed, "sk-gwwire111111111", "对账后行内 key 已还原")
             t.expect(!healed.contains("sk-cpaclientkey999999"), "对账后污染 token 已清除")
         }
+
+        // MARK: - 孤儿收养:更新重启 kill 打断导入(cc.add 已写产物、history.append 未执行)
+        // → 产物在、账本无,删除/刷新/对账都不认领。收养 = 凭 meta 导入标记识别孤儿,
+        // 从 provider 行重建账本条目(url/key 行内取、模型标记取),收养而非删除:
+        // 配置是导入时已通过测试的完好凭据。常驻行与用户手写行没有标记,永不触碰。
+        h.runSuite("Regression.孤儿收养") { t in
+            let env = try! TestEnv("reg-adopt")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            // 崩溃现场:直接调 cc.add(不经 Core.add)→ provider 在、账本无
+            let w = CCSwitchWriter()
+            var p = ParsedKey()
+            p.url = "https://adopt.example.com/v1"
+            p.key = "sk-adopt1111111111"
+            p.name = "adopt.example.com-0925-1400"
+            let r = try! w.add(p, appType: "claude", models: ["claude-opus-5-5"], proxy: nil)
+
+            // 前置:provider 行带导入标记
+            let meta = try! DB(path: env.dir + "/cc-switch.db").scalar(
+                "SELECT meta FROM providers WHERE id=?", [r.providerID]) ?? "{}"
+            t.contains(meta, "\"origin\"", "[标记] meta 含导入来源标记")
+
+            let core = Core()
+            let lines = core.reconcileWithCCSwitch()
+            t.contains(lines.joined(separator: "\n"), "收养", "[收养] 对账播报")
+
+            let adopted = core.history.snapshot().first { $0.ccProviderID == r.providerID }
+            let e = t.notNil(adopted, "[收养] 账本出现条目")
+            if let e {
+                t.equal(e.url, "https://adopt.example.com/v1", "[收养] url 一致")
+                t.equal(e.key, "sk-adopt1111111111", "[收养] key 一致")
+                t.equal(e.models, ["claude-opus-5-5"], "[收养] models 取自标记")
+                t.equal(e.targets, ["ccswitch"], "[收养] targets 按 appType")
+                t.equal(e.status, "active", "[收养] active")
+                t.equal(e.health, "ok", "[收养] 健康 ok(导入时已通过测试)")
+            }
+            // provider 行保留(收养而非删除)
+            let row = try! DB(path: env.dir + "/cc-switch.db").scalar(
+                "SELECT 1 FROM providers WHERE id=?", [r.providerID])
+            t.notNil(row, "[收养] provider 行保留")
+
+            // 再跑一次对账:已认领,不重复收养
+            let lines2 = core.reconcileWithCCSwitch()
+            t.expect(!lines2.joined(separator: "\n").contains("收养孤儿"), "[幂等] 已认领不再收养")
+            t.equal(core.history.snapshot().count, 1, "[幂等] 账本不重复")
+        }
+
+        h.runSuite("Regression.孤儿收养守卫") { t in
+            // ① key 已在账本(URL 不同)→ 跳过收养 + 告警,不制造重复凭据条目
+            let env = try! TestEnv("reg-adopt-dup")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let core = Core()
+            _ = try! core.add(raw: "https://other.example.com/v1 sk-dupkey11111111",
+                              ccOverride: true, cpaOverride: false, dshOverride: false,
+                              models: ["claude-sonnet-4-5"], force: true,
+                              appType: "claude", appTypeForced: true)
+            let w = CCSwitchWriter()
+            var p = ParsedKey()
+            p.url = "https://adopt-dup.example.com/v1"
+            p.key = "sk-dupkey11111111"
+            let r = try! w.add(p, appType: "claude", models: ["claude-sonnet-4-5"], proxy: nil)
+            let lines = core.reconcileWithCCSwitch()
+            t.contains(lines.joined(separator: "\n"), "未收养", "[重复key] 告警且跳过")
+            t.expect(core.history.snapshot().count == 1, "[重复key] 不新增账本条目")
+            let orphanStill = try! DB(path: env.dir + "/cc-switch.db").scalar(
+                "SELECT 1 FROM providers WHERE id=?", [r.providerID])
+            t.notNil(orphanStill, "[重复key] 孤儿行保留给人工处理")
+
+            // ② 常驻入口行(无导入标记)→ 永不收养
+            let env2 = try! TestEnv("reg-adopt-resident")
+            defer { env2.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env2)
+            let w2 = CCSwitchWriter()
+            _ = try! w2.syncCPAResident(appType: "opencode", baseURL: "http://127.0.0.1:8317",
+                                        clientKey: "sk-cpaclientkey", models: ["kimi-k3"])
+            let core2 = Core()
+            let lines2 = core2.reconcileWithCCSwitch()
+            t.expect(!lines2.joined(separator: "\n").contains("收养"), "[常驻] 无标记行不收养")
+            let resident = try! DB(path: env2.dir + "/cc-switch.db").scalar(
+                "SELECT 1 FROM providers WHERE settings_config LIKE '%sk-cpaclientkey%'")
+            t.notNil(resident, "[常驻] 常驻行保留")
+        }
     }
 }
