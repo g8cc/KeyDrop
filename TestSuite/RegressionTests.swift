@@ -1760,6 +1760,72 @@ openai-compatibility:
             t.contains(cfg, "- name: claude-opus-5-5", "[CPA] 模型已整替为新列表")
             t.expect(!cfg.contains("claude-sonnet-4-5"), "[CPA] 旧模型已移除")
         }
+
+        // MARK: - 账本压实:note 去重截断 + 超期已删转审计桩
+        // 审计=元数据永久留痕(id/name/url/keyMasked/targets/时间戳),敏感负载
+        // (明文 key/probeLog/note)到期清除;active 条目永不触碰
+        h.runSuite("Regression.账本压实") { t in
+            let env = try! TestEnv("reg-compact")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let core = Core()
+            let now = Date().timeIntervalSince1970
+
+            func mk(_ id: String, status: String, key: String?, deletedAt: TimeInterval?, note: String?) {
+                var e = HistoryEntry(
+                    id: id, ts: now - 40 * 24 * 3600, raw: "raw-\(id)", format: "multiline",
+                    name: "entry-\(id.prefix(4))", url: "https://\(id.prefix(4)).example.com/v1",
+                    model: nil, models: ["m1"], key: key, keyMasked: "sk-ma…xxxx",
+                    targets: ["ccswitch"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                    cpaConfigPath: nil, status: status, note: note,
+                    probeLog: [ProbePoint(t: now, ms: nil, ok: true)]
+                )
+                e.deletedAt = deletedAt
+                try! core.history.append(e)
+            }
+            // A:超期已删(40 天)→ 转审计桩
+            mk("aaaaaaaa-1111-2222-3333-444455556666", status: "deleted",
+               key: "sk-deadkey111111111", deletedAt: now - 40 * 24 * 3600,
+               note: String(repeating: "cc-switch provider 缺失,key 仍可用,可手动重新导入; ", count: 50))
+            // B:刚删除(1 天)→ 保留全部
+            mk("bbbbbbbb-1111-2222-3333-444455556666", status: "deleted",
+               key: "sk-freshkey111111111", deletedAt: now - 1 * 24 * 3600, note: nil)
+            // C:活跃条目 + 重复 80 遍的 note → 只去重不清理
+            mk("cccccccc-1111-2222-3333-444455556666", status: "active",
+               key: "sk-livekey111111111", deletedAt: nil,
+               note: String(repeating: "测试: GET https://x.example.com/v1/models → 200; ", count: 80))
+
+            let lines = core.compactLedger().joined(separator: "\n")
+            t.contains(lines, "审计桩", "[压实] 播报超期清除")
+            t.contains(lines, "备注已去重截断", "[压实] 播报 note 归一")
+
+            let a = core.history.find(idPrefix: "aaaaaaaa")
+            let ea = t.notNil(a, "[审计桩] 条目仍可查(可审计)")
+            if let ea {
+                t.equal(ea.status, "deleted", "[审计桩] 状态保持 deleted")
+                t.equal(ea.key, nil, "[审计桩] 明文 key 已清除")
+                t.equal(ea.probeLog, nil, "[审计桩] 探测历史已清除")
+                t.equal(ea.name, "entry-aaaa", "[审计桩] name 保留")
+                t.equal(ea.url, "https://aaaa.example.com/v1", "[审计桩] url 保留")
+                t.equal(ea.keyMasked, "sk-ma…xxxx", "[审计桩] keyMasked 保留")
+                t.contains(ea.note ?? "", "审计桩", "[审计桩] 归档标记")
+            }
+            let b = core.history.find(idPrefix: "bbbbbbbb")
+            t.equal(b?.key, "sk-freshkey111111111", "[保留] 未超期已删条目不动")
+
+            let c = core.history.find(idPrefix: "cccccccc")
+            let ec = t.notNil(c, "[active] 活跃条目在")
+            if let ec {
+                t.equal(ec.key, "sk-livekey111111111", "[active] key 不动")
+                t.equal(ec.status, "active", "[active] 状态不变")
+                t.expect(ec.note?.components(separatedBy: "测试: GET").count == 2,
+                         "[note] 重复 80 遍去重为 1 遍")
+            }
+
+            // 幂等:再跑一次无新变更
+            let lines2 = core.compactLedger()
+            t.expect(lines2.isEmpty, "[幂等] 二次压实无变更")
+        }
     }
 
     /// 敏感文件权限:历史/prefs/codex auth.json 含明文 key 或管理口令。

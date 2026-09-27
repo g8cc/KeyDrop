@@ -1123,7 +1123,11 @@ public final class Core {
                 let alreadyMissing = e.ccMissing == true
                 if test.authFailed {
                     updated.targets.removeAll { $0.hasPrefix("ccswitch") }
-                    if updated.targets.isEmpty { updated.status = "deleted" }
+                    if updated.targets.isEmpty {
+                        updated.status = "deleted"
+                        // 记删除时间:账本压实按此计龄转审计桩;重复进入不刷新计龄起点
+                        if updated.deletedAt == nil { updated.deletedAt = Date().timeIntervalSince1970 }
+                    }
                     appendNote("cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记")
                 } else {
                     updated.ccMissing = true
@@ -1272,7 +1276,82 @@ public final class Core {
     }
 
     public func selfHeal() -> [String] {
-        reconcileWithCCSwitch()
+        var out = compactLedger()
+        out.append(contentsOf: reconcileWithCCSwitch())
+        return out
+    }
+
+    /// 账本压实(启动 self-heal 执行,离线安全):    /// ① note 归一 —— 按 "; " 分句去重 + 总长上限。历史 bug 实证:单条 note 同一句
+    ///    「可手动重新导入」重复 655 遍(25KB),每轮对账全量重写白白放大 IO;
+    /// ② 超期已删条目转审计桩 —— status=deleted 且删除超 30 天的条目,清除明文
+    ///    key/raw/probeLog/note,保留 id/name/url/keyMasked/targets/时间戳供追溯。
+    ///    审计=元数据永久留痕,敏感负载到期清除;单文件 JSON 格式不变,
+    ///    CLI/文档排查清单等所有现有工具链不受影响。active 条目永不触碰。
+    public func compactLedger() -> [String] {
+        let cutoff = Date().timeIntervalSince1970 - 30 * 24 * 3600
+        var out: [String] = []
+        var purged = 0
+        var normalized = 0
+        var changed: [HistoryEntry] = []
+        for var e in history.snapshot() {
+            var dirty = false
+            // ① note 归一
+            let n = Self.normalizedNote(e.note)
+            if n != e.note { e.note = n; dirty = true; normalized += 1 }
+            // ② 超期已删 → 审计桩(计龄:deletedAt 缺失的历史条目回退 healthAt/ts)
+            if e.status == "deleted" {
+                let age = e.deletedAt ?? e.healthAt ?? e.ts
+                if age < cutoff, e.key != nil || e.probeLog != nil || e.modelProbeLog != nil
+                    || e.raw != "archived" {
+                    e.key = nil
+                    e.raw = "archived"
+                    e.probeLog = nil
+                    e.modelProbeLog = nil
+                    e.healthDetail = nil
+                    e.latencyMs = nil
+                    e.viaCPAOk = nil
+                    e.viaCPAAt = nil
+                    e.ccMissing = nil
+                    e.note = "审计桩: 超期已删除条目,明文 key/探测历史已按保留策略清除"
+                    if e.deletedAt == nil { e.deletedAt = age }
+                    dirty = true
+                    purged += 1
+                }
+            }
+            if dirty { changed.append(e) }
+        }
+        // 走 updateAll 整批替换:probeLog/modelProbeLog 是 store 托管字段(update 会
+        // 合并保留),审计桩必须显式清除它们 —— updateAll 是唯一的整条替换通道,
+        // 且一次落盘代替逐条写
+        if !changed.isEmpty {
+            do {
+                try history.updateAll(changed)
+                if purged > 0 { out.append("压实: \(purged) 条超期已删条目已转审计桩(明文 key/探测历史已清除)") }
+                if normalized > 0 { out.append("压实: \(normalized) 条条目的备注已去重截断") }
+            } catch {
+                out.append("⚠ 账本压实写入失败: \(error.localizedDescription)")
+            }
+        }
+        return out
+    }
+
+    /// note 归一:按 "; " 分句去重(同一句历史 bug 曾堆积 655 遍)+ 总长上限 4000 字符
+    /// (超限保留开头=导入记录、结尾=最近状态,中间以省略标记衔接)。
+    /// 审计语义不受损:去重的只是完全相同的重复句,不同内容全部保留。
+    static func normalizedNote(_ note: String?) -> String? {
+        guard let note, !note.isEmpty else { return note }
+        var seen = Set<String>()
+        var kept: [String] = []
+        for seg in note.components(separatedBy: "; ") {
+            let t = seg.trimmingCharacters(in: .whitespaces)
+            guard !t.isEmpty else { continue }
+            if seen.insert(t).inserted { kept.append(t) }
+        }
+        var n = kept.joined(separator: "; ")
+        if n.count > 4000 {
+            n = String(n.prefix(600)) + " …[已截断]… " + String(n.suffix(3400))
+        }
+        return n
     }
 
     func testEntry(entryIDPrefix: String) throws -> String {
@@ -2217,6 +2296,8 @@ public final class Core {
 
         entry.targets = remaining
         entry.status = remaining.isEmpty ? "deleted" : "active"
+        // 记删除时间供账本压实计龄;恢复 active 时清除
+        entry.deletedAt = remaining.isEmpty ? Date().timeIntervalSince1970 : nil
         if !failures.isEmpty {
             entry.note = ([entry.note].compactMap { $0 } + failures).joined(separator: "; ")
         }

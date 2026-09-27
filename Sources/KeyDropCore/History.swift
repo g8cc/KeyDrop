@@ -20,6 +20,7 @@ public struct HistoryEntry: Codable {
         case health, healthDetail, healthAt
         case ccMissing
         case clashFile
+        case deletedAt
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
@@ -52,6 +53,8 @@ public struct HistoryEntry: Codable {
     /// Clash 订阅生成的 yaml 文件名(仅 basename,存于 profiles 目录);
     /// 没有它 delete 无法清理生成的订阅文件
     public var clashFile: String?
+    /// 进入已删除状态的时间;账本压实(超期转审计桩)据此计龄,缺失时回退 healthAt/ts
+    public var deletedAt: TimeInterval?
     /// 最近一次 chat 探测的端到端延迟(毫秒)。实战监控:慢网关也显示"可用",
     /// 但延迟让用户对"用的时候行不行"有预期(真实反馈:显示可用,用起来 30s 无响应)
     public var latencyMs: Double?
@@ -119,6 +122,7 @@ public struct HistoryEntry: Codable {
         healthAt: TimeInterval? = nil,
         ccMissing: Bool? = nil,
         clashFile: String? = nil,
+        deletedAt: TimeInterval? = nil,
         latencyMs: Double? = nil,
         failStreak: Int? = nil,
         viaCPAOk: Bool? = nil,
@@ -149,6 +153,7 @@ public struct HistoryEntry: Codable {
         self.healthAt = healthAt
         self.ccMissing = ccMissing
         self.clashFile = clashFile
+        self.deletedAt = deletedAt
         self.latencyMs = latencyMs
         self.failStreak = failStreak
         self.viaCPAOk = viaCPAOk
@@ -182,6 +187,7 @@ public struct HistoryEntry: Codable {
         healthAt = try c.decodeIfPresent(TimeInterval.self, forKey: .healthAt)
         ccMissing = try c.decodeIfPresent(Bool.self, forKey: .ccMissing)
         clashFile = try c.decodeIfPresent(String.self, forKey: .clashFile)
+        deletedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .deletedAt)
         latencyMs = try c.decodeIfPresent(Double.self, forKey: .latencyMs)
         failStreak = try c.decodeIfPresent(Int.self, forKey: .failStreak)
         viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)

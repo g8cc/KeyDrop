@@ -1,6 +1,6 @@
 # KeyDrop 导入链路全景
 
-> 适用版本 v1.4.30。本文回答三类问题:
+> 适用版本 v1.4.39。本文回答三类问题:
 > ① 一个 key 从贴进 KeyDrop 到落到各工具,中间发生了什么(按顺序);
 > ② 每个目标(Claude Code / Codex / OpenCode / Grok Build / CPA / DSH)各自怎么写、写到哪;
 > ③ 多个目标同时命中时,谁优先、什么绝不覆盖。
@@ -277,6 +277,7 @@ API 模式的零触碰覆盖**读路径**:endpointInfo(端口+客户端 key,供�
   key 已失效(401/403)→ 同步标记删除;key 仍可用 → 标记 `ccMissing` 待手动重导(不自动复活)。
 - **回写污染自愈(v1.4.29)**:KeyDrop 托管的 claude 行若命中「baseURL 是 loopback 且 key == CPA clientKey」(= 被陈旧本地代理环境整块回写覆盖的事故签名)→ 用条目 url/key 还原;手改 key/换网关不碰。
 - **孤儿收养(v1.4.31)**:更新重启 kill 打断导入的毫秒级窗口会留下「产物在、账本无」的孤儿 provider(外部产物写入先于账本落盘)。对账凭 cc-switch 行 meta 里的导入标记识别(KeyDrop 写入的临时导入行才有;常驻入口/用户手写行无标记,永不触碰),从 provider 行重建账本条目**收养**之——配置是导入时已通过测试的完好凭据,收养后删除/刷新/对账恢复可用;key 已在账本时跳过并告警,绝不静默制造重复凭据。
+- **账本压实(v1.4.39)**:① note 按 "; " 分句去重 + 总长上限 4000 字符(历史 bug 实证单条同一句重复 655 遍 25KB);② 删除超 30 天的条目转**审计桩**——清除明文 key/raw/probeLog/note,保留 id/name/url/keyMasked/targets/时间戳。审计=元数据永久留痕,敏感负载到期清除;active 条目永不触碰。启动 self-heal 时执行。
 
 ### 健康扫描
 连续失败 → `health=dead` → 移入"待删除区"(status 仍是 active,不会变成删不掉的僵尸);quota/auth 失效有独立标注。
@@ -324,6 +325,7 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 | v1.4.29 | 导入 sub.tidalrelay 后,cc-switch provider 的 baseURL/key 被 `127.0.0.1:8317` + CPA key 整块覆盖。根因:cc-switch 运行时 KeyDrop 只写 DB 不写 live,留下「DB current=新行,live=旧环境」漂移;用户激活新 provider 时 cc-switch 按数据库 `is_current` 把过期 live 回写进新行 | **live 一致性写入**:导入/刷新即把 live 写成与 DB current 相同 env,回写退化为 no-op;对账新增回写污染自愈(loopback+clientKey 签名) |
 | v1.4.30 | 同一次导入,DSHWriter 把 `KEYDROP_07FA1C9C_API_KEY` 顶层裸写进 `.credentials.yaml`(dsh 要求凭据嵌在 `refs:` 内)→ dsh 启动崩溃。外部 AI 只手工缩进了文件,但写入方不感知 refs,下次写入会再追加顶格重复行 | **refs 感知写入**:凭据一律缩进写进 refs 块末尾(多行标量安全)、顶格遗留自愈清除、空文件落骨架、删空收敛 `refs: {}` |
 | v1.4.31 | 更新重启确认后 `kill -9` 无业务任务校验:导入流程"外部产物已写、账本未记"的毫秒级窗口被杀会留下孤儿 provider。影响面评估:监控数据采集不受影响(探测点逐条即时落盘)、各文件均有原子写/事务保护;唯一缺口是孤儿 | **孤儿收养**:cc.add 在 provider 行 meta 写入导入来源标记;对账时未认领的带标记行从行内重建账本条目(收养而非删除),key 重复时跳过告警 |
+| v1.4.39 | 账本无限增长三源:已删条目永不清理(70% 占比,含明文 key)、note 无上限累积(单条同句重复 655 遍 25KB)、probeLog 虽有 30 点滚动但已删条目照带 | **账本压实**:note 分句去重+4000 字符上限;删除超 30 天转审计桩(元数据留痕、明文清除);启动 self-heal 执行,updateAll 整批一次落盘 |
 
 ---
 
