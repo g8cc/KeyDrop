@@ -1735,28 +1735,21 @@ struct PanelView: View {
     }
 
     private var inputBlock: some View {
-        ZStack(alignment: .topLeading) {
-            TextEditor(text: $state.input)
-                .font(.system(size: 12.5, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .padding(8)
-                .frame(minHeight: 72, maxHeight: 130)
-                .focused($inputFocused)
-                .disabled(state.isBusy)
-            if state.input.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("粘贴 key / JSON / base64 / curl / 代理链接")
-                        .font(.system(size: 12, weight: .medium))
-                    Text("也可拖入 zip、配置文件或粘贴路径")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                .foregroundStyle(.secondary.opacity(0.85))
-                .padding(.top, 16)
-                .padding(.leading, 14)
-                .allowsHitTesting(false)
-            }
-        }
+        // 占位符用系统原生 prompt(TextField axis:.vertical):占位符永远渲染在文字
+        // 起点,系统保证与光标同行。旧实现用 ZStack 叠加手调偏移(top 16/leading 14)
+        // 去逼近 TextEditor 内部的 textContainerInset —— 内部值随 macOS 版本变,
+        // 一旦对不上占位符和光标就不在同一行(用户实测:提示字与光标错位)
+        TextField(
+            "粘贴 key / JSON / base64 / curl / 代理链接;也可拖入 zip、配置文件或粘贴路径",
+            text: $state.input,
+            axis: .vertical
+        )
+        .textFieldStyle(.plain)
+        .font(.system(size: 12.5, design: .monospaced))
+        .padding(8)
+        .frame(minHeight: 72, maxHeight: 130)
+        .focused($inputFocused)
+        .disabled(state.isBusy)
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color(nsColor: .textBackgroundColor).opacity(0.65))
@@ -1860,7 +1853,7 @@ struct PanelView: View {
                         .fill(Color.primary.opacity(0.05))
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12), lineWidth: 0.8))
                 )
-                .frame(width: 230)
+                .frame(width: 340)
                 Spacer()
                 Text("最近添加")
                     .font(.system(size: 11, weight: .semibold))
