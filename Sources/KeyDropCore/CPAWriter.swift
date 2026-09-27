@@ -544,6 +544,36 @@ public final class CPAWriter {
         }) ?? []
     }
 
+    /// 轮换聚合条目内的 key:同 URL 组内把 oldKey 原位替换为 newKey(位置不变,
+    /// 组内轮询顺序稳定;出现多行旧 key 时全部替换,不留残留)。编辑条目的 key
+    /// 字段时使用 —— 站方轮换 key 是高频场景,换 key 不换 URL/模型,机械替换即可。
+    /// API 模式经管理 API 读写,零文件触碰。组内未找到旧 key 返回空串(调用方跳过)。
+    public func rotateKey(baseURL: String, oldKey: String, newKey: String) throws -> String {
+        guard !oldKey.isEmpty, !newKey.isEmpty, oldKey != newKey else { return "" }
+        guard configAvailable() else { throw WriterError.file("CPA config 不可用") }
+        return try withCPASync {
+            let content = try readConfigText()
+            var lines = content.components(separatedBy: "\n")
+            guard let entryRange = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL)),
+                  let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entryRange)
+            else { return "" }
+            var replaced = false
+            for i in entriesRange {
+                let t = lines[i].trimmingCharacters(in: .whitespaces)
+                guard t.hasPrefix("- api-key:") else { continue }
+                let scalar = String(t.dropFirst("- api-key:".count)).trimmingCharacters(in: .whitespaces)
+                if decodeYAMLScalar(scalar) == oldKey {
+                    let indent = String(lines[i].prefix(while: { $0 == " " || $0 == "\t" }))
+                    lines[i] = "\(indent)- api-key: \(yamlScalar(newKey))"
+                    replaced = true
+                }
+            }
+            guard replaced else { return "" }
+            try atomicWrite(lines.joined(separator: "\n"))
+            return "key 已轮换(组内原位替换)"
+        }
+    }
+
     /// 聚合条目 name 取 baseURL 的 host[:port]。端口必须计入:同一 host 的不同端口
     /// 是不同上游端点,只取 host 会把 8317 和 9090 两批 key 并进同一条目,
     /// 后一批 key 被挂到先一批的 base-url 上轮询(静默路由错端点)。

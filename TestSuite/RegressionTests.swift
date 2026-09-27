@@ -1677,6 +1677,89 @@ openai-compatibility:
                 "SELECT 1 FROM providers WHERE settings_config LIKE '%sk-cpaclientkey%'")
             t.notNil(resident, "[常驻] 常驻行保留")
         }
+
+        // MARK: - 编辑增强:key 轮换 / 备注 / CPA 同步(此前编辑只更新 cc 系目标,
+        // CPA 聚合条目停在旧列表)。key 轮换 = 站方轮换的高频场景,同 URL 同模型
+        // 只换凭据:新 key 先过完整探测,通过后 cc/CPA/DSH/Grok 全产物机械替换。
+        h.runSuite("Regression.编辑 key 轮换") { t in
+            guard let server = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let env = try! TestEnv("reg-edit-key")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let cfgPath = env.dir + "/cpa-config.yaml"
+            // 必须先存在:resolvedCPAConfig 对环境路径做存在性检查,文件不存在时
+            // CPA 写入会被跳过(add 报「未找到 config.yaml」)
+            env.write("cpa-config.yaml", "")
+            setenv("KEYDROP_CPA_CONFIG", cfgPath, 1)
+            defer { setenv("KEYDROP_CPA_CONFIG", "", 1) }
+
+            let core = Core()
+            let r = try! core.add(raw: "http://127.0.0.1:\(server.port)/v1 sk-oldkey111111111",
+                                  ccOverride: true, cpaOverride: true, dshOverride: false,
+                                  models: ["claude-sonnet-4-5"], force: true,
+                                  appType: "claude", appTypeForced: true)
+            t.expect(r.ok, "[前置] 导入成功")
+            t.contains(env.read("cpa-config.yaml"), "sk-oldkey111111111", "[前置] CPA 聚合条目含旧 key")
+
+            // key 轮换 + 备注(新 key 经完整探测;mock 对任意 bearer 均回 200)
+            let msg = try! core.editEntry(
+                entryIDPrefix: r.entry.id,
+                key: "sk-newkey2222222222",
+                note: "轮换测试"
+            )
+            t.contains(msg, "key 已轮换", "[轮换] 播报")
+            let after = core.history.find(idPrefix: r.entry.id)
+            t.equal(after?.key, "sk-newkey2222222222", "[轮换] 账本 key 已更新")
+            t.equal(after?.note, "轮换测试", "[备注] 已写入")
+            t.equal(after?.health, "ok", "[轮换] 健康置 ok")
+
+            // cc-switch 行凭据已替换
+            let row = try! DB(path: env.dir + "/cc-switch.db").scalar(
+                "SELECT settings_config FROM providers WHERE id=?", [r.entry.ccProviderID!]) ?? ""
+            t.contains(row, "sk-newkey2222222222", "[cc] 凭据已替换")
+            t.expect(!row.contains("sk-oldkey111111111"), "[cc] 旧 key 无残留")
+
+            // CPA 聚合条目:组内原位替换
+            let cfg2 = env.read("cpa-config.yaml")
+            t.contains(cfg2, "sk-newkey2222222222", "[CPA] 新 key 已入组")
+            t.expect(!cfg2.contains("sk-oldkey111111111"), "[CPA] 旧 key 无残留")
+
+            // 同 key 重复提交 = 无变更
+            let msg2 = try! core.editEntry(entryIDPrefix: r.entry.id, key: "sk-newkey2222222222")
+            t.equal(msg2, "无变更", "[幂等] 同 key 不触发轮换")
+        }
+
+        h.runSuite("Regression.编辑模型同步 CPA") { t in
+            // 此前编辑只更新 cc 系目标,CPA 聚合条目停在旧列表(refresh 有此步,edit 漏了)
+            guard let server = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let env = try! TestEnv("reg-edit-cpa")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let cfgPath = env.dir + "/cpa-config.yaml"
+            env.write("cpa-config.yaml", "")
+            setenv("KEYDROP_CPA_CONFIG", cfgPath, 1)
+            defer { setenv("KEYDROP_CPA_CONFIG", "", 1) }
+
+            let core = Core()
+            let r = try! core.add(raw: "http://127.0.0.1:\(server.port)/v1 sk-editcpa1111111",
+                                  ccOverride: true, cpaOverride: true, dshOverride: false,
+                                  models: ["claude-sonnet-4-5"], force: true,
+                                  appType: "claude", appTypeForced: true)
+            _ = try! core.editEntry(
+                entryIDPrefix: r.entry.id,
+                models: ["claude-opus-5-5"],
+                verify: false
+            )
+            let cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "- name: claude-opus-5-5", "[CPA] 模型已整替为新列表")
+            t.expect(!cfg.contains("claude-sonnet-4-5"), "[CPA] 旧模型已移除")
+        }
     }
 
     /// 敏感文件权限:历史/prefs/codex auth.json 含明文 key 或管理口令。

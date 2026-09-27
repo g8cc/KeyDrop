@@ -1773,6 +1773,8 @@ public final class Core {
         entryIDPrefix: String,
         models: [String]? = nil,
         name: String? = nil,
+        key newKey: String? = nil,
+        note: String? = nil,
         verify: Bool = true
     ) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix)
@@ -1788,6 +1790,29 @@ public final class Core {
         let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
         var newModels = previousModels
 
+        // key 轮换:站方轮换 key 是高频场景,同 URL 同模型只换凭据。新 key 必须先
+        // 通过完整探测(与导入同口径),失败则整体拒绝 —— 不允许把没验证过的凭据
+        // 写进任何产物。通过后本函数内所有验证与同步一律改用新 key。
+        var effectiveKey = key
+        var previousKey = key
+        var keyRotated = false
+        if let newKey, !newKey.isEmpty, newKey != key {
+            let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth())
+            guard test.ok else {
+                throw ParseError.io("新 key 验证失败,未做任何修改: \(test.detail)")
+            }
+            effectiveKey = newKey
+            keyRotated = true
+            entry.key = newKey
+            entry.keyMasked = newKey.count > 8
+                ? String(newKey.prefix(6)) + "…" + String(newKey.suffix(4))
+                : String(repeating: "*", count: max(newKey.count, 6))
+            entry.health = "ok"
+            entry.healthDetail = "key 已轮换,新 key 已通过完整探测"
+            entry.healthAt = Date().timeIntervalSince1970
+            lines.append("✓ key 已轮换: \(entry.keyMasked)")
+        }
+
         if let models, !models.isEmpty {
             var verified: [String] = []
             var failures: [String] = []
@@ -1796,9 +1821,9 @@ public final class Core {
                 if verify {
                     // 先直连再代理:验证端点拿到代理就只走代理(无直连回退),本机代理对
                     // 回环/内网网关会返 502,直接传代理会把本可直连的模型全判失败(与 add() 同口径)
-                    var check = APITester.testModelChat(base: url, key: key, model: m)
+                    var check = APITester.testModelChat(base: url, key: effectiveKey, model: m)
                     if !check.ok, let verifyProxy, !verifyProxy.isEmpty {
-                        check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy)
+                        check = APITester.testModelChat(base: url, key: effectiveKey, model: m, proxy: verifyProxy)
                     }
                     if check.ok {
                         verified.append(m)
@@ -1824,10 +1849,14 @@ public final class Core {
             entry.name = name
             lines.append("✓ 名称已更新: \(name)")
         }
+        if let note {
+            entry.note = note.isEmpty ? nil : note
+            lines.append("✓ 备注已更新")
+        }
 
         // 旧判断 newModels.isEmpty && name == nil:newModels 默认就是 previousModels(几乎总非空),
         // 什么都没传也会走完整同步流程;name == "" 也漏判
-        if (models ?? []).isEmpty && (name ?? "").isEmpty {
+        if (models ?? []).isEmpty && (name ?? "").isEmpty && !keyRotated && note == nil {
             return "无变更"
         }
 
@@ -1845,7 +1874,7 @@ public final class Core {
            entry.targets.contains(where: { $0.hasPrefix("ccswitch") }) {
             do {
                 let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
-                let msg = try writer.sync(baseURL: url, key: key, models: newModels, removing: [])
+                let msg = try writer.sync(baseURL: url, key: effectiveKey, models: newModels, removing: [])
                 if !entry.targets.contains("grok") { entry.targets.append("grok") }
                 entry.grokConfigPath = writer.configPath
                 lines.append("✓ Grok Build: \(msg)")
@@ -1878,7 +1907,7 @@ public final class Core {
                 let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
                 let msg = try writer.sync(
                     baseURL: url,
-                    key: key,
+                    key: effectiveKey,
                     models: newModels,
                     removing: previousModels
                 )
@@ -1890,7 +1919,7 @@ public final class Core {
         } else if desiredAppType != "grok", entry.targets.contains("grok") {
             var p = ParsedKey()
             p.url = url
-            p.key = key
+            p.key = effectiveKey
             p.model = newModels.first
             do {
                 let r = try cc.add(p, nameOverride: entry.name,
@@ -1904,7 +1933,7 @@ public final class Core {
                 if let path = entry.grokConfigPath {
                     do {
                         _ = try GrokBuildWriter(configPath: path).remove(
-                            baseURL: url, key: key,
+                            baseURL: url, key: effectiveKey,
                             models: previousModels
                         )
                         entry.targets.removeAll { $0 == "grok" }
@@ -1928,7 +1957,7 @@ public final class Core {
                 .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
             var p = ParsedKey()
             p.url = url
-            p.key = key
+            p.key = effectiveKey
             p.model = newModels.first
             do {
                 try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType, models: newModels, proxy: proxyForHealth())
@@ -1941,10 +1970,47 @@ public final class Core {
         // 同步 dsh
         if entry.targets.contains("dsh") {
             do {
-                _ = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: newModels)
+                _ = try DSHWriter.add(providerID: entry.id, key: effectiveKey, url: url, models: newModels)
                 lines.append("✓ DeepSeek Harness: 已同步模型")
             } catch {
                 lines.append("⚠ DeepSeek Harness 同步失败: \(error.localizedDescription)")
+            }
+        }
+
+        // CPA 同步(与 refresh 同一账本口径,此前编辑只更新 cc 系目标,CPA 条目停在旧列表):
+        // 编辑模型 = 用户对列表的重新确认 → updateAggregatedModels 整替;
+        // key 轮换 → 聚合条目组内原位替换旧 key。API 模式全程零文件触碰。
+        if entry.targets.contains("cpa") {
+            let cfgPath: String?
+            if CPAAPI.apiMode {
+                cfgPath = entry.cpaConfigPath ?? prefs.resolvedCPAConfig()
+            } else {
+                cfgPath = entry.cpaConfigPath
+                    .flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+                    ?? prefs.resolvedCPAConfig()
+            }
+            if let cfg = cfgPath {
+                do {
+                    let writer = CPAWriter(configPath: cfg)
+                    var cpaLines: [String] = []
+                    if keyRotated {
+                        let msg = try writer.rotateKey(baseURL: url, oldKey: previousKey, newKey: effectiveKey)
+                        if !msg.isEmpty { cpaLines.append(msg) }
+                    }
+                    if !(models ?? []).isEmpty {
+                        let msg = try writer.updateAggregatedModels(baseURL: url, models: newModels)
+                        cpaLines.append(msg)
+                        entry.cpaConfigPath = cfg
+                        lines.append("✓ CPA: " + cpaLines.joined(separator: "; "))
+                        let resident = syncCPAResidentEntries(models: newModels)
+                        if !resident.isEmpty { lines.append(contentsOf: resident) }
+                    } else if !cpaLines.isEmpty {
+                        entry.cpaConfigPath = cfg
+                        lines.append("✓ CPA: " + cpaLines.joined(separator: "; "))
+                    }
+                } catch {
+                    lines.append("⚠ CPA 同步失败: \(error.localizedDescription)")
+                }
             }
         }
 

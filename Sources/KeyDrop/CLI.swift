@@ -14,6 +14,8 @@ enum CLI {
         var dshOverride: Bool? = nil
         var modelsOverride: [String] = []
         var editName: String? = nil
+        var editKey: String? = nil
+        var editNote: String? = nil
         var noVerify = false
         var force = false
         var appType: String? = nil
@@ -38,6 +40,16 @@ enum CLI {
             case "--name":
                 if i + 1 < a.count {
                     editName = a[i + 1]
+                    i += 1
+                }
+            case "--key":
+                if i + 1 < a.count {
+                    editKey = a[i + 1]
+                    i += 1
+                }
+            case "--note":
+                if i + 1 < a.count {
+                    editNote = a[i + 1]
                     i += 1
                 }
             case "--app":
@@ -242,7 +254,7 @@ enum CLI {
 
         case "edit":
             guard let target = remaining.first else {
-                print("用法: KeyDrop --edit <历史ID前缀> [--model <模型1,模型2>] [--name <名称>] [--no-verify]")
+                print("用法: KeyDrop --edit <历史ID前缀> [--model <模型1,模型2>] [--name <名称>] [--key <新key>] [--note <备注>] [--no-verify]")
                 return 2
             }
             do {
@@ -250,6 +262,8 @@ enum CLI {
                     entryIDPrefix: target,
                     models: modelsOverride.isEmpty ? nil : modelsOverride,
                     name: editName,
+                    key: editKey,
+                    note: editNote,
                     verify: !noVerify
                 )
                 print(msg)

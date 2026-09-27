@@ -60,6 +60,8 @@ final class AppState: ObservableObject {
     @Published var editTarget: HistoryEntry?
     @Published var editModelsText = ""
     @Published var editNameText = ""
+    @Published var editKeyText = ""
+    @Published var editNoteText = ""
     private var statusClearTask: DispatchWorkItem?
     private var healthTimer: Timer?
 
@@ -453,6 +455,8 @@ final class AppState: ObservableObject {
         editTarget = entry
         editModelsText = (entry.models ?? (entry.model.map { [$0] } ?? [])).joined(separator: ", ")
         editNameText = entry.name ?? ""
+        editKeyText = ""
+        editNoteText = entry.note ?? ""
         editShown = true
     }
 
@@ -464,8 +468,10 @@ final class AppState: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         let name = editNameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !models.isEmpty || !name.isEmpty else {
-            setStatus("模型或名称至少填一项", ok: false)
+        let newKey = editKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = editNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !models.isEmpty || !name.isEmpty || !newKey.isEmpty || !note.isEmpty else {
+            setStatus("至少填写一项(模型/名称/新 key/备注)", ok: false)
             return
         }
         editShown = false
@@ -481,7 +487,9 @@ final class AppState: ObservableObject {
                     try Core.shared.editEntry(
                         entryIDPrefix: entry.id,
                         models: models.isEmpty ? nil : models,
-                        name: name.isEmpty ? nil : name
+                        name: name.isEmpty ? nil : name,
+                        key: newKey.isEmpty ? nil : newKey,
+                        note: note.isEmpty ? nil : note
                     )
                 }.value
                 setStatus(msg, ok: true)
@@ -1361,11 +1369,18 @@ struct EditView: View {
                     .font(.system(size: 12, design: .monospaced))
                     .textFieldStyle(.roundedBorder)
                     .help("留空则不改动模型;填写后逐一自动验证(大小写敏感)")
+                TextField("新 key(留空不改动;站方轮换 key 时填这里,保存前会实测)", text: $state.editKeyText)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textFieldStyle(.roundedBorder)
+                    .help("轮换 key:验证通过后自动替换 cc-switch / CPA / DSH / Grok 里的旧凭据")
                 TextField("名称(可选)", text: $state.editNameText)
                     .font(.system(size: 12))
                     .textFieldStyle(.roundedBorder)
+                TextField("备注(可选)", text: $state.editNoteText)
+                    .font(.system(size: 12))
+                    .textFieldStyle(.roundedBorder)
                 HStack {
-                    Text("保存后将自动重新验证并同步 cc-switch / dsh")
+                    Text("保存后将自动重新验证并同步 cc-switch / CPA / dsh")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Spacer()
