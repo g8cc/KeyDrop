@@ -1388,6 +1388,85 @@ struct EditView: View {
 
 // MARK: - Main panel
 
+/// 导入主输入框:对占位符对齐做确定性修复 —— 包装 NSTextView 并把
+/// textContainerInset / lineFragmentPadding 显式置零,正文与占位符都从视图原点
+/// (0,0) 开始绘制,基线天然同行,不依赖任何随 macOS 版本漂移的 SwiftUI 内部值。
+/// 占位符由文本视图自身在空文本时 draw(无需 SwiftUI overlay 猜偏移);
+/// 拖拽类型注销(文件拖入由面板级 onDrop 接管)。
+struct ImportTextView: NSViewRepresentable {
+    @Binding var text: String
+    var enabled: Bool
+    var focus: FocusState<Bool>.Binding
+    var placeholder: NSAttributedString
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let tv = PlaceholderTextView()
+        tv.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+        tv.isRichText = false
+        tv.drawsBackground = false
+        tv.isEditable = enabled
+        tv.isSelectable = true
+        tv.textContainerInset = .zero
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.isVerticallyResizable = true
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        tv.autoresizingMask = [.width]
+        tv.placeholder = placeholder
+        tv.unregisterDraggedTypes()
+        tv.delegate = context.coordinator
+
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.documentView = tv
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.parent = self
+        guard let tv = scroll.documentView as? PlaceholderTextView else { return }
+        if tv.string != text {
+            let selected = tv.selectedRanges
+            tv.string = text
+            tv.selectedRanges = selected
+            tv.needsDisplay = true
+        }
+        tv.isEditable = enabled
+        tv.placeholder = placeholder
+        if focus.wrappedValue {
+            focus.wrappedValue = false
+            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: ImportTextView
+        init(_ parent: ImportTextView) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            parent.text = tv.string
+            tv.needsDisplay = true
+        }
+    }
+}
+
+private final class PlaceholderTextView: NSTextView {
+    var placeholder: NSAttributedString = NSAttributedString() {
+        didSet { needsDisplay = true }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        if string.isEmpty {
+            placeholder.draw(in: NSRect(origin: .zero, size: bounds.size))
+        }
+    }
+}
+
 struct PanelView: View {
     @ObservedObject var state: AppState
     @State private var showStatusDetail = false
@@ -1734,22 +1813,39 @@ struct PanelView: View {
         .help(on ? "点击关闭写入 \(title)" : "点击开启写入 \(title)")
     }
 
+    static let importPlaceholder: NSAttributedString = {
+        let p = NSMutableAttributedString()
+        p.append(NSAttributedString(
+            string: "粘贴 key / JSON / base64 / curl / 代理链接\n",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        ))
+        p.append(NSAttributedString(
+            string: "也可拖入 zip、配置文件或粘贴路径",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        ))
+        return p
+    }()
+
     private var inputBlock: some View {
-        // 占位符用系统原生 prompt(TextField axis:.vertical):占位符永远渲染在文字
-        // 起点,系统保证与光标同行。旧实现用 ZStack 叠加手调偏移(top 16/leading 14)
-        // 去逼近 TextEditor 内部的 textContainerInset —— 内部值随 macOS 版本变,
-        // 一旦对不上占位符和光标就不在同一行(用户实测:提示字与光标错位)
-        TextField(
-            "粘贴 key / JSON / base64 / curl / 代理链接;也可拖入 zip、配置文件或粘贴路径",
+        // 占位符对齐历史:v1.4.35 曾换 TextField(axis:.vertical) 原生 prompt —— 系统
+        // 保证与光标同行,但 macOS 上框比内容高时会把文字垂直居中(用户:更难看)。
+        // 回退 TextEditor 外观,改用下方 ImportTextView(NSViewRepresentable):
+        // textContainerInset/lineFragmentPadding 显式置零,占位符画在同一原点 ——
+        // 对齐是确定性的,不再依赖任何随系统版本漂移的内部值
+        ImportTextView(
             text: $state.input,
-            axis: .vertical
+            enabled: !state.isBusy,
+            focus: $inputFocused,
+            placeholder: Self.importPlaceholder
         )
-        .textFieldStyle(.plain)
-        .font(.system(size: 12.5, design: .monospaced))
         .padding(8)
         .frame(minHeight: 72, maxHeight: 130)
-        .focused($inputFocused)
-        .disabled(state.isBusy)
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color(nsColor: .textBackgroundColor).opacity(0.65))
