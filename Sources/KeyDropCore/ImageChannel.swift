@@ -35,40 +35,48 @@ public struct ImageChannel: Codable {
 }
 
 public enum ImageChannelStore {
+    private static let maxChannelBytes = 1_000_000
+
     public static var path: String {
         ProcessInfo.processInfo.environment["KEYDROP_IMAGE_CHANNEL"]
             ?? (NSHomeDirectory() + "/.keydrop/image-channel.json")
     }
 
     public static func load() -> ImageChannel? {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int,
+              size <= maxChannelBytes,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              data.count <= maxChannelBytes else { return nil }
         return try? JSONDecoder().decode(ImageChannel.self, from: data)
     }
 
     public static func save(_ c: ImageChannel) throws {
+        guard !c.url.isEmpty, c.url.utf8.count <= 4_096,
+              !c.key.isEmpty, c.key.utf8.count <= 4_096,
+              !c.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              c.model.utf8.count <= 256 else {
+            throw WriterError.file("生图渠道参数无效或过长")
+        }
         let url = URL(fileURLWithPath: path)
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        let data = try JSONEncoder().encode(c)
-        let tmp = url.appendingPathExtension("tmp")
-        try? FileManager.default.removeItem(at: tmp)
-        // 文件内容是明文 key,权限对齐 history.json(600)
-        do {
-            try data.write(to: tmp, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
-            if FileManager.default.fileExists(atPath: url.path) {
-                // replaceItemAt 会保留【原文件】的权限/ACL,若原文件是 0644,
-                // 新文件的 600 会被丢弃 —— 替换后再收一次
-                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-            } else {
-                try FileManager.default.moveItem(at: tmp, to: url)
+        try FileLock.withLock(FileLock.lockPath(for: url.path)) {
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(c)
+            let tmp = url.appendingPathExtension("tmp-\(UUID().uuidString)")
+            do {
+                try data.write(to: tmp, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+                if FileManager.default.fileExists(atPath: url.path) {
+                    _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+                } else {
+                    try FileManager.default.moveItem(at: tmp, to: url)
+                }
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            } catch {
+                try? FileManager.default.removeItem(atPath: tmp.path)
+                throw error
             }
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-        } catch {
-            // 失败时清掉 .tmp(内含明文 key),不留在磁盘上
-            try? FileManager.default.removeItem(atPath: tmp.path)
-            throw error
         }
     }
 }
@@ -103,53 +111,68 @@ public enum ImageMCPWriter {
     /// 写入 claude settings.json mcpServers;返回是否已存在
     public static func writeClaude() throws -> Bool {
         let path = claudeSettingsPath
-        var obj: [String: Any]
-        if FileManager.default.fileExists(atPath: path) {
-            // 文件存在但解析失败时拒绝写入,避免把用户既有配置清空
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                  let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw WriterError.file("\(path) 不是有效 JSON,为避免覆盖未修改")
+        return try FileLock.withLock(FileLock.lockPath(for: path)) {
+            var obj: [String: Any]
+            if FileManager.default.fileExists(atPath: path) {
+                // 文件存在但解析失败时拒绝写入,避免把用户既有配置清空
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                      let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw WriterError.file("\(path) 不是有效 JSON,为避免覆盖未修改")
+                }
+                obj = parsed
+            } else {
+                obj = [:]
             }
-            obj = parsed
-        } else {
-            obj = [:]
+            var servers = (obj["mcpServers"] as? [String: Any]) ?? [:]
+            if servers["keydrop-image"] != nil { return true }
+            let command = mcpCommand()
+            guard let executable = command.first else {
+                throw WriterError.file("MCP 命令为空")
+            }
+            servers["keydrop-image"] = [
+                "command": executable,
+                "args": Array(command.dropFirst()),
+            ]
+            obj["mcpServers"] = servers
+            let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+            // ~/.claude 可能不存在(未装/未初始化),必须补建目录,否则原子写直接抛错,
+            // 而 writeAll 首个失败会中止后续 codex/opencode 的注册
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            return false
         }
-        var servers = (obj["mcpServers"] as? [String: Any]) ?? [:]
-        if servers["keydrop-image"] != nil { return true }
-        servers["keydrop-image"] = [
-            "command": mcpCommand()[0],
-            "args": Array(mcpCommand().dropFirst()),
-        ]
-        obj["mcpServers"] = servers
-        let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
-        // ~/.claude 可能不存在(未装/未初始化),必须补建目录,否则原子写直接抛错,
-        // 而 writeAll 首个失败会中止后续 codex/opencode 的注册
-        try FileManager.default.createDirectory(
-            at: URL(fileURLWithPath: path).deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
-        return false
     }
 
     /// 写入 codex config.toml [mcp_servers.keydrop-image];返回是否已存在
     public static func writeCodex() throws -> Bool {
         let path = codexConfigPath
-        let cmd = mcpCommand()
-        let quote = { (s: String) -> String in
+        return try FileLock.withLock(FileLock.lockPath(for: path)) {
+            let cmd = mcpCommand()
+            guard let executable = cmd.first else {
+                throw WriterError.file("MCP 命令为空")
+            }
+            let quote = { (s: String) -> String in
             let q = "\""
-            return q + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: q, with: "\\" + q) + q
+                return q + s.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: q, with: "\\" + q)
+                    .replacingOccurrences(of: "\n", with: "\\n")
+                    .replacingOccurrences(of: "\r", with: "\\r")
+                    .replacingOccurrences(of: "\t", with: "\\t") + q
+            }
+            let section = "\n[mcp_servers.keydrop-image]\ncommand = \(quote(executable))\nargs = [" + cmd.dropFirst().map(quote).joined(separator: ", ") + "]\n"
+            let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+            if existing.contains("[mcp_servers.keydrop-image]") { return true }
+            let out = existing + section
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try out.write(toFile: path, atomically: true, encoding: .utf8)
+            return false
         }
-        let section = "\n[mcp_servers.keydrop-image]\ncommand = \(quote(cmd[0]))\nargs = [" + cmd.dropFirst().map(quote).joined(separator: ", ") + "]\n"
-        let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        if existing.contains("[mcp_servers.keydrop-image]") { return true }
-        let out = existing + section
-        try FileManager.default.createDirectory(
-            at: URL(fileURLWithPath: path).deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try out.write(toFile: path, atomically: true, encoding: .utf8)
-        return false
     }
 
     /// 全部写入;返回各目标是否已存在(未改动)。

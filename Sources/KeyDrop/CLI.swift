@@ -273,14 +273,21 @@ enum CLI {
             print("CPA 配置:      \(Core.shared.prefs.resolvedCPAConfig() ?? "未找到")")
             print(LLMParser.configSummary())
             let cc = CCSwitchWriter()
-            if let cur = cc.readSwitchSettings()?["currentProviderClaude"] as? String {
-                print("当前 provider (switch settings): \(cur)")
-            }
-            if let db = try? DB(path: CCSwitchWriter.dbPath),
-               let row = try? db.query(
-                   "SELECT id, name FROM providers WHERE app_type='claude' AND is_current=1 LIMIT 1"
-               ).first, let id = row[0] {
-                print("当前 provider (DB is_current):   \(id) \(row[1] ?? "")")
+            let switchSettings = cc.readSwitchSettings() ?? [:]
+            if let db = try? DB(path: CCSwitchWriter.dbPath) {
+                for appType in ["claude", "codex", "opencode"] {
+                    let key = "currentProvider" + appType.prefix(1).uppercased() + appType.dropFirst()
+                    let fileID = switchSettings[key] as? String
+                    print("当前 provider (settings \(appType)): \(fileID ?? "未设置")")
+                    if let row = try? db.query(
+                        "SELECT id, name FROM providers WHERE app_type=? AND is_current=1 LIMIT 1",
+                        [appType]
+                    ).first, let id = row[0] {
+                        print("当前 provider (DB \(appType)):       \(id) \(row[1] ?? "")")
+                    } else {
+                        print("当前 provider (DB \(appType)):       未设置")
+                    }
+                }
             }
             if let claude = cc.readClaudeSettings(),
                let env = claude["env"] as? [String: Any] {
@@ -420,14 +427,22 @@ enum CLI {
             }
         }
 
-        let cfg = CPAWriter.locateConfig()
-        let configContent = cfg.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? ""
+        // docker 判定需要 config 正文;API 模式必须走管理 API 取文本 ——
+        // locateConfig() 会 stat KEYDROP_CPA_CONFIG/prefs/默认候选路径,
+        // 路径在 ~/Documents 下时这一步就是一次 TCC「文稿」弹窗
+        let configContent: String
+        if CPAAPI.apiMode {
+            configContent = (try? CPAAPI.readConfigText(path: "")) ?? ""
+        } else {
+            let cfg = CPAWriter.locateConfig()
+            configContent = cfg.flatMap { try? String(contentsOfFile: $0, encoding: .utf8) } ?? ""
+        }
         let plan = ProxyPool.planBinding(accounts: accounts, proxies: proxies, strictPoolOnly: strict)
         let counts = Dictionary(grouping: plan.bindings, by: \.action).mapValues(\.count)
 
         if jsonOut {
             let payload: [String: Any] = [
-                "authDir": dir,
+                "authDir": dir ?? NSNull(),
                 "accounts": accounts.count,
                 "proxiesTotal": urls.count,
                 "proxiesAlive": proxies.filter { $0.status == .alive }.count,
@@ -478,7 +493,15 @@ enum CLI {
             }
             let expanded = NSString(string: value).expandingTildeInPath
             if FileManager.default.fileExists(atPath: expanded) {
-                if let data = try? Data(contentsOf: URL(fileURLWithPath: expanded)),
+                // 先看大小再读:参数可能指向 GB 级文件,无条件读会 OOM。
+                // 正常输入是 key 文本/配置/zip 路径,8MB 已远超实际需要。
+                // 超限时原样返回路径,由 Parser.parseFile 给出统一的「文件过大」报错
+                let maxBytes = 8_000_000
+                let size = (try? FileManager.default.attributesOfItem(atPath: expanded))?[.size] as? Int
+                // size 取不到(stat 失败)时也读,但用 count 兜住上限
+                if size.map({ $0 <= maxBytes }) ?? true,
+                   let data = try? Data(contentsOf: URL(fileURLWithPath: expanded)),
+                   data.count <= maxBytes,
                    let s = String(data: data, encoding: .utf8) {
                     return s
                 }
@@ -515,7 +538,7 @@ enum CLI {
         // 独立生图条目(name=<host>-image, image: true),本地渠道改指向 CPA 常驻
         // 端点 —— 多 key 轮询/失效剔除/热重载全部由 CPA 接管,后续再 image-add
         // 另一家,所有工具无需重配,agent 传 model 参数即自动路由
-        if cpaOverride != false, let cfg = CPAWriter.locateConfig() {
+        if cpaOverride != false, let cfg = Prefs.shared.resolvedCPAConfig() {
             let writer = CPAWriter(configPath: cfg)
             do {
                 let msg = try writer.addImageChannel(baseURL: url, key: key,

@@ -250,6 +250,7 @@ public struct HistoryEntry: Codable {
 
 public final class HistoryStore {
     static let shared = HistoryStore()
+    private static let maxHistoryBytes = 64_000_000
 
     var storeDir: URL {
         let base = ProcessInfo.processInfo.environment["KEYDROP_HOME"]
@@ -300,10 +301,13 @@ public final class HistoryStore {
         // 记录进入时的 mtime:仅当本轮真正消费了文件内容才更新 lastMtime,
         // 否则解析失败后外部把文件修好,也会因 mtime 未变而被跳过、永远读不进来
         let currentMtime = mtime
-        guard let data = try? Data(contentsOf: fileURL) else {
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.size] as? Int,
+              size <= Self.maxHistoryBytes,
+              let data = try? Data(contentsOf: fileURL),
+              data.count <= Self.maxHistoryBytes else {
             // 读失败 ≠ 文件为空,可能是磁盘满/权限瞬时故障;保留内存快照,
             // 且不更新 lastMtime,下轮 snapshot 时 mtime 未变会自动重试
-            Logger.warn("history 文件读取失败,保留内存快照: \(fileURL.path)")
+            Logger.warn("history 文件读取失败或过大,保留内存快照: \(fileURL.path)")
             return
         }
         struct Wrapper: Codable { var items: [HistoryEntry] }
@@ -386,6 +390,10 @@ public final class HistoryStore {
         } else {
             try FileManager.default.moveItem(at: tmp, to: fileURL)
         }
+        // replaceItemAt 保留【原文件】的权限:历史文件若在旧版本/手工操作下是 0644,
+        // 上面给 tmp 设的 0600 会被丢弃,含明文 key 的 history.json 从此长期可读。
+        // 落盘后再收紧一次(与 ImageChannelStore.save 同一处理)。
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         _items = merged
         // 已落盘的 id 全部登记:此后任何一次 save 发现它从文件消失 → 其他进程删除 → 不复活
         loadedIDs = Set(merged.map { $0.id })
@@ -584,6 +592,7 @@ public final class HistoryStore {
 
 public final class Prefs {
     public static let shared = Prefs()
+    private static let maxPrefsBytes = 1_000_000
 
     private var fileURL: URL {
         let base = ProcessInfo.processInfo.environment["KEYDROP_HOME"]
@@ -649,7 +658,10 @@ public final class Prefs {
 
     func load() {
         lock.lock(); defer { lock.unlock() }
-        if let data = try? Data(contentsOf: fileURL),
+        if let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path))?[.size] as? Int,
+           size <= Self.maxPrefsBytes,
+           let data = try? Data(contentsOf: fileURL),
+           data.count <= Self.maxPrefsBytes,
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             if let v = obj["useCC"] as? Bool { _useCC = v }
             if let v = obj["useGrok"] as? Bool { _useGrok = v }
@@ -675,8 +687,13 @@ public final class Prefs {
         // 严禁对 stored 路径 stat —— Documents 下的路径一次 stat 就可能是一次
         // 「文稿」弹窗(更新换签名使 TCC 授权作废后)。文件模式才需要确认存在。
         if CPAAPI.apiMode {
-            if let p = stored { return p }
-        } else if let p = stored, FileManager.default.fileExists(atPath: p) {
+            // 绝不能回落到 locateConfig():它会对 KEYDROP_CPA_CONFIG / prefs 路径 /
+            // 三个默认候选路径逐个 stat,还可能拉起 ps / docker —— 路径在 Documents 下时
+            // 每次导入都是一次「文稿」弹窗。API 模式下服务端用自己的配置,
+            // 本地路径纯属记录参数,给一个非空占位即可让上层流程继续。
+            return stored ?? "(CPA 管理 API)"
+        }
+        if let p = stored, FileManager.default.fileExists(atPath: p) {
             return p
         }
         return CPAWriter.locateConfig()
@@ -718,6 +735,9 @@ public final class Prefs {
             } else {
                 try FileManager.default.moveItem(at: tmp, to: fileURL)
             }
+            // replaceItemAt 保留原文件权限:prefs 含 CPA 管理密钥与代理凭据,
+            // 原文件若是 0644 则新文件也是 0644。落盘后统一收紧(同 history.save)。
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         }
     }
 }

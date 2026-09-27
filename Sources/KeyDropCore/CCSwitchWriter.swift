@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Darwin
 
 public struct CCAddResult {
     public let providerID: String
@@ -8,6 +9,7 @@ public struct CCAddResult {
     var renamedTo: String? = nil
     var directMode = false
     var proxyMode = false
+    public var activationDeferred = false
     public var warnings: [String] = []
 }
 
@@ -16,6 +18,7 @@ enum WriterError: LocalizedError {
     case missingKey
     case file(String)
     case json(String)
+    case currentMutationBlocked(String)
 
     var errorDescription: String? {
         switch self {
@@ -23,7 +26,13 @@ enum WriterError: LocalizedError {
         case .missingKey: return "缺少 API key"
         case .file(let s): return s
         case .json(let s): return "JSON 处理失败: \(s)"
+        case .currentMutationBlocked(let s): return s
         }
+    }
+
+    var isCurrentMutationBlocked: Bool {
+        if case .currentMutationBlocked = self { return true }
+        return false
     }
 }
 
@@ -37,6 +46,9 @@ public final class CCSwitchWriter {
     // ② 账本不变量:HistoryEntry.targets 的每个 tag 必须对应一个真实存在的外部产物,
     //    且 delete/reconcile 能凭 tag + ccProviderID 认领并清理它。
     //    外部写入失败时不得丢 tag(旧产物还在);回滚/清理成功时不得并 tag(产物已删)。
+    // ③ 运行态不变量:cc-switch 已运行时,它的 settings store 可能只在进程启动时加载。
+    //    此时 KeyDrop 不得改变 claude/codex 的 current 指针或 live 配置,否则磁盘状态
+    //    与 cc-switch UI/内存状态分叉,后续 cc-switch 回写还可能覆盖刚导入的 provider。
     // 场景测试:TestSuite/RegressionTests.swift(写入不变量矩阵 / 账本闭环 add→delete)。
     public init() {}
 
@@ -69,10 +81,11 @@ public final class CCSwitchWriter {
         try Self.ensureDB()
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let id = UUID().uuidString.lowercased()
+        var id = UUID().uuidString.lowercased()
         let name = (nameOverride?.isEmpty == false ? nameOverride! : p.name) ?? defaultName(for: url)
         let wireApi = "responses"
         let fakeRunning = ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "1"
+        let deferActivation = (appType == "claude" || appType == "codex") && Self.ccSwitchStateMayBeStale()
         let supportsResponses = appType == "codex" && !fakeRunning
             ? APITester.supportsResponsesAPI(base: url, key: key, proxy: proxy) : true
         let apiFormat = supportsResponses ? "openai_responses" : "openai_chat"
@@ -110,6 +123,7 @@ public final class CCSwitchWriter {
         let db = try DB(path: Self.dbPath)
         try db.exec("BEGIN IMMEDIATE")
         var dedupReplacedID: String? = nil
+        var reusedProviderID: String? = nil
         do {
             if appType == "opencode" || appType == "codex" {
                 let normURL = appType == "opencode" ? opencodeBaseURL(url) : normalizeEndpointURL(url)
@@ -130,30 +144,47 @@ public final class CCSwitchWriter {
                     guard row.count > 2 else { return false }
                     return Self.providerAPIKey(from: row[2] ?? "", appType: appType) == key
                 }
-                if let id = existing?[0] {
-                    try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [id])
-                    try db.run("DELETE FROM providers WHERE id=?", [id])
-                    dedupReplacedID = id
+                if let existingID = existing?[0] {
+                    if deferActivation {
+                        // cc-switch 已运行时不能删除它可能仍在内存中持有的 current 行。
+                        // 保留主键并原地更新，避免 settings.json/进程缓存指向悬空 ID。
+                        id = existingID
+                        reusedProviderID = existingID
+                    } else {
+                        try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [existingID])
+                        try db.run("DELETE FROM providers WHERE id=?", [existingID])
+                        dedupReplacedID = existingID
+                    }
                 }
             }
-            // cc-switch sorts by COALESCE(sort_index, 999999), then created_at ASC.
-            // NULL therefore goes to the end regardless of is_current. Shift the
-            // existing explicit order in this transaction and reserve index 0 for
-            // the newly imported provider.
-            try db.run(
-                "UPDATE providers SET sort_index = sort_index + 1 WHERE app_type = ? AND sort_index IS NOT NULL",
-                [appType]
-            )
-            try db.run(
-                """
-                INSERT INTO providers
-                (id, app_type, name, settings_config, website_url, category,
-                 created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue)
-                VALUES (?, ?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, 1, 0)
-                """,
-                [id, appType, name, settingsConfig, now, meta]
-            )
-            try db.run("UPDATE providers SET is_current = 0 WHERE app_type = ? AND id != ?", [appType, id])
+            if let reusedProviderID {
+                try db.run(
+                    "UPDATE providers SET name = ?, settings_config = ?, meta = ? WHERE id = ? AND app_type = ?",
+                    [name, settingsConfig, meta, reusedProviderID, appType]
+                )
+                try db.run("DELETE FROM provider_endpoints WHERE provider_id=?", [reusedProviderID])
+            } else {
+                // cc-switch sorts by COALESCE(sort_index, 999999), then created_at ASC.
+                // NULL therefore goes to the end regardless of is_current. Shift the
+                // existing explicit order in this transaction and reserve index 0 for
+                // the newly imported provider.
+                try db.run(
+                    "UPDATE providers SET sort_index = sort_index + 1 WHERE app_type = ? AND sort_index IS NOT NULL",
+                    [appType]
+                )
+                try db.run(
+                    """
+                    INSERT INTO providers
+                    (id, app_type, name, settings_config, website_url, category,
+                     created_at, sort_index, notes, icon, icon_color, meta, is_current, in_failover_queue)
+                    VALUES (?, ?, ?, ?, NULL, NULL, ?, 0, NULL, NULL, NULL, ?, ?, 0)
+                    """,
+                    [id, appType, name, settingsConfig, now, meta, deferActivation ? 0 : 1]
+                )
+            }
+            if !deferActivation {
+                try db.run("UPDATE providers SET is_current = 0 WHERE app_type = ? AND id != ?", [appType, id])
+            }
             try db.run(
                 "INSERT INTO provider_endpoints (provider_id, app_type, url, added_at) VALUES (?, ?, ?, ?)",
                 [id, appType, appType == "opencode" ? opencodeBaseURL(url) : url, now]
@@ -175,16 +206,24 @@ public final class CCSwitchWriter {
             }
 
             var result = CCAddResult(providerID: id, providerName: name)
+            if deferActivation {
+                result.activationDeferred = true
+                result.warnings.append(
+                    "cc-switch 正在运行，已保留当前激活 provider；本次导入未修改 current 指针或 live 配置，请在 cc-switch 界面手动切换，或重启 cc-switch 后再切换"
+                )
+            }
             if appType == "codex" && !supportsResponses {
                 result.warnings.append("该网关不支持 Responses API(codex 新版仅支持 responses 格式),codex 可能无法使用;建议将同 key 导入到 opencode")
             }
             result.renamedFrom = renamedFrom
             result.renamedTo = renamedTo
 
-            do {
-                try updateSwitchSettings(id, for: appType)
-            } catch {
-                result.warnings.append("switch settings 更新失败: \(error.localizedDescription)")
+            if !deferActivation {
+                do {
+                    try updateSwitchSettings(id, for: appType)
+                } catch {
+                    result.warnings.append("switch settings 更新失败: \(error.localizedDescription)")
+                }
             }
 
             if appType == "opencode" {
@@ -205,6 +244,7 @@ public final class CCSwitchWriter {
             }
 
             if appType == "codex" {
+                if deferActivation { return result }
                 let proxied = (try? String(contentsOfFile: Self.codexConfigPath, encoding: .utf8))
                     .flatMap { c -> Bool in
                         let custom = c.components(separatedBy: "[model_providers.custom]").dropFirst().first ?? ""
@@ -224,6 +264,8 @@ public final class CCSwitchWriter {
                 }
                 return result
             }
+
+            if deferActivation { return result }
 
             // ═══ live 一致性写入(cc-switch 运行与否同策略)═══
             // 两类回写事故对称发生,根源都是「live 与 DB current 漂移」:
@@ -348,10 +390,15 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         ])
     }
 
-    /// TOML 双引号字符串转义(模型名/key 可能含引号或反斜杠)
+    /// TOML 双引号字符串转义(模型名/key 可能含引号或反斜杠)。
+    /// 换行/回车/制表符必须转义:裸换行写进基本字符串会让整个 config.toml 解析失败
+    /// (codex 直接拒绝启动),而模型名/名称来自粘贴文本或 /models 列表,含换行并非不可能。
     static func tomlQuote(_ s: String) -> String {
         let e = s.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\t", with: "\\t")
         return "\"\(e)\""
     }
 
@@ -498,6 +545,10 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             try? FileManager.default.copyItem(atPath: authPath, toPath: authPath + ".bak")
         }
         try writeJSON(["OPENAI_API_KEY": p.key ?? ""], to: authPath)
+        // auth.json 是纯凭据文件(只含 OPENAI_API_KEY),收紧到仅属主可读写。
+        // writeJSON 走 replaceItemAt,会保留原文件权限 —— 若原文件是 0644(默认 umask),
+        // 明文 key 会一直对同机其他用户可读。
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authPath)
     }
 
     /// 删除 current provider 后,把 live 恢复为回退目标 fb 自己的 DB 配置。
@@ -768,6 +819,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     func remove(providerID: String, renamedFrom: String?, renamedTo: String?, appType: String = "claude") throws -> String {
         try Self.ensureDB()
         let db = try DB(path: Self.dbPath)
+        if Self.ccSwitchStateMayBeStale() && (appType == "claude" || appType == "codex") {
+            throw WriterError.currentMutationBlocked(
+                "cc-switch 正在运行，当前 provider 状态可能仍在进程内缓存；为避免界面、DB 与 live 配置分叉，请先在 cc-switch 中切换其他 provider 或退出 cc-switch 后再删除"
+            )
+        }
         // COMMIT 之后任何附属文件(settings/opencode.json/codex备份)写入失败都只降级为
         // 警告附在返回消息里,不再 throw:此刻事务已提交、DB 已删干净,
         // 抛错会让调用方(Core.delete)误判"删除失败",制造历史↔DB 账目不一致。
@@ -1405,22 +1461,54 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         return out
     }
 
+    static func ccSwitchStateMayBeStale() -> Bool {
+        if let raw = ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_STATE_CACHED"] {
+            return raw == "1"
+        }
+        return detectedCCSwitchRunning()
+    }
+
     static public func ccSwitchRunning() -> Bool {
         if ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "1" { return true }
         if ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "0" { return false }
 
+        return detectedCCSwitchRunning()
+    }
+
+    private static func detectedCCSwitchRunning() -> Bool {
         // 官方 macOS bundle id 是 com.ccswitch.desktop。不同安装渠道/旧版本可能只保留
         // 可执行文件名,所以同时按 bundle id、进程名和可执行文件名识别。
         // 这里宁可少写一次 live 配置,也不能在 cc-switch 已运行但未被精确识别时覆盖
         // 它正在管理的 Claude 配置,否则会触发旧 provider 的 settings_config 回写污染。
-        return NSWorkspace.shared.runningApplications.contains { app in
+        if NSWorkspace.shared.runningApplications.contains(where: { app in
             if app.bundleIdentifier == "com.ccswitch.desktop" { return true }
             let names = [app.localizedName, app.executableURL?.lastPathComponent]
                 .compactMap { $0?.lowercased() }
             return names.contains { name in
                 name == "cc-switch" || name == "cc switch" || name == "ccswitch"
             }
+        }) {
+            return true
         }
+
+        // CLI/菜单栏进程在部分 macOS 权限场景不会出现在 NSWorkspace 的应用列表中,
+        // 但 cc-switch 的真实可执行文件仍可由 libproc 枚举到。不能只依赖
+        // NSWorkspace,否则 KeyDrop 会把「运行中」误判成「未运行」并改写 current/live。
+        var pids = [pid_t](repeating: 0, count: 1024)
+        let pidCount = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride)))
+        guard pidCount > 0 else { return false }
+        for pid in pids.prefix(min(pidCount, pids.count)) where pid > 0 {
+            var pathBuffer = [CChar](repeating: 0, count: 4096)
+            let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+            guard pathLength > 0 else { continue }
+            let executablePath = String(cString: pathBuffer).lowercased()
+            if executablePath.contains("/cc switch.app/contents/macos/cc-switch")
+                || executablePath.hasSuffix("/cc-switch")
+                || executablePath.hasSuffix("/ccswitch") {
+                return true
+            }
+        }
+        return false
     }
 
     private static func ensureDB() throws {

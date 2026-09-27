@@ -88,7 +88,12 @@ public enum APITester {
             return nil   // 无法识别的形态:直连,而不是用错字典把探测全打挂
         }
         guard let url = URL(string: spec), let host = url.host, !host.isEmpty else { return nil }
-        let port = url.port ?? (isSocks ? 1080 : (spec.hasPrefix("https") ? 443 : 80))
+        // 端口必须显式校验:URL(string:) 对 "http://h:99999" 照样解析成功(port=99999),
+        // 而 CFNetwork 拿到越界端口的行为是未定义的 —— 可能静默直连或整个会话报错,
+        // 用户看到的是「所有 key 突然全挂」却查不出原因。越界一律视为配置错误。
+        let scheme = url.scheme?.lowercased() ?? ""
+        let port = url.port ?? (isSocks ? 1080 : (scheme == "https" ? 443 : 80))
+        guard port > 0, port <= 65535 else { return nil }
         if isSocks {
             return [
                 kCFNetworkProxiesSOCKSEnable as String: true,

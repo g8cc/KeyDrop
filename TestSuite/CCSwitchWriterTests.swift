@@ -282,6 +282,45 @@ enum CCSwitchWriterTests {
             t.equal(s3["db.grok"], s3["oc.grok"], "refresh 后:DB 与 opencode.json 同名")
         }
 
+        // 回归:cc-switch 已运行时会把 settings.json 缓存在进程内。
+        // KeyDrop 不得只改磁盘上的 current 指针,否则 DB/settings.json 看似已切换,
+        // cc-switch 界面仍展示旧 provider,后续回写还可能覆盖新行。
+        h.runSuite("CCSwitchWriter.运行中不制造 current 分叉") { t in
+            let env = try! TestEnv("cc-runtime-current")
+            defer { env.cleanup() }
+            try! createSchema(env)
+            let w = CCSwitchWriter()
+            var old = ParsedKey()
+            old.key = "sk-runtime-old-111111"
+            old.url = "https://runtime-old.example/v1"
+            let oldResult = try! w.add(old, appType: "codex", models: ["gpt-5.6-sol"], proxy: nil)
+            let beforeConfig = env.read("codex.toml")
+            env.write("settings.json", "{\"currentProviderCodex\":\"\(oldResult.providerID)\"}")
+
+            setenv("KEYDROP_FAKE_CC_STATE_CACHED", "1", 1)
+            defer { setenv("KEYDROP_FAKE_CC_STATE_CACHED", "0", 1) }
+            var newer = ParsedKey()
+            newer.key = "sk-runtime-new-222222"
+            newer.url = "https://runtime-new.example/v1"
+            let result = try! w.add(newer, appType: "codex", models: ["gpt-5.6-sol"], proxy: nil)
+            let db = try! DB(path: env.dir + "/cc-switch.db")
+
+            t.expect(result.activationDeferred, "运行中导入明确延迟激活")
+            t.equal(try! db.scalar("SELECT is_current FROM providers WHERE id=?", [oldResult.providerID]), "1",
+                    "运行中旧 provider 继续保持 current")
+            t.equal(try! db.scalar("SELECT is_current FROM providers WHERE id=?", [result.providerID]), "0",
+                    "运行中新 provider 不抢 current")
+            t.contains(env.read("settings.json"), oldResult.providerID, "运行中不改 settings.json current 指针")
+            t.equal(env.read("codex.toml"), beforeConfig, "运行中不改 Codex live 配置")
+
+            // 同 URL + 同 key 重导入不得删除仍被缓存的 current 主键。
+            let same = try! w.add(old, appType: "codex", models: ["gpt-5.6-sol"], proxy: nil)
+            t.equal(same.providerID, oldResult.providerID, "运行中重复导入保留 current provider 主键")
+            t.notNil(try! db.scalar("SELECT 1 FROM providers WHERE id=?", [oldResult.providerID]),
+                     "运行中重复导入不留下悬空 current ID")
+
+        }
+
         // CPA 常驻入口:被动 upsert,不抢激活、幂等、模型原地更新
         h.runSuite("CCSwitchWriter.CPA 常驻入口") { t in
             let env = try! TestEnv("cc-resident")

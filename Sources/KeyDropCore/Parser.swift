@@ -21,9 +21,48 @@ public struct ClashProxy: Codable {
 
 public enum Parser {
 
+    private static let maxInputBytes = 8_000_000
+
     private struct Cand { let value: String; let lhs: String? }
 
+    // MARK: - 正则编译缓存
+    //
+    // `String.range(of:options:.regularExpression)` 与 `replacingOccurrences(...)`
+    // 每次调用都会重新编译一份 NSRegularExpression。key/模型判定是逐 token 的热路径:
+    // 一次粘贴一万行 = 数万次编译,实测能吃掉秒级 CPU。模式全是静态字面量,
+    // 按「选项 + 模式」缓存编译结果即可(缓存规模 = 代码里的模式数量,不会增长)。
+    private static let regexLock = NSLock()
+    private static var regexCache: [String: NSRegularExpression] = [:]
+
+    private static func compiled(_ pattern: String, _ options: NSRegularExpression.Options) -> NSRegularExpression? {
+        let key = "\(options.rawValue)\u{1}\(pattern)"
+        regexLock.lock()
+        if let hit = regexCache[key] { regexLock.unlock(); return hit }
+        regexLock.unlock()
+        guard let re = try? NSRegularExpression(pattern: pattern, options: options) else { return nil }
+        regexLock.lock()
+        regexCache[key] = re
+        regexLock.unlock()
+        return re
+    }
+
+    /// 等价于 `s.range(of: pattern, options: .regularExpression) != nil`(带选项)
+    static func regexMatch(_ s: String, _ pattern: String, _ options: NSRegularExpression.Options = []) -> Bool {
+        guard let re = compiled(pattern, options) else { return false }
+        return re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
+    }
+
+    /// 等价于 `s.replacingOccurrences(of: pattern, with: template, options: .regularExpression)`
+    static func regexReplace(_ s: String, _ pattern: String, with template: String,
+                             _ options: NSRegularExpression.Options = []) -> String {
+        guard let re = compiled(pattern, options) else { return s }
+        return re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: template)
+    }
+
     public static func parse(_ raw: String, depth: Int = 0) throws -> ParsedKey {
+        guard raw.utf8.count <= maxInputBytes else {
+            throw ParseError.io("输入过大(超过 \(maxInputBytes / 1_000_000)MB),已拒绝解析")
+        }
         let text = stripPasteNoise(normalizeFullWidth(raw)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw ParseError.emptyInput }
 
@@ -121,7 +160,18 @@ public enum Parser {
         guard FileManager.default.fileExists(atPath: path) else {
             throw ParseError.io("文件不存在: \(path)")
         }
+        // 先看大小再读:拖入/粘贴路径可能是任意大文件(镜像、日志、数据库),
+        // 无条件 Data(contentsOf:) 会把整个文件读进内存,GB 级输入直接 OOM 崩溃。
+        // 配置/凭据文件都是 KB 级,8MB 上限足够宽松。
+        let maxFileBytes = 8_000_000
+        if let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int,
+           size > maxFileBytes {
+            throw ParseError.io("文件过大(\(size / 1_000_000)MB > \(maxFileBytes / 1_000_000)MB),已拒绝读取: \(path)")
+        }
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        if data.count > maxFileBytes {
+            throw ParseError.io("文件过大(\(data.count / 1_000_000)MB > \(maxFileBytes / 1_000_000)MB),已拒绝读取: \(path)")
+        }
         if data.count > 4, data[0] == 0x50, data[1] == 0x4B {
             return try parseZipData(data, depth: depth)
         }
@@ -205,22 +255,23 @@ public enum Parser {
         let cleaned = stripCJK(t)
         if looksLikeURL(cleaned) { return Cand(value: cleaned, lhs: nil) }
         // 懒惰前缀 ≤40 字符 + [:=] + 完整 scheme URL → 只留 URL 捕获组
-        if cleaned.range(of: #"^.{0,40}?[:=]\s*((?:https?|socks5)://\S+)$"#, options: .regularExpression) != nil {
-            let urlPart = cleaned.replacingOccurrences(
-                of: #"^.{0,40}?[:=]\s*((?:https?|socks5)://\S+)$"#,
-                with: "$1", options: .regularExpression)
+        if regexMatch(cleaned, gluedLabeledURLPattern) {
+            let urlPart = regexReplace(cleaned, gluedLabeledURLPattern, with: "$1")
             return Cand(value: urlPart, lhs: nil)
         }
         return Cand(value: stripQuotes(t), lhs: nil)
     }
 
+    private static let gluedLabeledURLPattern = #"^.{0,40}?[:=]\s*((?:https?|socks5)://\S+)$"#
+
     /// Split a single line containing several labeled fields, for example:
     /// `baseurl: https://example.com/ key:<base64>`.
     /// The generic line parser cannot split on every colon because URLs contain
     /// colons too, so only recognized field labels at token boundaries are used.
+    private static let inlineLabeledPattern = #"(?i)(?:^|[\s,;])((?:anthropic[_-](?:auth[_-]?token|api[_-]?key|base[_-]?url|model)|base[_-]?url|baseurl|url|endpoint|host|api[_-]?key|apikey|api-key|auth[_-]?token|access[_-]?token|token|secret|key|default[_-]?model|claude[_-]?model|model|provider[_-]?name|provider|name|label|title))\s*[:=]\s*"#
+
     private static func inlineLabeledFields(_ line: String) -> [Cand]? {
-        let pattern = #"(?i)(?:^|[\s,;])((?:anthropic[_-](?:auth[_-]?token|api[_-]?key|base[_-]?url|model)|base[_-]?url|baseurl|url|endpoint|host|api[_-]?key|apikey|api-key|auth[_-]?token|access[_-]?token|token|secret|key|default[_-]?model|claude[_-]?model|model|provider[_-]?name|provider|name|label|title))\s*[:=]\s*"#
-        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        guard let re = compiled(inlineLabeledPattern, []) else { return nil }
         let ns = line as NSString
         let fullRange = NSRange(location: 0, length: ns.length)
         let matches = re.matches(in: line, range: fullRange)
@@ -348,7 +399,9 @@ public enum Parser {
 
     /// 识别「去除 X 即可」类指令,返回分隔符 X(如 :diamond_suit: 或 emoji)
     private static func separatorInstruction(_ text: String) -> String? {
-        let re = try! NSRegularExpression(pattern: #"(?:去除|去掉|删除|移除)\s*[:：]?\s*(.+?)\s*(?:即可|就可以|使用|,|，|。|$)"#)
+        // 原实现每次调用都 try! 编译正则:文本不含中文提示时也会白编译一次,
+        // 且一旦模式写错直接 crash 整个进程(而非返回 nil)
+        guard let re = compiled(separatorInstructionPattern, []) else { return nil }
         let ns = text as NSString
         guard let m = re.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) else { return nil }
         let r = m.range(at: 1)
@@ -357,8 +410,11 @@ public enum Parser {
         return s.isEmpty ? nil : s
     }
 
+    private static let separatorInstructionPattern =
+        #"(?:去除|去掉|删除|移除)\s*[:：]?\s*(.+?)\s*(?:即可|就可以|使用|,|，|。|$)"#
+
     private static func isInstructionLine(_ line: String) -> Bool {
-        line.range(of: #"(?:去除|去掉|删除|移除).*?(?:即可|就可以)"#, options: .regularExpression) != nil
+        regexMatch(line, #"(?:去除|去掉|删除|移除).*?(?:即可|就可以)"#)
     }
 
     /// key 行重组:剥字段标签 → 去分隔符 → 过滤非 key 字符(emoji/标点) → 校验
@@ -846,31 +902,53 @@ public enum Parser {
 
         // 解压前先用 unzip -l 预检总解压量:50MB 限制必须发生在任何落盘之前,
         // 否则 10GB 解压量的 zip bomb 会先撑爆磁盘,检查来不及生效。
-        // 口径与解压后的检查对齐:跳过 __MACOSX 资源 fork 条目和 >1.5MB 的
-        // 解压后也会被跳过的大文件,只检查总量(条目数仍由解压后检查,
-        // 目录条目 size=0 不计入总量,避免误杀含大量目录的合法 zip)
+        // 必须统计【所有】条目 —— 旧实现跳过 size > 1.5MB 的条目,而解压命令
+        // (unzip -o -q -j)对它们照解不误,解压后的检查又同样跳过它们:
+        // 2000 个 2MB 的条目 = 4GB 落盘,两道检查都算作 0,防护完全失效。
+        // 条目数同样在预检阶段卡住:百万个 0 字节条目能通过体积检查,
+        // 却在枚举阶段撑爆内存。
         let listProc = Process()
         listProc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
         listProc.arguments = ["-l", path]
         let listPipe = Pipe()
         listProc.standardOutput = listPipe
         listProc.standardError = FileHandle.nullDevice
-        if (try? listProc.run()) != nil {
-            let listData = listPipe.fileHandleForReading.readDataToEndOfFile()
+        guard (try? listProc.run()) != nil else {
+            throw ParseError.io("无法预检 zip 文件")
+        }
+        let listData: Data
+        do {
+            listData = try readPipeBounded(listPipe, maxBytes: 4_000_000, process: listProc)
+        } catch {
+            listProc.terminate()
             listProc.waitUntilExit()
-            if listProc.terminationStatus == 0 {
-                let text = String(data: listData, encoding: .utf8) ?? ""
-                var preTotal = 0
-                for line in text.split(separator: "\n") {
-                    // 行格式: "  12345  2024-01-01 12:00   name";表头/分隔线不含纯数字首列,自动跳过
-                    let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-                    guard parts.count >= 4, let size = Int(parts[0]) else { continue }
-                    if line.contains("__MACOSX") || line.contains("node_modules") || size > 1_500_000 { continue }
-                    preTotal += size
-                }
-                if preTotal > 50_000_000 {
-                    throw ParseError.io("zip 解压总量超过 50MB(疑似 zip bomb),已中止")
-                }
+            throw error
+        }
+        listProc.waitUntilExit()
+        guard listProc.terminationStatus == 0 else {
+            throw ParseError.io("无法读取 zip 目录")
+        }
+        guard let text = String(data: listData, encoding: .utf8) else {
+            throw ParseError.io("zip 目录不是有效 UTF-8")
+        }
+        var preTotal = 0
+        var preCount = 0
+        for line in text.split(separator: "\n") {
+            // 行格式: "  12345  2024-01-01 12:00   name";表头/分隔线不含纯数字首列,自动跳过
+            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+            guard parts.count == 4,
+                  parts[1].count == 10,
+                  parts[2].contains(":"),
+                  let size = Int(parts[0]), size >= 0 else { continue }
+            if line.contains("__MACOSX") { continue }
+            preCount += 1
+            let (sum, overflow) = preTotal.addingReportingOverflow(size)
+            guard !overflow, sum <= 50_000_000 else {
+                throw ParseError.io("zip 解压总量超过 50MB(疑似 zip bomb),已中止")
+            }
+            preTotal = sum
+            if preCount > 200 {
+                throw ParseError.io("zip 内文件数超过 200,已中止")
             }
         }
 
@@ -900,11 +978,18 @@ public enum Parser {
                 var isDir: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: p, isDirectory: &isDir), !isDir.boolValue else { continue }
                 let size = ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-                if size > 1_500_000 { continue }
+                // 体积计入总量(即使随后因过大不参与解析):预检已把总量卡在 50MB,
+                // 这里再兜一层,防 unzip 对压缩包声称大小与实际落盘不符的情况
                 totalSize += size
                 if totalSize > maxTotalSize {
                     throw ParseError.io("zip 解压总量超过 \(maxTotalSize / 1_000_000)MB(疑似 zip bomb),已中止")
                 }
+                // 条目数上限在枚举中就检查,不等枚举完 —— 否则先撑爆内存再报错
+                if files.count > 200 {
+                    throw ParseError.io("zip 内文件数超过 200,已中止")
+                }
+                // 超大单文件不参与解析(解析是全文读进内存):配置/凭据文件不可能这么大
+                if size > 1_500_000 { continue }
                 files.append((url, priority(ext: url.pathExtension.lowercased())))
             }
         }
@@ -929,6 +1014,21 @@ public enum Parser {
         if found.url == nil, let u = urlBorrow { found.url = u }
         found.format = "zip>" + found.format
         return found
+    }
+
+    private static func readPipeBounded(_ pipe: Pipe, maxBytes: Int, process: Process) throws -> Data {
+        var out = Data()
+        let handle = pipe.fileHandleForReading
+        while true {
+            let chunk = handle.readData(ofLength: 4096)
+            if chunk.isEmpty { break }
+            if out.count > maxBytes - chunk.count {
+                process.terminate()
+                throw ParseError.io("zip 目录过大,已中止")
+            }
+            out.append(chunk)
+        }
+        return out
     }
 
     private static func priority(ext e: String) -> Int {
@@ -1010,10 +1110,10 @@ public enum Parser {
         // 手贴模型名就丢了(真实事故:s2api.top 的 qwen3.8-flash)。
         // 再用 isDottedVersionModel 兜住 o3.5/k2.5:家族词(o3/k2)已吃掉首位数字,
         // 「词+[-\d]」不命中其后紧跟的点,靠末段全数字判回模型,否则 URL 抢占丢模型
-        guard l.range(of: #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#, options: .regularExpression) != nil,
+        guard regexMatch(l, #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#),
               !l.contains(".."),
               !isDottedVersionModel(l),
-              l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
+              !regexMatch(l, modelFamilyPrefixPattern)
         else { return false }
         return URL(string: "https://" + l)?.host?.isEmpty == false
     }
@@ -1067,6 +1167,10 @@ public enum Parser {
         let initialBias = 72, initialN = 128
         let scalars = Array(input.unicodeScalars)
         guard !scalars.isEmpty else { return nil }
+        // DNS 标签上限 63 字节,编码后也不会超过约 255。超长输入只可能来自
+        // 恶意粘贴的「URL」:算法是 O(n²)(每轮遍历全部标量),一万字符就是上亿次
+        // 运算,足以让导入卡住数十秒。直接拒绝。
+        guard scalars.count <= 255 else { return nil }
         var output = ""
         var n = initialN
         var delta = 0
@@ -1129,15 +1233,15 @@ public enum Parser {
     static func looksLikeKey(_ s: String) -> Bool {
         let t = stripCJK(s).trimmingCharacters(in: .whitespaces)
         guard t.count >= 16, t.count <= 256 else { return false }
-        guard t.range(of: #"^[\x21-\x7E]+$"#, options: .regularExpression) != nil else { return false }
+        guard regexMatch(t, #"^[\x21-\x7E]+$"#) else { return false }
         if t.contains(":") { return false }
-        if t.range(of: #"^(sk|ak|key|pk|cr|sp|dk|bk|rk|fk|tk|xk|wk|zk|gk|vk|nk|mk|hk|csk|gsk|sk-or|sk-ant|sk_tr|cfut|nvapi|ms)[-_]"#, options: [.regularExpression, .caseInsensitive]) != nil {
+        if regexMatch(t, #"^(sk|ak|key|pk|cr|sp|dk|bk|rk|fk|tk|xk|wk|zk|gk|vk|nk|mk|hk|csk|gsk|sk-or|sk-ant|sk_tr|cfut|nvapi|ms)[-_]"#, [.caseInsensitive]) {
             return true
         }
         if t.count >= 28,
-           t.range(of: #"^[A-Za-z0-9_\-./=]+$"#, options: .regularExpression) != nil,
-           !(t.range(of: #"^[0-9a-fA-F]+$"#, options: .regularExpression) != nil && decodeKeyIfHex(t) == nil),
-           t.lowercased().range(of: #"(claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex)"#, options: .regularExpression) == nil {
+           regexMatch(t, #"^[A-Za-z0-9_\-./=]+$"#),
+           !(regexMatch(t, #"^[0-9a-fA-F]+$"#) && decodeKeyIfHex(t) == nil),
+           !regexMatch(t.lowercased(), keyExcludeFamiliesPattern) {
             return true
         }
         return false
@@ -1150,21 +1254,34 @@ public enum Parser {
         guard s.contains(where: { $0.isLetter }) else { return false }
         if s.contains(where: { $0 == "$" || $0 == "！" || $0 == "？" || $0 == "!" || $0 == "?" }) { return false }
         let l = s.lowercased()
-        if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
+        if regexMatch(l, #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#) { return false }
         // 带点的「纯主机名字符」默认当域名排除,但家族模型名(qwen3.8-flash /
         // gpt5.2-mini 等「家族词+数字」新版命名)与点分版本名(o3.5 / k2.5)必须放行:
         // 前者靠「词+[-或数字]」前缀,后者末段全数字、真域名末段(TLD)恒为字母。
         // 词后紧跟点的真域名(qwen.example.com)仍被排除
-        if s.contains("."), s.range(of: #"^[a-z0-9][a-z0-9.-]*$"#, options: [.regularExpression, .caseInsensitive]) != nil,
+        if s.contains("."), regexMatch(s, #"^[a-z0-9][a-z0-9.-]*$"#, [.caseInsensitive]),
            !isDottedVersionModel(l),
-           s.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
+           !regexMatch(s, modelFamilyPrefixPattern)
         { return false }
-        let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
-        if l.range(of: families, options: .regularExpression) != nil { return true }
-        if l.range(of: #"\d"#, options: .regularExpression) != nil { return true }
-        if l.range(of: #"v\d"#, options: .regularExpression) != nil { return true }
+        if regexMatch(l, modelFamiliesPattern) { return true }
+        // \d 是 ASCII 数字(ICU 默认):用 isNumber 会把 ½/٣ 等也算进来,语义不等价
+        if l.contains(where: { $0.isASCII && $0.isNumber }) { return true }
+        if regexMatch(l, #"v\d"#) { return true }
         return false
     }
+
+    /// 家族词表(单一事实源):looksLikeModel / looksLikeURL 的排除式共用同一份,
+    /// 避免两处改不同步导致模型名被当域名抢走(或反之)
+    private static let modelFamiliesPattern =
+        "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
+    /// looksLikeKey 的排除式:不含 o[134]/k2 —— 那两个短模式无词边界,
+    /// 会在长随机令牌里误命中(如 …o3…),把合法 key 判成模型名而拒收。
+    /// 保持与历史行为逐字一致。
+    private static let keyExcludeFamiliesPattern =
+        "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex"
+    /// 「家族词 + 数字/连字符」前缀:qwen3.8 / gpt-4o / o3.5 这类带点或带数字的模型名
+    private static let modelFamilyPrefixPattern =
+        #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#
 
     static public func isAnyTLS(_ s: String) -> Bool {
         s.lowercased().hasPrefix("anytls://")

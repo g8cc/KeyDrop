@@ -9,8 +9,12 @@ public enum Version {
         guard let r = path.range(of: "/releases/tag/") else { return nil }
         var v = String(path[r.upperBound...])
         if v.hasPrefix("v") { v = String(v.dropFirst()) }
-        guard let f = v.first, f.isNumber else { return nil }
+        guard isValidReleaseVersion(v) else { return nil }
         return v
+    }
+
+    public static func isValidReleaseVersion(_ value: String) -> Bool {
+        value.range(of: #"^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9A-Za-z.-]+)?$"#, options: .regularExpression) != nil
     }
 
     /// 语义化版本比较:a > b → .orderedDescending;支持 v 前缀与多段数字(1.0.0.1),忽略 -后缀

@@ -151,6 +151,12 @@ public final class CPAWriter {
         public let clientKey: String
     }
 
+    /// API 模式下的占位「路径」:本地路径在 API 模式不参与任何读写(服务端用自己的
+    /// 配置),但调用方签名要求非空路径。用显式占位串而非回落到 locateConfig() ——
+    /// 后者会 stat 多个候选路径并可能拉起 ps/docker,路径在 ~/Documents 下时
+    /// 每次导入都会弹一次「文稿」授权。
+    public static let apiModePathPlaceholder = "(CPA 管理 API)"
+
     public static func endpointInfo() -> CPAEndpoint? {
         // 统一经 fetchConfigText 取配置文本:API 模式走管理 API(对 ~/Documents 下的
         // config.yaml 零触碰 —— 2026-09-25 事故:v1.4.31 起启动对账调 endpointInfo,
@@ -340,7 +346,9 @@ public final class CPAWriter {
     func addAggregated(baseURL: String, key: String, models: [String], proxy: String? = nil) throws -> String {
         let k = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !k.isEmpty else { throw WriterError.missingKey }
-        guard FileManager.default.fileExists(atPath: configPath) else {
+        // 必须走 configAvailable():API 模式没有本地 config.yaml(读写在服务端),
+        // 直接 fileExists 会把每次 API 模式导入都判成「config 不存在」而全部失败
+        guard configAvailable() else {
             throw WriterError.file("CPA config 不存在: \(configPath)")
         }
         let writeMsg = try withWriteLock {
@@ -760,7 +768,8 @@ public final class CPAWriter {
     /// 删除 keys:同时清理 `claude-api-key:` 平铺段和 `openai-compatibility:` 聚合段。
     /// 平铺段命中 → 删整条目;聚合段命中 → 删单个 api-key 子项,删空则整条目移除。
     func remove(apiKeys: [String]) throws -> String {
-        guard FileManager.default.fileExists(atPath: configPath) else {
+        // API 模式无本地文件:是否「存在」由服务端决定,PUT 会在缺失时报错
+        guard configAvailable() else {
             return "CPA config 不存在,跳过"
         }
         return try withCPASync {
@@ -1068,9 +1077,16 @@ public final class CPAWriter {
         }
         let url = URL(fileURLWithPath: configPath)
         let bak = url.appendingPathExtension("keydrop-bak")
-        try? FileManager.default.removeItem(at: bak)
-        if FileManager.default.fileExists(atPath: url.path) {
-            try? FileManager.default.copyItem(at: url, to: bak)
+        let fm = FileManager.default
+        let hadOriginal = fm.fileExists(atPath: url.path)
+        if hadOriginal {
+            try? fm.removeItem(at: bak)
+            do {
+                try fm.copyItem(at: url, to: bak)
+                try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: bak.path)
+            } catch {
+                throw WriterError.file("CPA 配置备份失败,拒绝覆盖: \(error.localizedDescription)")
+            }
         }
         guard let data = content.data(using: .utf8) else {
             throw WriterError.file("CPA 配置无法编码为 UTF-8")
@@ -1085,8 +1101,11 @@ public final class CPAWriter {
         } catch {
             let bakPath = url.appendingPathExtension("keydrop-bak").path
             var rollbackFailed = false
-            if let old = try? Data(contentsOf: URL(fileURLWithPath: bakPath)) {
+            if hadOriginal, let old = try? Data(contentsOf: URL(fileURLWithPath: bakPath)) {
                 do { try old.write(to: url) }
+                catch { rollbackFailed = true }
+            } else if !hadOriginal {
+                do { try fm.removeItem(at: url) }
                 catch { rollbackFailed = true }
             }
             let suffix = rollbackFailed

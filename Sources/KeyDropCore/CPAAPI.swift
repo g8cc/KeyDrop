@@ -33,10 +33,32 @@ public enum CPAAPI {
         !(Prefs.shared.cpaManagementKey ?? "").isEmpty
     }
 
+    /// 专用会话:ephemeral(不落盘缓存 cookie/凭据)+ 空代理字典 ——
+    /// 管理 API 打的是本机回环,走系统代理设置既没必要也可能被代理拦掉。
+    /// 显式超时兜底:request 里还有一层信号量等待,双保险。
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 20
+        c.timeoutIntervalForResource = 30
+        c.connectionProxyDictionary = [:]
+        return URLSession(configuration: c)
+    }()
+
     static var baseURL: URL {
         let fallback = "http://127.0.0.1:8317"
         let raw = Prefs.shared.cpaAPIBase ?? ""
-        return URL(string: raw.isEmpty ? fallback : raw) ?? URL(string: fallback)!
+        let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: candidate.isEmpty ? fallback : candidate),
+              let scheme = components.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              components.host?.isEmpty == false,
+              components.user == nil,
+              components.password == nil,
+              components.fragment == nil,
+              let url = components.url else {
+            return URL(string: fallback)!
+        }
+        return url
     }
 
     /// 统一同步请求入口;返回 (状态码, 响应体)。
@@ -47,11 +69,19 @@ public enum CPAAPI {
         guard let key = Prefs.shared.cpaManagementKey, !key.isEmpty else {
             throw CPAAPIError.noKey
         }
-        var comp = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        guard var comp = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false),
+              let scheme = comp.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              comp.host?.isEmpty == false else {
+            throw CPAAPIError.http(0, "管理 API 地址无效")
+        }
         if !query.isEmpty {
             comp.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
         }
-        var req = URLRequest(url: comp.url!)
+        guard let requestURL = comp.url else {
+            throw CPAAPIError.http(0, "管理 API 地址无效")
+        }
+        var req = URLRequest(url: requestURL)
         req.httpMethod = method
         req.timeoutInterval = 20
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
@@ -63,13 +93,27 @@ public enum CPAAPI {
         var code = 0
         var taskError: Error?
         let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: req) { d, r, e in
-            defer { sem.signal() }
-            if let e { taskError = e; return }
-            code = (r as? HTTPURLResponse)?.statusCode ?? 0
-            payload = d ?? Data()
-        }.resume()
-        sem.wait()
+        let lock = NSLock()
+        let task = session.dataTask(with: req) { d, r, e in
+            lock.lock()
+            if let e { taskError = e } else {
+                code = (r as? HTTPURLResponse)?.statusCode ?? 0
+                payload = d ?? Data()
+            }
+            lock.unlock()
+            sem.signal()
+        }
+        task.resume()
+        // 必须带超时等待:URLRequest.timeoutInterval 只覆盖「已建立连接后的传输」,
+        // CPA 若 TCP 可连但永不回包(卡死/半死),裸 sem.wait() 会让整个导入/扫描
+        // 永久挂住 —— 菜单栏应用表现为点了没反应、只能强杀。
+        if sem.wait(timeout: .now() + 30) == .timedOut {
+            task.cancel()
+            // cancel 后回调仍会到达一次,同步等它收尾,关闭「回调悬空晚写」窗口
+            _ = sem.wait(timeout: .now() + 5)
+            throw CPAAPIError.http(0, "管理 API 无响应(30s 超时),请检查 CPA 是否卡住")
+        }
+        lock.lock(); defer { lock.unlock() }
         if let taskError { throw taskError }
         return (code, payload)
     }

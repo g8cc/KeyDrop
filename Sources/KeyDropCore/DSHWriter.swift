@@ -83,15 +83,14 @@ public enum DSHWriter {
         try upsertSettings(&settings, route: route, env: env, url: url, models: models)
         try upsertCredential(&creds, env: env, value: key)
 
-        try FileManager.default.createDirectory(
-            atPath: URL(fileURLWithPath: settingsPath).deletingLastPathComponent().path,
-            withIntermediateDirectories: true
-        )
+        let fm = FileManager.default
+        try fm.createDirectory(at: URL(fileURLWithPath: settingsPath).deletingLastPathComponent(), withIntermediateDirectories: true)
+        try fm.createDirectory(at: URL(fileURLWithPath: credentialsPath).deletingLastPathComponent(), withIntermediateDirectories: true)
         // 写入顺序:creds(被引用方)先写,settings(引用方)后写。
         // 反过来时 settings 写成功而 creds 失败会留下引用不存在 env 的半成品,DSH 启动报错;
         // creds 先写失败则 settings 未动,多一个未被引用的 env 无害。
         try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
         try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
         return route
     }

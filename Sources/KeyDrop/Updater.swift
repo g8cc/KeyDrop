@@ -49,6 +49,7 @@ final class Updater {
     /// 已下载就绪的更新包(.ready 态):用户确认重启后才真正替换安装
     private var pendingArchive: (url: URL, version: String)?
     private var progressTimer: Timer?
+    private var downloadGeneration = UUID()
     private let lastCheckKey = "updateLastCheckAt"
     private let promptedVersionKey = "updatePromptedVersion"
 
@@ -111,6 +112,10 @@ final class Updater {
                     return
                 }
                 let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+                guard Version.isValidReleaseVersion(version) else {
+                    self.setState(.failed("检查更新失败: 版本号格式无效"))
+                    return
+                }
                 let local = Self.currentVersion()
                 if Version.compare(version, local) != .orderedDescending {
                     self.setState(.upToDate)
@@ -119,7 +124,8 @@ final class Updater {
                 guard let assets = info?["assets"] as? [[String: Any]],
                       let asset = assets.first(where: { ($0["name"] as? String)?.hasPrefix("KeyDrop-") == true && ($0["name"] as? String)?.hasSuffix(".zip") == true }),
                       let urlStr = asset["browser_download_url"] as? String,
-                      let url = URL(string: urlStr) else {
+                      let url = URL(string: urlStr),
+                      Self.isTrustedDownloadURL(url) else {
                     self.setState(.failed("检查更新失败: 未找到安装包"))
                     return
                 }
@@ -148,36 +154,52 @@ final class Updater {
     /// (产品决策:自动下载可以,静默重启不行 —— 重启会打断用户正在用的会话)
     func startDownload() {
         guard case .available(let version, let url, _) = state else { return }
+        guard Self.isTrustedDownloadURL(url) else {
+            setState(.failed("下载失败: 更新地址不受信任"))
+            return
+        }
+        let generation = UUID()
+        downloadGeneration = generation
         state = .downloading(version: version, progress: 0)
         var req = URLRequest(url: url)
         req.timeoutInterval = 300
         req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
         let task = Self.urlSession(proxy: Prefs.shared.proxy).downloadTask(with: req) { [weak self] fileURL, resp, err in
-            guard let self else { return }
-            self.downloadTask = nil
-            if let err {
-                self.setState(.failed("下载失败: \(err.localizedDescription)"))
-                return
+            // URLSession 回调在后台线程:downloadTask/progressTimer 都是主线程对象,
+            // 在后台写它们与 Timer 的读取构成数据竞争(且 Timer.invalidate 非线程安全)。
+            // 统一 hop 回 main 再处理。
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard self.downloadGeneration == generation else {
+                    if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+                    return
+                }
+                self.downloadTask = nil
+                if let err {
+                    self.setState(.failed("下载失败: \(err.localizedDescription)"))
+                    return
+                }
+                guard let fileURL, let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                    self.setState(.failed("下载失败: HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))
+                    return
+                }
+                // 大小防护:异常/恶意响应不应写满磁盘。两道拦截:
+                // ① 响应头声明的大小;② 落盘后实测(downloadTask 无法边下边限流,这里兜底)
+                let maxBytes = 150_000_000
+                if http.expectedContentLength > maxBytes {
+                    self.setState(.failed("更新包过大(\(http.expectedContentLength / 1_000_000)MB),已取消"))
+                    return
+                }
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                   let size = attrs[.size] as? Int, size > maxBytes {
+                    self.setState(.failed("更新包过大(\(size / 1_000_000)MB),已取消"))
+                    return
+                }
+                self.progressTimer?.invalidate()
+                self.progressTimer = nil
+                self.pendingArchive = (url: fileURL, version: version)
+                self.setState(.ready(version: version))
             }
-            guard let fileURL, let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                self.setState(.failed("下载失败: HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))
-                return
-            }
-            // 大小防护:异常/恶意响应不应写满磁盘。两道拦截:
-            // ① 响应头声明的大小;② 落盘后实测(downloadTask 无法边下边限流,这里兜底)
-            let maxBytes = 150_000_000
-            if http.expectedContentLength > maxBytes {
-                self.setState(.failed("更新包过大(\(http.expectedContentLength / 1_000_000)MB),已取消"))
-                return
-            }
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-               let size = attrs[.size] as? Int, size > maxBytes {
-                self.setState(.failed("更新包过大(\(size / 1_000_000)MB),已取消"))
-                return
-            }
-            self.progressTimer?.invalidate()
-            self.pendingArchive = (url: fileURL, version: version)
-            self.setState(.ready(version: version))
         }
         downloadTask = task
         task.resume()
@@ -197,19 +219,33 @@ final class Updater {
     func applyUpdate() {
         guard case .ready = state, let a = pendingArchive else { return }
         progressTimer?.invalidate()
-        install(archive: a.url, version: a.version)
+        progressTimer = nil
+        // install 会做 sha256(最大 150MB)、ditto 解压、codesign 校验 —— 全部同步阻塞。
+        // 直接在主线程跑会让菜单栏应用无响应数十秒(点「重启完成更新」后界面卡死,
+        // 用户以为崩了会强杀进程,正好卡在「已移走旧包」的中间态)。
+        // 放后台执行,状态更新由 setState 自己 hop 回 main。
+        let digest = pendingDigest
+        setState(.installing)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.install(archive: a.url, version: a.version, expectedDigest: digest)
+        }
     }
 
     func cancelDownload() {
+        downloadGeneration = UUID()
         progressTimer?.invalidate()
         downloadTask?.cancel()
         downloadTask = nil
+        if let archive = pendingArchive {
+            try? FileManager.default.removeItem(at: archive.url)
+        }
         pendingArchive = nil
+        pendingDigest = nil
         // 取消后必须把状态清掉,否则 UI 永远停在「下载中」
         setState(.idle)
     }
 
-    private func install(archive: URL, version: String) {
+    private func install(archive: URL, version: String, expectedDigest: String?) {
         let fm = FileManager.default
         let tmp = NSTemporaryDirectory() + "KeyDropUpdate-\(UUID().uuidString.prefix(8))"
         do {
@@ -218,17 +254,17 @@ final class Updater {
             let zipPath = tmp + "/KeyDrop-\(Self.sanitizePathComponent(version)).zip"
             try fm.copyItem(atPath: archive.path, toPath: zipPath)
 
+            // 在任何解压落盘前校验归档条目。解压后再检查只能发现越界,
+            // 无法撤销恶意条目已经覆盖的文件,也无法阻止 zip bomb 先撑满磁盘。
+            try Self.verifyArchiveBeforeExtraction(at: zipPath)
+
             // ① 若 GitHub 资产带 sha256,先校验下载包完整性(能挡住被替包的 zip)
-            if let expected = pendingDigest {
+            if let expected = expectedDigest {
                 guard let actual = Self.sha256Hex(zipPath), actual.caseInsensitiveCompare(expected) == .orderedSame else {
-                    pendingDigest = nil
                     throw UpdateError.downloadFailed("更新包 sha256 校验失败,已拒绝安装")
                 }
             }
-            pendingDigest = nil
 
-            // 本函数运行在 URLSession 回调线程,state 更新必须走 main(setState)
-            setState(.installing)
             let extractDir = tmp + "/extract"
             try fm.createDirectory(atPath: extractDir, withIntermediateDirectories: true)
             let ditto = Process()
@@ -246,6 +282,11 @@ final class Updater {
                 let tail = String(data: dittoOut, encoding: .utf8)?.suffix(200) ?? ""
                 throw UpdateError.extractFailed("ditto exit \(ditto.terminationStatus) \(tail)")
             }
+
+            // Zip Slip 防护:ditto -x 对含 "../" 或绝对路径的条目并非总是拒绝,
+            // 恶意/损坏的包可以把文件写到 extractDir 之外(甚至覆盖 ~/.ssh 等)。
+            // 解压后校验:顶层必须只有一个 KeyDrop.app,且所有条目都解析在 extractDir 内。
+            try Self.verifyExtractionContained(at: extractDir)
 
             let newBundle = extractDir + "/KeyDrop.app"
             guard fm.fileExists(atPath: newBundle) else {
@@ -301,6 +342,105 @@ final class Updater {
     }
 
     // MARK: - 更新包校验
+
+    /// 预检 zip 条目路径与声明的解压总量,避免 Zip Slip/zip bomb 在解压阶段生效。
+    private static func verifyArchiveBeforeExtraction(at path: String) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        proc.arguments = ["-l", path]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+        } catch {
+            throw UpdateError.extractFailed("无法预检更新包: \(error.localizedDescription)")
+        }
+
+        let output: Data
+        do {
+            output = try Self.readProcessOutputBounded(pipe, maxBytes: 4_000_000, process: proc)
+        } catch {
+            proc.terminate()
+            proc.waitUntilExit()
+            throw error
+        }
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            throw UpdateError.extractFailed("更新包目录读取失败")
+        }
+        guard let text = String(data: output, encoding: .utf8) else {
+            throw UpdateError.extractFailed("更新包目录不是有效 UTF-8")
+        }
+
+        var count = 0
+        var totalSize = 0
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+            guard parts.count == 4,
+                  parts[1].count == 10,
+                  parts[2].contains(":"),
+                  let size = Int(parts[0]), size >= 0 else { continue }
+            let name = String(parts[3])
+            let normalized = name.replacingOccurrences(of: "\\", with: "/")
+            let components = normalized.split(separator: "/", omittingEmptySubsequences: true)
+            guard !normalized.hasPrefix("/"), !normalized.contains("\0"),
+                  !components.contains(".."), let first = components.first else {
+                throw UpdateError.extractFailed("更新包包含越界路径,已拒绝安装")
+            }
+            guard first == "KeyDrop.app" || first == "__MACOSX" || (components.count == 1 && first == ".DS_Store") else {
+                throw UpdateError.extractFailed("更新包顶层含非预期内容,已拒绝安装: \(name)")
+            }
+            count += 1
+            let (sum, overflow) = totalSize.addingReportingOverflow(size)
+            guard !overflow, sum <= 150_000_000 else {
+                throw UpdateError.extractFailed("更新包解压后超过 150MB,已拒绝安装")
+            }
+            totalSize = sum
+            guard count <= 10_000 else {
+                throw UpdateError.extractFailed("更新包文件数过多,已拒绝安装")
+            }
+        }
+    }
+
+    private static func readProcessOutputBounded(_ pipe: Pipe, maxBytes: Int, process: Process) throws -> Data {
+        var output = Data()
+        let handle = pipe.fileHandleForReading
+        while true {
+            let chunk = handle.readData(ofLength: 4096)
+            if chunk.isEmpty { break }
+            if output.count > maxBytes - chunk.count {
+                process.terminate()
+                throw UpdateError.extractFailed("更新包目录过大,已拒绝安装")
+            }
+            output.append(chunk)
+        }
+        return output
+    }
+
+    /// Zip Slip 防护:确认解压产物全部落在 extractDir 之内,且顶层只有 KeyDrop.app。
+    /// 不依赖 ditto 的路径清洗行为 —— 它面对 "../" / 绝对路径条目时并不保证拒绝,
+    /// 一旦写出目录外就是任意文件覆盖(可覆盖 ~/.ssh/authorized_keys 等)。
+    private static func verifyExtractionContained(at extractDir: String) throws {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: extractDir).standardizedFileURL
+        let rootPath = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard let en = fm.enumerator(at: root, includingPropertiesForKeys: [.isSymbolicLinkKey]) else {
+            throw UpdateError.extractFailed("无法枚举解压产物")
+        }
+        for case let url as URL in en {
+            // 解析符号链接后再判断:包内符号链接可以指向目录外
+            let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+            guard resolved.path.hasPrefix(rootPath) || resolved.path == root.path else {
+                throw UpdateError.extractFailed("更新包包含越界路径,已拒绝安装: \(url.lastPathComponent)")
+            }
+        }
+        // 顶层条目白名单:只允许 KeyDrop.app
+        let top = (try? fm.contentsOfDirectory(atPath: extractDir)) ?? []
+        guard top.allSatisfy({ $0 == "KeyDrop.app" || $0 == ".DS_Store" || $0 == "__MACOSX" }) else {
+            throw UpdateError.extractFailed("更新包顶层含非预期内容(\(top.joined(separator: ", "))),已拒绝安装")
+        }
+    }
 
     /// 启动后延迟清理上次更新留下的 .keydrop-old 备份与 /tmp 更新目录。
     /// 旧实现由替换脚本在 6 秒后无条件删备份:若新版本一启动就崩,唯一可用的旧版也没了,
@@ -365,17 +505,44 @@ final class Updater {
         return allowed.isEmpty ? "unknown" : String(allowed.prefix(64))
     }
 
+    private static func isTrustedDownloadURL(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "https", let host = url.host?.lowercased() else { return false }
+        return host == "github.com" || host == "objects.githubusercontent.com" || host.hasSuffix(".githubusercontent.com")
+    }
+
     private static func shellEscape(_ s: String) -> String {
         "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     /// 更新请求走用户配置的本机代理(GitHub API/资产下载在部分网络直连不可达);
-    /// 代理为空 → 系统默认会话
+    /// 代理为空/不可识别 → 系统默认会话。
+    /// session 按代理地址缓存:旧实现每次检查/下载都新建 URLSession 且从不 invalidate,
+    /// 内部线程与连接池常驻(菜单栏 app 长驻,反复「检查更新」持续泄漏)。
+    private static let sessionLock = NSLock()
+    private static var sessions: [String: URLSession] = [:]
+
     private static func urlSession(proxy: String?) -> URLSession {
-        guard let p = proxy?.trimmingCharacters(in: .whitespaces), !p.isEmpty,
-              URL(string: p)?.host != nil, URL(string: p)?.scheme?.lowercased().hasPrefix("http") == true
+        let p = proxy?.trimmingCharacters(in: .whitespaces) ?? ""
+        // 只接受 http(s) 代理:CFNetwork 的 connectionProxyDictionary 不支持 socks,
+        // 传 socks 地址进去等于把请求发到 SOCKS 端口上,必然失败
+        guard !p.isEmpty, let u = URL(string: p), u.host != nil,
+              ["http", "https"].contains(u.scheme?.lowercased() ?? ""),
+              (u.port ?? 80) > 0, (u.port ?? 80) <= 65535
         else { return .shared }
-        return URLSession(configuration: proxyConfig(proxy))
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        if let cached = sessions[p] { return cached }
+        let s = URLSession(configuration: proxyConfig(p))
+        // 上限保护:用户反复改代理会产生多个地址
+        if sessions.count >= 4 {
+            let evicted = sessions
+            sessions.removeAll()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) {
+                evicted.values.forEach { $0.finishTasksAndInvalidate() }
+            }
+        }
+        sessions[p] = s
+        return s
     }
 
     private static func proxyConfig(_ proxy: String?) -> URLSessionConfiguration {
@@ -383,7 +550,7 @@ final class Updater {
         cfg.timeoutIntervalForRequest = 30
         if let p = proxy?.trimmingCharacters(in: .whitespaces), !p.isEmpty,
            let u = URL(string: p), let host = u.host,
-           u.scheme?.lowercased().hasPrefix("http") == true {
+           ["http", "https"].contains(u.scheme?.lowercased() ?? "") {
             let port = u.port ?? (u.scheme?.lowercased() == "https" ? 443 : 80)
             cfg.connectionProxyDictionary = [
                 kCFNetworkProxiesHTTPProxy as String: host,

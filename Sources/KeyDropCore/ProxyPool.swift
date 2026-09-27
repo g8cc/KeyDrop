@@ -85,7 +85,11 @@ public enum ProxyPool {
             var line = raw.trimmingCharacters(in: .whitespaces)
             if line.isEmpty || line.hasPrefix("#") { continue }
             if !line.contains("://") { line = "http://" + line }
-            guard let comps = URLComponents(string: line), comps.host != nil, comps.host != "" else { continue }
+            guard let comps = URLComponents(string: line),
+                  let scheme = comps.scheme?.lowercased(),
+                  ["http", "https", "socks4", "socks5", "socks5h"].contains(scheme),
+                  let host = comps.host, !host.isEmpty,
+                  let port = comps.port, port > 0, port <= 65535 else { continue }
             guard seen.insert(line).inserted else { continue }
             out.append(line)
         }
@@ -165,7 +169,11 @@ public enum ProxyPool {
     }
 
     /// auth-dir 的默认位置:CPA config.yaml 同级的 auth-dir 目录(docker 挂载源)。
+    /// API 模式返回 nil:凭据经 /auth-files 管理端点读写,本地目录无意义 ——
+    /// 而 locateConfig()+fileExists 会 stat Documents 下的路径,是一次 TCC「文稿」弹窗。
+    /// 自守卫(而非依赖调用方记得判断),避免将来新增调用点又踩同一个坑。
     public static func defaultAuthDir() -> String? {
+        if CPAAPI.apiMode { return nil }
         guard let cfg = CPAWriter.locateConfig() else { return nil }
         let dir = ((cfg as NSString).deletingLastPathComponent as NSString).appendingPathComponent("auth-dir")
         var isDir: ObjCBool = false
@@ -276,18 +284,33 @@ public enum ProxyPool {
         for b in bindings {
             guard b.action == .assigned || b.action == .replaced || b.action == .cleared,
                   let path = paths[b.fileName] else { continue }
-            guard let data = fm.contents(atPath: path),
-                  var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                AppLog.error("代理池: 写入失败,无法解析 \(b.fileName)")
-                continue
+            try FileLock.withLock(FileLock.lockPath(for: path)) {
+                guard let data = fm.contents(atPath: path),
+                      var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    AppLog.error("代理池: 写入失败,无法解析 \(b.fileName)")
+                    return
+                }
+                obj.removeValue(forKey: "proxy_url")
+                obj.removeValue(forKey: "proxy-url")
+                if let p = b.newProxy {
+                    obj["proxy_url"] = CPAWriter.rewriteProxyForDocker(p, configContent: configContent) ?? p
+                }
+                let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
+                let tmp = URL(fileURLWithPath: path + ".keydrop-tmp-\(UUID().uuidString)")
+                do {
+                    try out.write(to: tmp)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+                    if FileManager.default.fileExists(atPath: path) {
+                        _ = try FileManager.default.replaceItemAt(URL(fileURLWithPath: path), withItemAt: tmp)
+                    } else {
+                        try FileManager.default.moveItem(at: tmp, to: URL(fileURLWithPath: path))
+                    }
+                    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+                } catch {
+                    try? FileManager.default.removeItem(at: tmp)
+                    throw error
+                }
             }
-            obj.removeValue(forKey: "proxy_url")
-            obj.removeValue(forKey: "proxy-url")
-            if let p = b.newProxy {
-                obj["proxy_url"] = CPAWriter.rewriteProxyForDocker(p, configContent: configContent) ?? p
-            }
-            let out = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
-            try out.write(to: URL(fileURLWithPath: path))
             written += 1
         }
         return written
@@ -309,11 +332,14 @@ public enum ProxyPool {
         let queue = DispatchQueue(label: "keydrop.proxypool.check", attributes: .concurrent)
 
         for url in urls {
+            // 必须先取信号量再入队:旧实现把 gate.wait() 放在闭包内部,闭包一入队就
+            // 各自占一个线程并在信号量上阻塞 —— 上千条代理时会创建上千个阻塞线程
+            // (线程栈各 512KB,几百 MB 内存 + 调度开销),而且 group.wait() 期间
+            // 这些线程全都活着。先等信号量则最多 concurrency 个任务真正在跑。
+            gate.wait()
             group.enter()
             queue.async {
-                defer { group.leave() }
-                gate.wait()
-                defer { gate.signal() }
+                defer { gate.signal(); group.leave() }
                 let result = probeOne(url: url, target: target, timeout: timeout)
                 lock.lock()
                 results[url] = result
@@ -339,7 +365,11 @@ public enum ProxyPool {
         ]
         let pipe = Pipe()
         p.standardOutput = pipe
-        p.standardError = Pipe()
+        // stderr 必须导到 nullDevice 而不是新建 Pipe:不读的 Pipe 在 curl 输出
+        // 超过 64KB 管道缓冲时会让子进程永久阻塞在 write,waitUntilExit() 卡死;
+        // 并发 64 路探测时每个未读 Pipe 还各占两个 fd。
+        // (-sS 已抑制进度条,stderr 只剩错误文本,不需要读取)
+        p.standardError = FileHandle.nullDevice
         do {
             try p.run()
         } catch {

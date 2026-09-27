@@ -6,9 +6,11 @@ final class ImageMockServer {
     private let listener: TCPServer
     var port: Int { listener.port }
     let supportsImage: Bool
+    let requiresV1: Bool
 
-    init(supportsImage: Bool) throws {
+    init(supportsImage: Bool, requiresV1: Bool = false) throws {
         self.supportsImage = supportsImage
+        self.requiresV1 = requiresV1
         listener = try TCPServer()
         Thread.detachNewThread { [weak self] in
             self?.serveLoop()
@@ -32,14 +34,16 @@ final class ImageMockServer {
 
         let status: String
         var body = ""
-        if target == "/images/generations" {
+        let imagePath = requiresV1 ? "/v1/images/generations" : "/images/generations"
+        let modelsPath = requiresV1 ? "/v1/models" : "/models"
+        if target == imagePath {
             if supportsImage {
                 status = "400 Bad Request"
                 body = "{\"error\":{\"message\":\"prompt is required\"}}"
             } else {
                 status = "404 Not Found"
             }
-        } else if target == "/models" {
+        } else if target == modelsPath {
             status = "200 OK"
             body = "{\"data\":[{\"id\":\"flux-schnell\"},{\"id\":\"imagen-3\"}]}"
         } else {
@@ -70,6 +74,28 @@ enum ImageAPITests {
             }
             let p2 = ImageAPI.probe(baseURL: "http://127.0.0.1:\(noServer.port)", key: "sk-test-123", timeout: 5)
             t.expect(!p2.supported, "无生图端点(404): \(p2.detail)")
+
+            guard let v1Server = try? ImageMockServer(supportsImage: true, requiresV1: true) else {
+                t.expect(false, "v1 mock 启动失败")
+                return
+            }
+            let pV1 = ImageAPI.probe(baseURL: "http://127.0.0.1:\(v1Server.port)", key: "sk-test-123", timeout: 5)
+            t.expect(pV1.supported && pV1.models.contains("flux-schnell"), "无 /v1 输入自动回退到 /v1 生图端点")
+
+            do {
+                _ = try ImageAPI.generate(baseURL: base, key: "sk-test-123",
+                                           prompt: String(repeating: "x", count: 64_001), model: "m")
+                t.expect(false, "超长 prompt 应拒绝")
+            } catch {
+                t.contains(error.localizedDescription, "64KB", "超长 prompt 错误可读")
+            }
+            do {
+                _ = try ImageAPI.generate(baseURL: base, key: "sk-test-123",
+                                           prompt: "ok", model: "m", size: "1x1x1")
+                t.expect(false, "非法 size 应拒绝")
+            } catch {
+                t.contains(error.localizedDescription, "size", "非法 size 错误可读")
+            }
 
             // 不可达 → 不支持
             let p3 = ImageAPI.probe(baseURL: "http://10.255.255.1:9", key: "sk-test-123", timeout: 3, proxy: nil)

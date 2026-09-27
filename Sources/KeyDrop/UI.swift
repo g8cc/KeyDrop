@@ -2001,7 +2001,7 @@ struct PanelView: View {
                                             },
                                             onReimport: { state.doReimport(e.id) },
                                             onEdit: { state.showEdit(e) },
-                                                                                        highlighted: false
+                                            highlighted: state.highlightID == e.id && state.highlightPulse > 0
                                         )
                                     }
                                 }
@@ -2087,7 +2087,7 @@ struct PanelView: View {
                                             },
                                             onReimport: { state.doReimport(e.id) },
                                             onEdit: { state.showEdit(e) },
-                                                                                        highlighted: false
+                                            highlighted: state.highlightID == e.id && state.highlightPulse > 0
                                         )
                                     }
                                 }
@@ -2144,24 +2144,37 @@ struct PanelView: View {
                 state.doAdd()
                 return
             }
-            var contents: [String] = []
-            var skipped = 0
-            for u in pendingURLs {
-                if let s = try? String(contentsOf: u, encoding: .utf8), !s.isEmpty {
-                    contents.append(s)
-                } else {
-                    skipped += 1  // 二进制 zip 等无法当文本拼,跳过并提示
+            // 读取放后台:拖入的可能是几十 MB 的文件,在主线程同步读会卡住 UI
+            // (面板无响应,进度条也不动)。读完后回主线程赋值并触发导入。
+            let urls = pendingURLs
+            Task { @MainActor in
+                let (contents, skipped) = await Task.detached(priority: .userInitiated) { () -> ([String], Int) in
+                    var contents: [String] = []
+                    var skipped = 0
+                    let maxBytes = 8_000_000
+                    for u in urls {
+                        // 逐文件设上限:二进制 zip 等既读不成文本,大文件还会撑爆内存
+                        let size = (try? FileManager.default.attributesOfItem(atPath: u.path))?[.size] as? Int
+                        guard size.map({ $0 <= maxBytes }) ?? true,
+                              let s = try? String(contentsOf: u, encoding: .utf8), !s.isEmpty else {
+                            skipped += 1  // 二进制 zip / 超限文件:无法当文本拼,跳过并提示
+                            continue
+                        }
+                        contents.append(s)
+                    }
+                    return (contents, skipped)
+                }.value
+                guard !state.isBusy else { return }
+                if skipped > 0 {
+                    state.setStatus("部分拖入文件无法按文本读取(\(skipped) 个,二进制或超过 8MB),已导入其余文件", ok: false)
                 }
+                guard !contents.isEmpty else {
+                    state.setStatus(skipped > 0 ? "拖入的 \(skipped) 个文件均无法按文本读取" : "拖入的文件均无法读取", ok: false)
+                    return
+                }
+                state.input = contents.joined(separator: "\n")
+                state.doAdd()
             }
-            if skipped > 0 {
-                state.setStatus("部分拖入文件无法按文本读取(\(skipped) 个),已导入其余文件", ok: false)
-            }
-            guard !contents.isEmpty else {
-                state.setStatus(skipped > 0 ? "拖入的 \(skipped) 个文件均无法按文本读取" : "拖入的文件均无法读取", ok: false)
-                return
-            }
-            state.input = contents.joined(separator: "\n")
-            state.doAdd()
         }
         return handled
     }

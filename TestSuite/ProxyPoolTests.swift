@@ -21,6 +21,9 @@ enum ProxyPoolTests {
             t.expect(list.contains("http://1.2.3.4:8080"), "裸地址补 http://")
             t.expect(list.contains("socks5://user:pass@9.9.9.9:1080"), "socks5 带认证保留")
             t.expect(list.contains("socks5h://u:p@10.0.0.1:7891"), "socks5h 保留")
+
+            let invalid = ProxyPool.loadProxyList("ftp://proxy.example.com:21\nhttp://proxy.example.com:0\nhttp://proxy.example.com:70000\nhttp://proxy.example.com:8080")
+            t.equal(invalid, ["http://proxy.example.com:8080"], "拒绝不支持协议与越界端口")
         }
 
         h.runSuite("ProxyPool.账号扫描") { t in

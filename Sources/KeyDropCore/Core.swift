@@ -57,6 +57,14 @@ public final class Core {
         let appType = appType ?? Core.defaultAppType
         AppLog.info("add 开始(force=\(force))")
         defer { AppLog.info("add 结束") }
+        // 输入上限:raw 会被原样存进历史(JSON 落盘),而解析是逐行/逐 token 的
+        // O(n) 甚至 O(n²) 扫描。粘贴几十 MB(误粘日志/二进制转文本)会让
+        // 解析 + 历史序列化卡住整个应用,并把 ~/.keydrop 撑到不可用。
+        // 正常粘贴内容(含 zip 路径、订阅 URL)都是 KB 级,1MB 已极宽松。
+        let maxRawBytes = 1_000_000
+        if raw.utf8.count > maxRawBytes {
+            throw ParseError.io("粘贴内容过大(\(raw.utf8.count / 1000)KB > \(maxRawBytes / 1000)KB),已拒绝处理。请只粘贴 key 相关片段,或改用文件路径/zip 导入。")
+        }
         let proxyURL: String? = {
             if let proxy, !proxy.isEmpty { return proxy }
             let p = prefs.proxy
@@ -524,14 +532,20 @@ public final class Core {
                     entry.ccRenamedTo = r.renamedTo
                     anyOK = true
                     let appLabel = resolvedAppType == "claude" ? "Claude Code" : resolvedAppType
-                    lines.append("✓ cc-switch: 已添加 provider「\(r.providerName)」到 \(appLabel) 并激活")
+                    if r.activationDeferred {
+                        lines.append("✓ cc-switch: 已添加 provider「\(r.providerName)」到 \(appLabel)，保留当前 provider 未切换")
+                    } else {
+                        lines.append("✓ cc-switch: 已添加 provider「\(r.providerName)」到 \(appLabel) 并激活")
+                    }
                     if resolvedAppType == "codex", probedNeedsProxy {
                         lines.append(proxyHintLine())
                     }
                     if r.renamedFrom != nil {
                         lines.append("  热激活: 原 provider 已暂存,删除本条时自动还原")
                     }
-                    if r.directMode {
+                    if r.activationDeferred {
+                        lines.append("  运行时缓存: cc-switch 已运行，需在 cc-switch 界面手动切换或重启后切换")
+                    } else if r.directMode {
                         lines.append("  直写模式: 已更新配置文件,重开会话生效")
                     } else if r.proxyMode {
                         lines.append("  代理模式: cc-switch 本地代理已热切换,立即可用,无需重启")
@@ -945,12 +959,16 @@ public final class Core {
         let group = DispatchGroup()
         let queue = DispatchQueue.global(qos: .userInitiated)
         for e in targets {
+            // 在进入并发闭包前解包:过滤条件已保证非 nil,但 e.url!/e.key! 是在
+            // 后台线程里求值的强制解包 —— 一旦将来过滤条件放宽就是崩溃点。
+            // 提前 guard 掉,让「不可能」变成安全跳过而不是 crash。
+            guard let entryURL = e.url, let entryKey = e.key, !entryKey.isEmpty else { continue }
             sem.wait()
             group.enter()
             queue.async {
                 defer { sem.signal(); group.leave() }
                 let px = self.proxyForHealth()
-                let test = APITester.test(url: e.url!, key: e.key!, timeout: 10,
+                let test = APITester.test(url: entryURL, key: entryKey, timeout: 10,
                                           proxy: px, preferredModel: e.model,
                                           modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t },
                                           importedModels: e.models)
@@ -1721,9 +1739,17 @@ public final class Core {
         // CPA 条目永远停在首次导入的列表(真实场景:cc 已 4 模型,CPA 仍 1 个)
         var cpaNote = ""
         if entry.targets.contains("cpa") {
-            let cfgPath = entry.cpaConfigPath
-                .flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
-                ?? prefs.resolvedCPAConfig()
+            // API 模式:读写在 CPA 服务端,条目里记的本地路径不参与任何操作 ——
+            // 对它 fileExists 会在路径位于 ~/Documents 时触发 TCC「文稿」弹窗
+            // (更新换签名使授权作废后,每次刷新都弹一次)。此时直接用记录值。
+            let cfgPath: String?
+            if CPAAPI.apiMode {
+                cfgPath = entry.cpaConfigPath ?? prefs.resolvedCPAConfig()
+            } else {
+                cfgPath = entry.cpaConfigPath
+                    .flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+                    ?? prefs.resolvedCPAConfig()
+            }
             if let cfg = cfgPath {
                 do {
                     let cpaMsg = try CPAWriter(configPath: cfg).updateAggregatedModels(baseURL: url, models: filtered)
@@ -1981,7 +2007,13 @@ public final class Core {
         try history.update(entry)
 
         let appLabel = appType == "claude" ? "Claude Code" : appType
-        var msg = "✓ CPA 端点(\(ep.baseURL))已写入 cc-switch → \(appLabel) 并激活"
+        var msg: String
+        if r.activationDeferred {
+            msg = "✓ CPA 端点(\(ep.baseURL))已写入 cc-switch → \(appLabel)，保留当前 provider 未切换"
+            msg += "\n  运行时缓存: cc-switch 已运行，需在 cc-switch 界面手动切换或重启后切换"
+        } else {
+            msg = "✓ CPA 端点(\(ep.baseURL))已写入 cc-switch → \(appLabel) 并激活"
+        }
         if r.directMode { msg += "\n  直写模式: 已更新配置文件,重开会话生效" }
         else if r.proxyMode { msg += "\n  代理模式: 热切换,立即可用" }
         for w in r.warnings { msg += "\n  ⚠ \(w)" }
@@ -2085,6 +2117,9 @@ public final class Core {
                     )
                     lines.append("✓ cc-switch: \(msg)")
                     remaining.removeAll { $0.hasPrefix("ccswitch") }
+                } catch let error as WriterError where error.isCurrentMutationBlocked {
+                    // cc-switch 运行中拒绝删除,不能进入按 ID 兜底,否则会绕过运行态保护。
+                    failures.append("cc-switch: \(error.localizedDescription)")
                 } catch {
                     // 主路径失败时按 ID 兜底,绝不按 host 误删其他 provider
                     do {

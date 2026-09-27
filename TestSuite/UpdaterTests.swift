@@ -29,6 +29,8 @@ enum UpdaterTests {
             t.expect(Version.fromTagPath("/g8cc/KeyDrop/releases") == nil, "无 tag 段返回 nil")
             t.expect(Version.fromTagPath("/releases/tag/") == nil, "空 tag 返回 nil")
             t.expect(Version.fromTagPath("/releases/tag/v") == nil, "裸 v 前缀返回 nil")
+            t.expect(Version.fromTagPath("/releases/tag/v1.2.3/../../tmp") == nil, "路径型 tag 不误判为版本")
+            t.expect(!Version.isValidReleaseVersion("1.2.3/../../tmp"), "拒绝含路径分隔符的版本")
         }
     }
 }

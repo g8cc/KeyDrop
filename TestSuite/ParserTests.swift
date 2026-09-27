@@ -161,6 +161,106 @@ enum ParserTests {
             // 单一 provider 提及仍走官方 fallback(deepseek 场景不受影响)
             let singleHit = try! Parser.parseWithFallback("sk-x1234567890abcdef deepseek 官方")
             t.equal(singleHit.url, "https://api.deepseek.com", "单 provider 保留官方 fallback")
+
+            // ── 正则缓存重构等价性 ──
+            // range(of:options:.regularExpression) 每次调用都会重新编译正则,逐 token 的
+            // 解析路径上是数万次编译。改成共享缓存后语义必须逐字不变,以下用两侧对照断言。
+            let modelCases = [
+                "qwen3.8-flash", "gpt5.2-mini", "o3.5", "k2.5", "glm-5.2",
+                "sub.example.com", "qwen.example.com", "qwen.ai", "1.2.3.4",
+                "deepseek-v4-flash", "claude-3-5-sonnet", "gpt-4o", "随便", "500rmb",
+            ]
+            for c in modelCases {
+                // 重构后的实现必须与「原始字面量表达式」完全一致
+                let legacy = legacyLooksLikeModel(c)
+                t.equal(Parser.looksLikeModel(c), legacy, "looksLikeModel 重构等价: \(c)")
+            }
+            let urlCases = ["qwen3.8-flash", "sub.example.com", "o3.5", "k2.5", "1.2.3.4", "qwen.ai", "https://x.com"]
+            for c in urlCases {
+                t.equal(Parser.looksLikeURL(c), legacyLooksLikeURL(c), "looksLikeURL 重构等价: \(c)")
+            }
+            // looksLikeKey 是 internal,只能经公开入口间接验证:key 提取结果不受缓存重构影响
+            t.equal(Parser.extractAllKeys("sk-abc123def456ghi789jkl").count, 1, "looksLikeKey 经公开入口:普通 key")
+            t.equal(Parser.extractAllKeys("nvapi-aaa111bbb222ccc333ddd111").count, 1, "looksLikeKey 经公开入口:nvapi 前缀")
+            // 家族词开头的长串无 sk- 类前缀 → 走通用分支被家族词排除(防模型名当 key)
+            t.equal(Parser.extractAllKeys("claude-3-5-sonnet-abcdefghijklmnop").count, 0,
+                    "looksLikeKey 经公开入口:家族词长串被排除")
+            // 带显式厂商前缀的优先命中前缀分支,即使串里含家族词也照收(与重构前一致)
+            t.equal(Parser.extractAllKeys("sk-claude-3-5-sonnet-abcdefghijklmnop").count, 1,
+                    "looksLikeKey 经公开入口:显式 sk- 前缀优先于家族词排除")
+
+            // 分隔符指令正则:旧实现 try! 编译,现在走缓存 + 可失败返回 nil
+            do {
+                let sep = try! Parser.parse("""
+                    去除 diamond_suit 即可
+                    https://api-relay-test.example.com/v1
+                    sk-diamond_suitabc-diamond_suit123def456ghi789
+                    """)
+                t.equal(sep.key, "sk-abc-123def456ghi789", "分隔符指令:去分隔符重组 key")
+                t.equal(sep.url, "https://api-relay-test.example.com/v1", "分隔符指令:URL 不受影响")
+            }
         }
+    }
+
+    // MARK: - 重构对照实现(照抄重构前的字面量表达式,仅用于断言等价)
+
+    private static func legacyLooksLikeModel(_ s: String) -> Bool {
+        if s.contains(where: { $0.isWhitespace }) { return false }
+        if s.unicodeScalars.contains(where: { (0x4E00...0x9FFF).contains($0.value) }) { return false }
+        if s.count < 2 || s.count > 80 { return false }
+        guard s.contains(where: { $0.isLetter }) else { return false }
+        if s.contains(where: { $0 == "$" || $0 == "！" || $0 == "？" || $0 == "!" || $0 == "?" }) { return false }
+        let l = s.lowercased()
+        if l.range(of: #"(rmb|usd|cny|yuan|元|块|钱包|余额)"#, options: .regularExpression) != nil { return false }
+        if s.contains("."), s.range(of: #"^[a-z0-9][a-z0-9.-]*$"#, options: [.regularExpression, .caseInsensitive]) != nil,
+           !legacyIsDotted(s.lowercased()),
+           s.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
+        { return false }
+        let families = "claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134]|k2"
+        if l.range(of: families, options: .regularExpression) != nil { return true }
+        if l.range(of: #"\d"#, options: .regularExpression) != nil { return true }
+        if l.range(of: #"v\d"#, options: .regularExpression) != nil { return true }
+        return false
+    }
+
+    private static func legacyLooksLikeURL(_ s: String) -> Bool {
+        let l = String(s.unicodeScalars.filter {
+            !(0x3400...0x9FFF).contains($0.value) && !(0xF900...0xFAFF).contains($0.value)
+        }).lowercased()
+        guard !l.contains(where: { $0.isWhitespace }) else { return false }
+        if l.hasPrefix("https://") || l.hasPrefix("http://") {
+            return URL(string: l)?.host?.isEmpty == false
+        }
+        guard l.range(of: #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#, options: .regularExpression) != nil,
+              !l.contains(".."),
+              !legacyIsDotted(l),
+              l.range(of: #"^(?:gpt|claude|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex|o[134])[-\d]"#, options: .regularExpression) == nil
+        else { return false }
+        return URL(string: "https://" + l)?.host?.isEmpty == false
+    }
+
+    private static func legacyLooksLikeKey(_ s: String) -> Bool {
+        let t = String(s.unicodeScalars.filter {
+            !(0x3400...0x9FFF).contains($0.value) && !(0xF900...0xFAFF).contains($0.value)
+        }).trimmingCharacters(in: .whitespaces)
+        guard t.count >= 16, t.count <= 256 else { return false }
+        guard t.range(of: #"^[\x21-\x7E]+$"#, options: .regularExpression) != nil else { return false }
+        if t.contains(":") { return false }
+        if t.range(of: #"^(sk|ak|key|pk|cr|sp|dk|bk|rk|fk|tk|xk|wk|zk|gk|vk|nk|mk|hk|csk|gsk|sk-or|sk-ant|sk_tr|cfut|nvapi|ms)[-_]"#, options: [.regularExpression, .caseInsensitive]) != nil {
+            return true
+        }
+        if t.count >= 28,
+           t.range(of: #"^[A-Za-z0-9_\-./=]+$"#, options: .regularExpression) != nil,
+           t.lowercased().range(of: #"(claude|gpt|gemini|glm|kimi|qwen|deepseek|grok|opus|sonnet|haiku|mistral|llama|minimax|mimo|longcat|codex)"#, options: .regularExpression) == nil {
+            return true
+        }
+        return false
+    }
+
+    private static func legacyIsDotted(_ s: String) -> Bool {
+        let segs = s.split(separator: ".", omittingEmptySubsequences: false)
+        guard segs.count == 2, let last = segs.last, !last.isEmpty else { return false }
+        guard last.allSatisfy({ $0.isNumber }) else { return false }
+        return segs[0].contains(where: { $0.isLetter })
     }
 }

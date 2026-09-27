@@ -81,6 +81,8 @@ final class TestEnv {
         // override=0:不覆盖测试内已显式 setenv 的值(如 live 门控测试切 FAKE_CC_RUNNING=0);
         // 未设置时默认 1(cc-switch「运行中」),与历史行为一致
         setenv("KEYDROP_FAKE_CC_RUNNING", "1", 0)
+        // 外部 cc-switch 的设置缓存默认关闭,避免测试结果受开发者本机是否运行 cc-switch 影响。
+        setenv("KEYDROP_FAKE_CC_STATE_CACHED", "0", 0)
         setenv("KEYDROP_PROXY", "", 1)
         // 自动代理探测隔离:开发者本机常有真实代理(7890)在监听,探测命中会把
         // 回环 mock 的请求塞进真实代理(mihomo 对回环目标返 502),污染测试结果

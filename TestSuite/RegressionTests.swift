@@ -1678,4 +1678,123 @@ openai-compatibility:
             t.notNil(resident, "[常驻] 常驻行保留")
         }
     }
+
+    /// 敏感文件权限:历史/prefs/codex auth.json 含明文 key 或管理口令。
+    /// replaceItemAt 保留【原文件】权限,原文件若是 0644(旧版本/手工创建/默认 umask),
+    /// 新文件也还是 0644 —— 同机其他用户可读全部凭据。落盘后必须再收紧一次。
+    static func runPermissionRegressions(_ h: Harness) {
+        h.runSuite("Regression.凭据文件权限收紧") { t in
+            func perms(_ p: String) -> Int? {
+                ((try? FileManager.default.attributesOfItem(atPath: p))?[.posixPermissions] as? NSNumber)?.intValue
+            }
+            let env = try! TestEnv("reg-perms")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+
+            // ① history.json:先造成 0644,再经 save 写入 → 必须回到 0600
+            let histPath = env.dir + "/home/history.json"
+            try! FileManager.default.createDirectory(atPath: env.dir + "/home", withIntermediateDirectories: true)
+            try! Data("{\"items\":[]}".utf8).write(to: URL(fileURLWithPath: histPath))
+            try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: histPath)
+            let hist = HistoryStore()
+            try! hist.append(HistoryTests.entry("perm-1111-2222-3333-444444444444", ts: 1))
+            t.equal(perms(histPath), 0o600, "[history] 落盘后权限收紧为 600")
+
+            // ② prefs.json:含 CPA 管理密钥
+            let prefsPath = env.dir + "/home/prefs.json"
+            try! Data("{}".utf8).write(to: URL(fileURLWithPath: prefsPath))
+            try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: prefsPath)
+            Prefs.shared.proxy = "http://127.0.0.1:7890"
+            try! Prefs.shared.save()
+            t.equal(perms(prefsPath), 0o600, "[prefs] 落盘后权限收紧为 600")
+            Prefs.shared.proxy = ""
+
+            // ③ codex auth.json:纯凭据文件
+            let authPath = env.dir + "/codex-auth.json"
+            try! Data("{}".utf8).write(to: URL(fileURLWithPath: authPath))
+            try! FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: authPath)
+            let w = CCSwitchWriter()
+            var p = ParsedKey()
+            p.url = "https://perm.example.com/v1"
+            p.key = "sk-permkey1111111111"
+            _ = try! w.add(p, appType: "codex", models: ["gpt-5.6"], proxy: nil)
+            t.equal(perms(authPath), 0o600, "[codex auth] 写入后权限收紧为 600")
+        }
+
+        // API 模式无本地 config.yaml:addAggregated/remove 若用 fileExists 判定,
+        // 每次导入都会以「config 不存在」失败。必须走 configAvailable()。
+        h.runSuite("Regression.API模式 CPA 写入不依赖本地文件") { t in
+            guard let server = try? MockHTTPServer(mode: .cpaMgmt) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let origKey = Prefs.shared.cpaManagementKey
+            let origBase = Prefs.shared.cpaAPIBase
+            let origProxy = Prefs.shared.proxy
+            Prefs.shared.proxy = ""
+            Prefs.shared.cpaManagementKey = "test-key"
+            Prefs.shared.cpaAPIBase = "http://127.0.0.1:\(server.port)"
+            defer {
+                Prefs.shared.cpaManagementKey = origKey
+                Prefs.shared.cpaAPIBase = origBase
+                Prefs.shared.proxy = origProxy
+            }
+            server.mgmtLock.lock()
+            server.cpaYAML = "port: 8317\napi-keys:\n  - sk-client\nopenai-compatibility:\n"
+            server.mgmtLock.unlock()
+
+            // 指向不存在的本地路径:API 模式下不读文件,写入经 PUT 到服务端。
+            // 走公开入口 Core.add(单 key → addAggregated),这正是真实导入链路。
+            let ghost = "/nonexistent-keydrop-api-mode/config.yaml"
+            Prefs.shared.cpaConfigPath = ghost
+            let core = Core()
+            do {
+                let outcome = try core.add(
+                    raw: "https://api-mode.example.com/v1\nsk-apimodekey111111",
+                    ccOverride: false, grokOverride: false, cpaOverride: true, dshOverride: false,
+                    models: ["gpt-5.6-sol"], force: true   // 跳过真实网络测试,只验写入路径
+                )
+                t.expect(outcome.ok, "[API] 导入成功")
+                t.contains(outcome.lines.joined(separator: "\n"), "CPA", "[API] 结果含 CPA 写入行")
+                t.expect(!outcome.lines.joined(separator: "\n").contains("config 不存在"),
+                         "[API] 不得报「config 不存在」")
+            } catch {
+                t.expect(false, "[API] addAggregated 不应要求本地文件存在: \(error.localizedDescription)")
+            }
+            // PUT 正文应含新条目
+            server.mgmtLock.lock()
+            let putBody = server.cpaPutBody
+            server.mgmtLock.unlock()
+            t.contains(putBody, "api-mode.example.com", "[API] PUT 正文含新条目")
+            t.expect(!FileManager.default.fileExists(atPath: ghost), "[API] 本地路径始终不存在(零触碰)")
+
+            // remove 路径(Core.delete)同样不得因本地文件缺失而跳过
+            let entryID = core.history.snapshot().first { $0.targets.contains("cpa") }?.id ?? ""
+            if !entryID.isEmpty {
+                do {
+                    let msg = try core.delete(entryIDPrefix: entryID)
+                    t.expect(!msg.contains("不存在"), "[API] delete 不因本地文件缺失跳过: \(msg)")
+                } catch {
+                    // delete 会因 cc/dsh 侧失败而抛错,但只要 CPA 那行没报「不存在」即算通过
+                    t.expect(!error.localizedDescription.contains("CPA config 不存在"),
+                             "[API] delete 的 CPA 分支不应报 config 不存在: \(error.localizedDescription)")
+                }
+            }
+
+            // resolvedCPAConfig:API 模式绝不回落 locateConfig(会 stat Documents 路径 → TCC 弹窗),
+            // 但必须返回非空以便上层继续。KEYDROP_CPA_CONFIG(TestEnv 设的)优先级最高,
+            // 所以这里清掉它,专门验证「prefs 记录值」这条分支不再 stat。
+            let savedEnv = ProcessInfo.processInfo.environment["KEYDROP_CPA_CONFIG"]
+            unsetenv("KEYDROP_CPA_CONFIG")
+            Prefs.shared.cpaConfigPath = "/Users/someone/Documents/cpa/config.yaml"
+            let resolved = Prefs.shared.resolvedCPAConfig()
+            t.notNil(resolved, "[API] resolvedCPAConfig 返回非空(不 stat Documents 路径)")
+            t.equal(resolved, "/Users/someone/Documents/cpa/config.yaml", "[API] 用记录值而非重新探测")
+            Prefs.shared.cpaConfigPath = nil
+            if let savedEnv { setenv("KEYDROP_CPA_CONFIG", savedEnv, 1) }
+
+            // ProxyPool.defaultAuthDir:API 模式自守卫返回 nil(不 stat auth-dir)
+            t.expect(ProxyPool.defaultAuthDir() == nil, "[API] defaultAuthDir 自守卫返回 nil")
+        }
+    }
 }
