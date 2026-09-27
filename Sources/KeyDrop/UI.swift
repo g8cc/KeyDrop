@@ -1756,7 +1756,8 @@ struct PanelView: View {
         switch state.updateState {
         case .available(let v, _, _):
             updateIconButton(
-                systemName: "arrow.up.circle.fill",
+                // 空心圆圈:与 cc-switch 的 UpdateBadge(ArrowUpCircle 描边)同款观感
+                systemName: "arrow.up.circle",
                 color: Color(red: 0.22, green: 0.58, blue: 0.40),
                 help: "新版本 v\(v) 可更新!点击查看并更新")
         case .downloading(_, let p):
@@ -2423,7 +2424,7 @@ struct UpdateSheet: View {
             case .available(let version, _, let notes):
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 6) {
-                        Image(systemName: "arrow.up.circle.fill")
+                        Image(systemName: "arrow.up.circle")
                             .foregroundStyle(Color(red: 0.22, green: 0.58, blue: 0.40))
                         Text("v\(version) 可更新")
                             .font(.system(size: 13, weight: .semibold))
