@@ -1794,6 +1794,12 @@ openai-compatibility:
             mk("cccccccc-1111-2222-3333-444455556666", status: "active",
                key: "sk-livekey111111111", deletedAt: nil,
                note: String(repeating: "测试: GET https://x.example.com/v1/models → 200; ", count: 80))
+            // D:活跃条目 + 超长 note(>4000 且各句互不相同)→ 截断且截断结果稳定
+            //   (回归:截断公式 600+9+3400=4009 仍超阈值,每次压实渐进啃掉尾部)
+            let longSegments = (0..<120).map { "第\($0)轮扫描: GET https://long.example.com/path/\($0) → 200" }
+            mk("dddddddd-1111-2222-3333-444455556666", status: "active",
+               key: "sk-longkey1111111111", deletedAt: nil,
+               note: longSegments.joined(separator: "; "))
 
             let lines = core.compactLedger().joined(separator: "\n")
             t.contains(lines, "审计桩", "[压实] 播报超期清除")
@@ -1820,6 +1826,19 @@ openai-compatibility:
                 t.equal(ec.status, "active", "[active] 状态不变")
                 t.expect(ec.note?.components(separatedBy: "测试: GET").count == 2,
                          "[note] 重复 80 遍去重为 1 遍")
+            }
+            // D:超长 note 截断 + 截断幂等(二次压实长度不再变化)
+            let d = core.history.find(idPrefix: "dddddddd")
+            let ed = t.notNil(d, "[截断] 条目在")
+            if let ed {
+                let firstLen = ed.note?.count ?? 0
+                t.expect(firstLen > 0 && firstLen <= 4000, "[截断] 长度 ≤4000(实测 \(firstLen))")
+                t.contains(ed.note ?? "", "第0轮扫描", "[截断] 保留开头(导入记录)")
+                t.contains(ed.note ?? "", "第119轮扫描", "[截断] 保留结尾(最近状态)")
+                let before = ed.note ?? ""
+                _ = core.compactLedger()
+                let after = core.history.find(idPrefix: "dddddddd")?.note ?? ""
+                t.equal(after.count, before.count, "[截断] 二次压实长度稳定(无渐进啃尾)")
             }
 
             // 幂等:再跑一次无新变更

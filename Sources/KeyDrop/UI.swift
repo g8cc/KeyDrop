@@ -1453,8 +1453,12 @@ struct ImportTextView: NSViewRepresentable {
         tv.isEditable = enabled
         tv.placeholder = placeholder
         if focus.wrappedValue {
-            focus.wrappedValue = false
-            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+            // 聚焦请求与状态复位都推迟到主循环:updateNSView 处于 SwiftUI 视图更新期,
+            // 同步改 @FocusState 会触发 "Modifying state during view update" 警告
+            DispatchQueue.main.async {
+                focus.wrappedValue = false
+                tv.window?.makeFirstResponder(tv)
+            }
         }
     }
 

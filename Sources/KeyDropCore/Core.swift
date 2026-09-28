@@ -1348,8 +1348,10 @@ public final class Core {
             if seen.insert(t).inserted { kept.append(t) }
         }
         var n = kept.joined(separator: "; ")
+        // 上限 4000:头 590 + 标记 9 + 尾 3390 = 3989 < 4000 —— 截断结果必须
+        // 严格低于阈值,否则每次压实都会再截一轮,渐进性啃掉尾部内容
         if n.count > 4000 {
-            n = String(n.prefix(600)) + " …[已截断]… " + String(n.suffix(3400))
+            n = String(n.prefix(590)) + " …[已截断]… " + String(n.suffix(3390))
         }
         return n
     }
