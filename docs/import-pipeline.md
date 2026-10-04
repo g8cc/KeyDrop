@@ -1,6 +1,6 @@
 # KeyDrop 导入链路全景
 
-> 适用版本 v1.4.39。本文回答三类问题:
+> 适用版本 v1.4.43。本文回答三类问题:
 > ① 一个 key 从贴进 KeyDrop 到落到各工具,中间发生了什么(按顺序);
 > ② 每个目标(Claude Code / Codex / OpenCode / Grok Build / CPA / DSH)各自怎么写、写到哪;
 > ③ 多个目标同时命中时,谁优先、什么绝不覆盖。
@@ -269,6 +269,11 @@ API 模式的零触碰覆盖**读路径**:endpointInfo(端口+客户端 key,供�
 4. 家族变化 → 自动迁移:不匹配的旧 provider 删除重建(entry 的 targets/ccProviderID 同步改)。
 5. 探测结果写入监控时间轴(健康页的图)。
 
+### 编辑(编辑面板 / `keydrop edit --model <列表> --key <新key> --note <备注>`)
+- 模型:逐个 chat 验证(慢响应模型可用 `--no-verify`),同步 cc-switch/**CPA(与刷新同口径整替)**/DSH/Grok
+- **key 轮换(v1.4.38)**:站方轮换 key 的高频场景 —— 新 key 先完整实测(失败整体拒绝),通过后 cc-switch 凭据/CPA 组内原位替换/DSH credentials/Grok 段 key/账本 全产物机械替换;CPA 配置缺失或组内无旧 key 时明确告警(v1.4.42)
+- 备注:纯账本字段;名称同步 cc-switch provider 名
+
 ### 删除
 逆序清理所有产物:cc-switch provider → Grok 段 → CPA key → DSH route+凭据 → live 回退(防陈旧配置复活)。tag 只在产物删成功后摘除。
 
@@ -325,6 +330,7 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 | v1.4.29 | 导入 sub.tidalrelay 后,cc-switch provider 的 baseURL/key 被 `127.0.0.1:8317` + CPA key 整块覆盖。根因:cc-switch 运行时 KeyDrop 只写 DB 不写 live,留下「DB current=新行,live=旧环境」漂移;用户激活新 provider 时 cc-switch 按数据库 `is_current` 把过期 live 回写进新行 | **live 一致性写入**:导入/刷新即把 live 写成与 DB current 相同 env,回写退化为 no-op;对账新增回写污染自愈(loopback+clientKey 签名) |
 | v1.4.30 | 同一次导入,DSHWriter 把 `KEYDROP_07FA1C9C_API_KEY` 顶层裸写进 `.credentials.yaml`(dsh 要求凭据嵌在 `refs:` 内)→ dsh 启动崩溃。外部 AI 只手工缩进了文件,但写入方不感知 refs,下次写入会再追加顶格重复行 | **refs 感知写入**:凭据一律缩进写进 refs 块末尾(多行标量安全)、顶格遗留自愈清除、空文件落骨架、删空收敛 `refs: {}` |
 | v1.4.31 | 更新重启确认后 `kill -9` 无业务任务校验:导入流程"外部产物已写、账本未记"的毫秒级窗口被杀会留下孤儿 provider。影响面评估:监控数据采集不受影响(探测点逐条即时落盘)、各文件均有原子写/事务保护;唯一缺口是孤儿 | **孤儿收养**:cc.add 在 provider 行 meta 写入导入来源标记;对账时未认领的带标记行从行内重建账本条目(收养而非删除),key 重复时跳过告警 |
+| v1.4.40 | 账本压实截断公式 600+9+3400=4009 仍超 4000 上限,每次启动渐进啃掉超长备注尾部(v1.4.39 引入,测试最长 3600 字符未覆盖 cap 路径) | 590+9+3390=3989<4000 稳定;补 >4000 字符互异分句用例(首尾保留+二次压实长度不变) |
 | v1.4.39 | 账本无限增长三源:已删条目永不清理(70% 占比,含明文 key)、note 无上限累积(单条同句重复 655 遍 25KB)、probeLog 虽有 30 点滚动但已删条目照带 | **账本压实**:note 分句去重+4000 字符上限;删除超 30 天转审计桩(元数据留痕、明文清除);启动 self-heal 执行,updateAll 整批一次落盘 |
 
 ---
@@ -337,6 +343,7 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 - **导入**:菜单栏「导入账本…」或 `keydrop import --file <文件> --passphrase <口令>`。默认自动执行产物重放;`--no-replay` 跳过。
 - **合并语义**:按 id 合并,绝不覆盖本机已有条目;本机已有同 key 的活跃条目 → 跳过(防制造重复凭据条目);已删除的条目不搬运。
 - **WebDAV 推送/拉取(v1.4.42)**:无需自建账号服务 —— 「WebDAV 同步设置…」里填坚果云等标准 WebDAV 的目录/账号/密码,即可「推送到 WebDAV」(覆盖远端加密快照)/「从 WebDAV 拉取」(按 id 合并 + 产物重放,本机墓碑的 key 不复活)。加密口令仅存本机,WebDAV 服务端只见密文;CLI: `keydrop webdav-push/webdav-pull`。
+- 条目带 `updatedAt`(追加/编辑/刷新/探测自动盖章),为多设备 LWW 同步预留。
 - **双层版本化**:信封 formatVersion(加密方式变更)+ 载荷 schemaVersion(字段变更),导入端拒绝比自己新的 schema 并提示升级。
 - **产物重放幂等**:cc-switch 以「账本无本机 pid 或 pid 已不存在」为重放条件;CPA/DSH/Grok 写入器天然 upsert。重放后 cc-switch 里最后重放的条目为激活态,自行切换即可。
 

@@ -56,6 +56,15 @@ enum LedgerTransferTests {
                 targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
                 cpaConfigPath: nil, status: "active")
             try! core.history.append(seeded)
+            // 本机墓碑:曾导入过 K3 后删除(拉取不得复活这把 key)
+            var tomb = HistoryEntry(
+                id: "cccccccc-1111-2222-3333-444455556666", ts: 2, raw: "raw-tomb", format: "multiline",
+                name: "已删除的 K3", url: "https://tomb.example.com/v1", model: nil,
+                models: ["kimi-k3"], key: "sk-K3333333333333", keyMasked: "sk-K3…3333",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "deleted")
+            tomb.deletedAt = Date().timeIntervalSince1970
+            try! core.history.append(tomb)
 
             // 机器 A 的导出载荷:e1(claude+ccswitch,全新)、e2(opencode+cpa,与预置同 key)
             let e1 = HistoryEntry(
@@ -70,16 +79,24 @@ enum LedgerTransferTests {
                 models: ["kimi-k3"], key: "sk-K2222222222222", keyMasked: "sk-K2…2222",
                 targets: ["cpa"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
                 cpaConfigPath: nil, status: "active")
+            let e3 = HistoryEntry(
+                id: "e3e3e3e3-1111-2222-3333-444455556666", ts: 102, raw: "raw-e3", format: "multiline",
+                name: "e3-opencode", url: "https://c.example.com/v1", model: "kimi-k3",
+                models: ["kimi-k3"], key: "sk-K3333333333333", keyMasked: "sk-K3…3333",
+                targets: ["cpa"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
             let payload = LedgerPayload(
                 schemaVersion: LedgerCrypto.currentSchemaVersion,
                 exportedAt: Date().timeIntervalSince1970, appVersion: "test",
-                entries: [e1, e2],
+                entries: [e1, e2, e3],
                 switches: .init(useCC: true, useGrok: true, useCPA: true, useDSH: true, cpaResident: true))
             let sealed = try! LedgerCrypto.seal(try! JSONEncoder().encode(payload), passphrase: "passphrase-12345")
 
             let report = try! core.importLedger(sealed, passphrase: "passphrase-12345")
             t.contains(report, "新增 1 条", "[导入] e1 补入")
             t.contains(report, "同 key 跳过 1 条", "[导入] e2 同 key 跳过")
+            t.contains(report, "已删除跳过 1 条", "[导入/墓碑] 本地墓碑 K3 不搬运(载荷无已删条目)")
+            t.expect(core.history.find(idPrefix: "e3e3e3e3") == nil, "[墓碑] K3 不复活入账本")
             let e1in = core.history.find(idPrefix: "eeeeeeee")
             let e1v = t.notNil(e1in, "[导入] e1 已入账本")
             if let e1v {

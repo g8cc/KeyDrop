@@ -21,6 +21,7 @@ public struct HistoryEntry: Codable {
         case ccMissing
         case clashFile
         case deletedAt
+        case updatedAt
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
@@ -55,6 +56,8 @@ public struct HistoryEntry: Codable {
     public var clashFile: String?
     /// 进入已删除状态的时间;账本压实(超期转审计桩)据此计龄,缺失时回退 healthAt/ts
     public var deletedAt: TimeInterval?
+    /// 最后修改时间(HistoryStore.append/update 自动盖章):多设备同步的 LWW 依据
+    public var updatedAt: TimeInterval?
     /// 最近一次 chat 探测的端到端延迟(毫秒)。实战监控:慢网关也显示"可用",
     /// 但延迟让用户对"用的时候行不行"有预期(真实反馈:显示可用,用起来 30s 无响应)
     public var latencyMs: Double?
@@ -123,6 +126,7 @@ public struct HistoryEntry: Codable {
         ccMissing: Bool? = nil,
         clashFile: String? = nil,
         deletedAt: TimeInterval? = nil,
+        updatedAt: TimeInterval? = nil,
         latencyMs: Double? = nil,
         failStreak: Int? = nil,
         viaCPAOk: Bool? = nil,
@@ -154,6 +158,7 @@ public struct HistoryEntry: Codable {
         self.ccMissing = ccMissing
         self.clashFile = clashFile
         self.deletedAt = deletedAt
+        self.updatedAt = updatedAt
         self.latencyMs = latencyMs
         self.failStreak = failStreak
         self.viaCPAOk = viaCPAOk
@@ -188,6 +193,7 @@ public struct HistoryEntry: Codable {
         ccMissing = try c.decodeIfPresent(Bool.self, forKey: .ccMissing)
         clashFile = try c.decodeIfPresent(String.self, forKey: .clashFile)
         deletedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .deletedAt)
+        updatedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .updatedAt)
         latencyMs = try c.decodeIfPresent(Double.self, forKey: .latencyMs)
         failStreak = try c.decodeIfPresent(Int.self, forKey: .failStreak)
         viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)
@@ -414,6 +420,8 @@ public final class HistoryStore {
     public func append(_ e: HistoryEntry) throws {
         lock.lock()
         defer { lock.unlock() }
+        var e = e
+        e.updatedAt = Date().timeIntervalSince1970
         _items.insert(e, at: 0)
         _items = Self.applyCap(_items)
         try saveLocked(dirtyIDs: [e.id])
@@ -444,12 +452,22 @@ public final class HistoryStore {
         defer { lock.unlock() }
         guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
         var merged = e
+        merged.updatedAt = Date().timeIntervalSince1970
         // probeLog 是监控账本,归 store 所有:调用方的 entry 快照可能早于最新探测点
         // (refreshModels 先 appendProbePoint 再 update 整条),整条覆盖会回滚监控历史
         merged.probeLog = _items[i].probeLog
         merged.modelProbeLog = _items[i].modelProbeLog
         _items[i] = merged
         try saveLocked(dirtyIDs: [e.id])
+    }
+
+    /// 刷新条目最后修改时间(探测点追加也算修改;多设备同步的 LWW 依据)。
+    /// 条目不存在时静默跳过(调用方各自处理自身的报错口径)
+    private func touchUpdatedAt(id: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+        _items[i].updatedAt = Date().timeIntervalSince1970
     }
 
     /// 批量健康更新:只合并 health/healthDetail/healthAt 三个字段,其余字段以内存现状为准。
@@ -468,6 +486,7 @@ public final class HistoryStore {
             _items[i].failStreak = e.failStreak
             _items[i].viaCPAOk = e.viaCPAOk
             _items[i].viaCPAAt = e.viaCPAAt
+            _items[i].updatedAt = at
             // 探测历史滚动追加(监控图数据源)
             let pt = ProbePoint(t: at, ms: e.latencyMs,
                                 ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
@@ -490,6 +509,7 @@ public final class HistoryStore {
 
     /// 手动重测(refreshModels)路径追加单个探测点(监控图数据源)
     public func appendProbePoint(id: String, ok: Bool, ms: Double?, cpa: Bool?, at: TimeInterval) throws {
+        defer { touchUpdatedAt(id: id) }
         lock.lock()
         defer { lock.unlock() }
         guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
@@ -501,6 +521,7 @@ public final class HistoryStore {
 
     /// 模型级探测点追加(手动重测/扫描共用)
     public func appendModelProbePoints(id: String, points: [String: ProbePoint]) throws {
+        defer { touchUpdatedAt(id: id) }
         guard !points.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
@@ -679,6 +700,27 @@ public final class Prefs {
     public var webdavExportPass: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavExportPass }
         set { lock.lock(); _webdavExportPass = newValue; lock.unlock() }
+    }
+
+    /// 测试隔离:TestEnv 每个环境调用一次,把全部偏好重置为默认值。
+    /// Prefs.shared 是进程级单例,跨 TestEnv 共享;不重置会让前面套件的
+    /// 设置(管理密钥/代理/WebDAV 凭据)泄漏到后面,套件间产生隐式依赖。
+    public func resetForTest() {
+        lock.lock()
+        defer { lock.unlock() }
+        _useCC = true
+        _useGrok = true
+        _useCPA = false
+        _useDSH = true
+        _cpaResident = true
+        _cpaConfigPath = nil
+        _proxy = ""
+        _cpaManagementKey = nil
+        _cpaAPIBase = nil
+        _webdavURL = nil
+        _webdavUser = nil
+        _webdavPass = nil
+        _webdavExportPass = nil
     }
 
     init() { load() }

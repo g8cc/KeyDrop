@@ -1444,6 +1444,8 @@ struct ImportTextView: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let tv = scroll.documentView as? PlaceholderTextView else { return }
+        // 中文输入法组词中(marked text)不得回写:绑定同步会打断组词
+        guard !tv.hasMarkedText() else { return }
         if tv.string != text {
             let selected = tv.selectedRanges
             tv.string = text

@@ -97,6 +97,11 @@ final class TestEnv {
         setenv("KEYDROP_IMAGES_DIR", dir + "/images", 1)
         setenv("KEYDROP_CLASH_PROFILES", dir + "/clash-profiles", 1)
         setenv("KEYDROP_MCP_COMMAND", "/usr/bin/true keydrop-mcp-test", 1)
+        // 套件间状态隔离:LLM key 归零但不覆盖(override=0)——需要它的套件
+        // 会自行 setenv;override=1 会把前面套件刚设置的 key 抹掉(真实回归:
+        // 回写污染自愈接线测试在 TestEnv 之后才设 KEYDROP_LLM_KEY)
+        setenv("KEYDROP_LLM_KEY", "", 0)
+        Prefs.shared.resetForTest()
     }
 
     func read(_ path: String) -> String {

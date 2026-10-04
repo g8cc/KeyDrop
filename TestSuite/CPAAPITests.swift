@@ -117,17 +117,13 @@ enum CPAAAPITests {
                 t.expect(false, "零触达回归失败: \(error)")
             }
 
-            // 9. 代理池扫描(API 模式)
-            do {
-                let accounts = ProxyPool.scanAccounts(authDir: "/nonexistent", types: ["xai"])
-                t.equal(accounts.count, 1, "API 模式扫描到 1 个 xai 账号")
-                t.equal(accounts.first?.fileName, "acc-a.json", "文件名正确")
-                t.equal(accounts.first?.existingProxy, nil as String?, "清除后 existingProxy=nil(未绑定)")
-                let unbound = ProxyPool.unboundAccounts(authDir: "/nonexistent", types: ["xai"])
-                t.equal(unbound.count, 1, "清除后视为未绑定")
-            } catch {
-                t.expect(false, "API 扫描失败: \(error)")
-            }
+            // 9. 代理池扫描(API 模式;scanAccounts 内部处理错误不抛出)
+            let accounts = ProxyPool.scanAccounts(authDir: "/nonexistent", types: ["xai"])
+            t.equal(accounts.count, 1, "API 模式扫描到 1 个 xai 账号")
+            t.equal(accounts.first?.fileName, "acc-a.json", "文件名正确")
+            t.equal(accounts.first?.existingProxy, nil as String?, "清除后 existingProxy=nil(未绑定)")
+            let unbound = ProxyPool.unboundAccounts(authDir: "/nonexistent", types: ["xai"])
+            t.equal(unbound.count, 1, "清除后视为未绑定")
 
             // 10. 代理池 apply(API 模式):绑定写入 PATCH,且 loopback 改写仍生效
             do {
