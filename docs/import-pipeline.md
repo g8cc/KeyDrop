@@ -329,6 +329,16 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 
 ---
 
+## 13. 数据迁移与多设备（v1.4.41）
+
+**设计原则:只同步账本,不同步产物** —— 账本是源,产物(cc-switch/CPA/DSH/Grok 的本机文件)在新机器由「产物重放」按各条目的 targets 重建;未安装的目标逐条报告跳过。
+
+- **加密导出**:菜单栏「导出账本…」或 `keydrop export --out <文件> --passphrase <口令>`。文件端到端加密(PBKDF2-SHA256 60 万轮派生 + AES-256-GCM),口令丢失无法恢复。
+- **导入**:菜单栏「导入账本…」或 `keydrop import --file <文件> --passphrase <口令>`。默认自动执行产物重放;`--no-replay` 跳过。
+- **合并语义**:按 id 合并,绝不覆盖本机已有条目;本机已有同 key 的活跃条目 → 跳过(防制造重复凭据条目);已删除的条目不搬运。
+- **双层版本化**:信封 formatVersion(加密方式变更)+ 载荷 schemaVersion(字段变更),导入端拒绝比自己新的 schema 并提示升级。
+- **产物重放幂等**:cc-switch 以「账本无本机 pid 或 pid 已不存在」为重放条件;CPA/DSH/Grok 写入器天然 upsert。重放后 cc-switch 里最后重放的条目为激活态,自行切换即可。
+
 ## 附:排查一条 key 的入口清单
 
 1. `~/.keydrop/history.json` → 找条目:看 `targets`(写了哪些产物)、`models`(精选列表)、`health/healthDetail`(探测详情)、`note`(导入过程记录)。

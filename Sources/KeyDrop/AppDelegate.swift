@@ -255,6 +255,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(.separator())
         self.appendUpdateItems(to: menu)
         menu.addItem(.separator())
+        let exportLedgerItem = NSMenuItem(title: "导出账本…", action: #selector(exportLedgerAction), keyEquivalent: "")
+        exportLedgerItem.target = self
+        menu.addItem(exportLedgerItem)
+        let importLedgerItem = NSMenuItem(title: "导入账本…", action: #selector(importLedgerAction), keyEquivalent: "")
+        importLedgerItem.target = self
+        menu.addItem(importLedgerItem)
+        menu.addItem(.separator())
         menu.addItem(.separator())
         let versionItem = NSMenuItem(title: "KeyDrop v\(Version.currentVersion())", action: nil, keyEquivalent: "")
         versionItem.isEnabled = false
@@ -330,6 +337,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func applyUpdateAction() {
         updater.applyUpdate()
+    }
+
+    // MARK: - 账本迁移(导出/导入 + 产物重放)
+
+    /// 口令输入弹窗(密文框);confirm=true 时叠加确认框并校验一致与最小长度
+    private func promptPassphrase(confirm: Bool, title: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "口令用于端到端加密账本(密文不落任何第三方),至少 8 位;丢失无法恢复"
+        alert.alertStyle = .informational
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: confirm ? 60 : 26))
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: confirm ? 32 : 0, width: 300, height: 24))
+        container.addSubview(field)
+        var confirmField: NSSecureTextField?
+        if confirm {
+            let c = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            container.addSubview(c)
+            confirmField = c
+        }
+        alert.accessoryView = container
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let pass = field.stringValue
+        guard pass.count >= 8 else {
+            let warn = NSAlert()
+            warn.messageText = "口令至少 8 位"
+            warn.runModal()
+            return nil
+        }
+        if let cf = confirmField, cf.stringValue != pass {
+            let warn = NSAlert()
+            warn.messageText = "两次输入的口令不一致"
+            warn.runModal()
+            return nil
+        }
+        return pass
+    }
+
+    private func alertOK(_ title: String, _ text: String) {
+        DispatchQueue.main.async {
+            let a = NSAlert()
+            a.messageText = title
+            a.informativeText = text
+            a.runModal()
+        }
+    }
+
+    @objc private func exportLedgerAction() {
+        guard let pass = promptPassphrase(confirm: true, title: "导出账本:设置口令") else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "KeyDrop-export-\(Int(Date().timeIntervalSince1970)).keydrop"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let dateText = url.path
+        Task.detached(priority: .userInitiated) {
+            do {
+                let data = try Core.shared.exportLedger(passphrase: pass)
+                try data.write(to: url, options: .atomic)
+                self.alertOK("账本已导出", "\(dateText)\n\n文件已端到端加密:导入需要导出时设置的口令,口令丢失无法恢复")
+            } catch {
+                self.alertOK("导出失败", error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func importLedgerAction() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard let data = try? Data(contentsOf: url) else {
+            self.alertOK("导入失败", "无法读取文件: \(url.path)")
+            return
+        }
+        guard let pass = promptPassphrase(confirm: false, title: "导入账本:输入导出时设置的口令") else { return }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let msg = try Core.shared.importLedger(data, passphrase: pass)
+                let replay = Core.shared.replayArtifacts()
+                AppLog.info("账本导入: \(msg)\n" + replay.joined(separator: "\n"))
+                self?.alertOK("导入完成", msg + "\n\n" + replay.joined(separator: "\n"))
+            } catch {
+                self?.alertOK("导入失败", error.localizedDescription)
+            }
+        }
     }
 
     @objc private func promptUpdate() {

@@ -1,0 +1,106 @@
+import Foundation
+import KeyDropCore
+
+/// 账本迁移:加密导出/导入 + 产物重放
+/// 设计:只同步账本(源),产物(cc-switch/CPA/DSH/Grok)在新机器由
+/// replayArtifacts 按各条目的 targets 重放 —— 账本是源,产物是派生。
+enum LedgerTransferTests {
+    static func run(_ h: Harness) {
+        h.runSuite("LedgerTransfer.加解密回环") { t in
+            let payload = LedgerPayload(
+                schemaVersion: LedgerCrypto.currentSchemaVersion,
+                exportedAt: 12345, appVersion: "test",
+                entries: [], switches: nil)
+            let data = try! JSONEncoder().encode(payload)
+            let sealed = try! LedgerCrypto.seal(data, passphrase: "passphrase-12345")
+            let opened = try! LedgerCrypto.open(sealed, passphrase: "passphrase-12345")
+            t.equal(opened, data, "加解密回环一致")
+            t.expect((try? LedgerCrypto.open(sealed, passphrase: "wrong-pass-1")) == nil, "错误口令解密失败")
+            t.expect((try? LedgerCrypto.seal(data, passphrase: "short")) == nil, "短口令拒绝")
+        }
+
+        h.runSuite("LedgerTransfer.schema 拒绝") { t in
+            let env = try! TestEnv("ltx-schema")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let core = Core()
+            let payload = LedgerPayload(
+                schemaVersion: LedgerCrypto.currentSchemaVersion + 99,
+                exportedAt: 1, appVersion: "future", entries: [], switches: nil)
+            let sealed = try! LedgerCrypto.seal(try! JSONEncoder().encode(payload), passphrase: "passphrase-12345")
+            do {
+                _ = try core.importLedger(sealed, passphrase: "passphrase-12345")
+                t.expect(false, "[schema] 应拒绝比自己新的版本")
+            } catch {
+                t.contains(error.localizedDescription, "先升级", "[schema] 拒绝并提示升级")
+            }
+        }
+
+        h.runSuite("LedgerTransfer.双机迁移与重放") { t in
+            // 确定性设计:不经过 coreA/coreB 两条导入链(同进程共享 HistoryStore 单例,
+            // 同 key 会互相污染)—— 导出文件直接构造载荷(等价机器 A 的密文),
+            // 机器 B 预置条目用直接 append(显式 id,绕开 add() 的同 key 去重)。
+            let env = try! TestEnv("ltx-b")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            env.write("cpa-config.yaml", "")
+            setenv("KEYDROP_CPA_CONFIG", env.dir + "/cpa-config.yaml", 1)
+            defer { setenv("KEYDROP_CPA_CONFIG", "", 1) }
+            let core = Core()
+
+            // 预置:本机已有同 key 条目(模拟用户在 B 机手动加过一把同 key)
+            var seeded = HistoryEntry(
+                id: "dddddddd-1111-2222-3333-444455556666", ts: 1, raw: "seed", format: "multiline",
+                name: "本机手加", url: "https://seed.example.com/v1", model: nil,
+                models: ["kimi-k3"], key: "sk-K2222222222222", keyMasked: "sk-K2…2222",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! core.history.append(seeded)
+
+            // 机器 A 的导出载荷:e1(claude+ccswitch,全新)、e2(opencode+cpa,与预置同 key)
+            let e1 = HistoryEntry(
+                id: "eeeeeeee-1111-2222-3333-444455556666", ts: 100, raw: "raw-e1", format: "multiline",
+                name: "e1-claude", url: "https://a.example.com/v1", model: "claude-sonnet-4-5",
+                models: ["claude-sonnet-4-5"], key: "sk-K1111111111111", keyMasked: "sk-K1…1111",
+                targets: ["ccswitch"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            let e2 = HistoryEntry(
+                id: "ffffffff-1111-2222-3333-444455556666", ts: 101, raw: "raw-e2", format: "multiline",
+                name: "e2-opencode", url: "https://b.example.com/v1", model: "kimi-k3",
+                models: ["kimi-k3"], key: "sk-K2222222222222", keyMasked: "sk-K2…2222",
+                targets: ["cpa"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            let payload = LedgerPayload(
+                schemaVersion: LedgerCrypto.currentSchemaVersion,
+                exportedAt: Date().timeIntervalSince1970, appVersion: "test",
+                entries: [e1, e2],
+                switches: .init(useCC: true, useGrok: true, useCPA: true, useDSH: true, cpaResident: true))
+            let sealed = try! LedgerCrypto.seal(try! JSONEncoder().encode(payload), passphrase: "passphrase-12345")
+
+            let report = try! core.importLedger(sealed, passphrase: "passphrase-12345")
+            t.contains(report, "新增 1 条", "[导入] e1 补入")
+            t.contains(report, "同 key 跳过 1 条", "[导入] e2 同 key 跳过")
+            let e1in = core.history.find(idPrefix: "eeeeeeee")
+            let e1v = t.notNil(e1in, "[导入] e1 已入账本")
+            if let e1v {
+                t.equal(e1v.key, "sk-K1111111111111", "[导入] key 随账本迁移")
+                t.equal(e1v.ccProviderID, nil, "[导入] 来源机器的产物绑定已清除")
+            }
+            // 目标开关按导出值应用
+            t.equal(core.prefs.useCPA, true, "[导入] 开关已应用")
+
+            // 产物重放:e1 → 本机 cc-switch 建 claude 行;幂等二次重放跳过
+            let lines = core.replayArtifacts()
+            t.contains(lines.joined(separator: "\n"), "已重放", "[重放] 播报")
+            let row = try! DB(path: env.dir + "/cc-switch.db").scalar(
+                "SELECT settings_config FROM providers WHERE settings_config LIKE '%sk-K1111111111111%'") ?? ""
+            t.contains(row, "claude-sonnet-4-5", "[重放] 本机 cc-switch 行已重建")
+            let e1row = core.history.find(idPrefix: "eeeeeeee")
+            t.notNil(e1row?.ccProviderID, "[重放] 绑定本机 provider id")
+
+            let lines2 = core.replayArtifacts()
+            t.expect(!lines2.joined(separator: "\n").contains("已重放"), "[幂等] 二次重放全部跳过")
+            t.contains(lines2.joined(separator: "\n"), "本机已有", "[幂等] 跳过原因可见")
+        }
+    }
+}

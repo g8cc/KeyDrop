@@ -1356,6 +1356,154 @@ public final class Core {
         return n
     }
 
+    // MARK: - 账本迁移(Phase 1):加密导出/导入 + 产物重放
+
+    /// 导出账本:全量条目 + 目标开关,端到端加密(口令派生密钥,不落任何第三方)。
+    /// 已删条目一并导出(文件本身是密文),由导入端决定是否搬墓碑。
+    public func exportLedger(passphrase: String) throws -> Data {
+        let payload = LedgerPayload(
+            schemaVersion: LedgerCrypto.currentSchemaVersion,
+            exportedAt: Date().timeIntervalSince1970,
+            appVersion: Version.currentVersion(),
+            entries: history.snapshot(),
+            switches: .init(useCC: prefs.useCC, useGrok: prefs.useGrok,
+                            useCPA: prefs.useCPA, useDSH: prefs.useDSH,
+                            cpaResident: prefs.cpaResident)
+        )
+        let data = try JSONEncoder().encode(payload)
+        return try LedgerCrypto.seal(data, passphrase: passphrase)
+    }
+
+    /// 导入账本(按 id 合并,绝不覆盖本机已有条目):
+    /// - 已删除的条目不搬(一次性迁移不搬墓碑;同步语义留给 Phase 2);
+    /// - 本机已有同 id → 跳过;本机 active 条目已有同 key → 跳过(防制造重复凭据条目);
+    /// - 来源机器的本地产物绑定(ccProviderID/cpaConfigPath 等)清除,待本机 replayArtifacts 重建;
+    /// - 目标开关按导出值应用(机器特定项:代理/CPA 路径/管理密钥不迁移)。
+    public func importLedger(_ fileData: Data, passphrase: String) throws -> String {
+        let rawPayload = try LedgerCrypto.open(fileData, passphrase: passphrase)
+        let payload: LedgerPayload
+        do {
+            payload = try JSONDecoder().decode(LedgerPayload.self, from: rawPayload)
+        } catch {
+            throw LedgerTransferError.badEnvelope("载荷解析失败: 文件可能来自更新版本的 KeyDrop")
+        }
+        guard payload.schemaVersion <= LedgerCrypto.currentSchemaVersion else {
+            throw LedgerTransferError.schemaTooNew(payload.schemaVersion)
+        }
+
+        var added = 0, skippedExisting = 0, skippedSameKey = 0, skippedTombstone = 0
+        let localActiveKeys = Set(history.snapshot().filter { $0.status == "active" }.compactMap { $0.key })
+        for var e in payload.entries {
+            if e.status == "deleted" { skippedTombstone += 1; continue }
+            if history.find(idPrefix: e.id) != nil { skippedExisting += 1; continue }
+            if let k = e.key, !k.isEmpty, localActiveKeys.contains(k) { skippedSameKey += 1; continue }
+            // 清来源机器的本地产物绑定:账本是可迁移的,产物绑定是机器本地的
+            e.ccProviderID = nil
+            e.ccRenamedFrom = nil
+            e.ccRenamedTo = nil
+            e.cpaConfigPath = nil
+            e.grokConfigPath = nil
+            e.ccMissing = nil
+            try history.append(e)
+            added += 1
+        }
+        prefs.useCC = payload.switches?.useCC ?? prefs.useCC
+        prefs.useGrok = payload.switches?.useGrok ?? prefs.useGrok
+        prefs.useCPA = payload.switches?.useCPA ?? prefs.useCPA
+        prefs.useDSH = payload.switches?.useDSH ?? prefs.useDSH
+        prefs.cpaResident = payload.switches?.cpaResident ?? prefs.cpaResident
+        try prefs.save()
+        return "导入: 新增 \(added) 条,已存在跳过 \(skippedExisting) 条,同 key 跳过 \(skippedSameKey) 条,已删除跳过 \(skippedTombstone) 条;目标开关已按导出值应用。跑「产物重放」把各工具的配置在本机重建。"
+    }
+
+    /// 产物重放:把账本里 active 条目的产物按 targets 在本机重写一遍。
+    /// 用于迁移后的新机器 —— 账本是源,产物是派生。幂等口径:
+    /// cc-switch 以「账本无本机 pid 或 pid 已不存在」为重放条件(防重复建行);
+    /// CPA/DSH/Grok 写入器天然 upsert,重复执行无副作用。
+    /// 未安装的目标(cc-switch/CPA/dsh)逐条报告跳过,不阻断其他条目。
+    @discardableResult
+    public func replayArtifacts() -> [String] {
+        var lines: [String] = ["产物重放:"]
+        var replayed = 0
+        let px = proxyForHealth()
+        for var e in history.snapshot() where e.status == "active" {
+            guard let url = e.url, let key = e.key, !key.isEmpty,
+                  let models = e.models, !models.isEmpty, !e.targets.isEmpty else { continue }
+            var entryLines: [String] = []
+            // cc-switch
+            if e.targets.contains(where: { $0.hasPrefix("ccswitch") }) {
+                let appType = e.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                if let pid = e.ccProviderID, cc.providerExists(pid, appType: appType) {
+                    entryLines.append("cc-switch: 本机已有,跳过")
+                } else {
+                    do {
+                        var p = ParsedKey()
+                        p.url = url
+                        p.key = key
+                        p.model = models.first
+                        p.name = e.name
+                        let r = try cc.add(p, nameOverride: e.name, appType: appType,
+                                           models: models, proxy: px)
+                        e.ccProviderID = r.providerID
+                        let tag = appType == "claude" ? "ccswitch" : "ccswitch-\(appType)"
+                        if !e.targets.contains(tag) { e.targets.append(tag) }
+                        entryLines.append("cc-switch: 已重放")
+                        replayed += 1
+                    } catch {
+                        entryLines.append("⚠ cc-switch: \(error.localizedDescription)")
+                    }
+                }
+            }
+            // grok
+            if e.targets.contains("grok") {
+                do {
+                    let writer = GrokBuildWriter(configPath: e.grokConfigPath)
+                    let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])
+                    e.grokConfigPath = writer.configPath
+                    entryLines.append("Grok Build: 已重放")
+                    replayed += 1
+                } catch {
+                    entryLines.append("⚠ Grok Build: \(error.localizedDescription)")
+                }
+            }
+            // cpa
+            if e.targets.contains("cpa") {
+                if let cfg = prefs.resolvedCPAConfig() {
+                    do {
+                        let msg = try CPAWriter(configPath: cfg)
+                            .addAggregated(baseURL: url, key: key, models: models)
+                        e.cpaConfigPath = cfg
+                        entryLines.append("CPA: \(msg)")
+                        replayed += 1
+                    } catch {
+                        entryLines.append("⚠ CPA: \(error.localizedDescription)")
+                    }
+                } else {
+                    entryLines.append("– CPA: 本机未找到 CPA 配置,跳过")
+                }
+            }
+            // dsh
+            if e.targets.contains("dsh") {
+                do {
+                    _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
+                    entryLines.append("DSH: 已重放")
+                    replayed += 1
+                } catch {
+                    entryLines.append("⚠ DSH: \(error.localizedDescription)")
+                }
+            }
+            guard !entryLines.isEmpty else { continue }
+            e.ccMissing = nil
+            do { try history.update(e) } catch {
+                entryLines.append("⚠ 账本更新失败: \(error.localizedDescription)")
+            }
+            lines.append("[\(e.name ?? String(e.id.prefix(8)))] " + entryLines.joined(separator: "; "))
+        }
+        lines[0] = "产物重放: \(replayed) 个产物写入本机"
+        return lines
+    }
+
     func testEntry(entryIDPrefix: String) throws -> String {
         guard let entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")

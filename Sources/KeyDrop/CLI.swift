@@ -17,6 +17,10 @@ enum CLI {
         var editKey: String? = nil
         var editNote: String? = nil
         var noVerify = false
+        var exportOut: String? = nil
+        var importFile: String? = nil
+        var importPass: String? = nil
+        var noReplay = false
         var force = false
         var appType: String? = nil
         var proxy: String? = nil
@@ -37,6 +41,13 @@ enum CLI {
             case "--force": force = true
             case "--yes", "-y": break
             case "--no-verify": noVerify = true
+            case "--out":
+                if i + 1 < a.count { exportOut = a[i + 1]; i += 1 }
+            case "--file":
+                if i + 1 < a.count { importFile = a[i + 1]; i += 1 }
+            case "--passphrase":
+                if i + 1 < a.count { importPass = a[i + 1]; i += 1 }
+            case "--no-replay": noReplay = true
             case "--name":
                 if i + 1 < a.count {
                     editName = a[i + 1]
@@ -323,6 +334,40 @@ enum CLI {
 
         case "proxy-pool":
             return runProxyPool(remaining)
+
+        case "export":
+            guard let out = exportOut, let pass = importPass, pass.count >= 8 else {
+                print("用法: KeyDrop export --out <文件> --passphrase <口令(至少 8 位)>")
+                return 2
+            }
+            do {
+                let data = try Core.shared.exportLedger(passphrase: pass)
+                try data.write(to: URL(fileURLWithPath: out), options: .atomic)
+                print("已导出: \(out)(\(data.count) 字节,端到端加密;导入: KeyDrop import --file <文件> --passphrase <口令>)")
+                return 0
+            } catch {
+                print("导出失败: \(error.localizedDescription)")
+                return 1
+            }
+
+        case "import":
+            guard let file = importFile, let pass = importPass else {
+                print("用法: KeyDrop import --file <导出文件> --passphrase <口令> [--no-replay]")
+                return 2
+            }
+            do {
+                let data = try Data(contentsOf: URL(fileURLWithPath: file))
+                print(try Core.shared.importLedger(data, passphrase: pass))
+                if !noReplay {
+                    for line in Core.shared.replayArtifacts() { print(line) }
+                } else {
+                    print("产物重放已跳过(--no-replay);需要时执行 KeyDrop self-heal 或逐条重新导入")
+                }
+                return 0
+            } catch {
+                print("导入失败: \(error.localizedDescription)")
+                return 1
+            }
 
         case "help", "h":
             print(helpText)
