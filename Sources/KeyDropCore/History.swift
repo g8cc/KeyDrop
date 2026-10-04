@@ -659,6 +659,27 @@ public final class Prefs {
         get { lock.lock(); defer { lock.unlock() }; return _cpaAPIBase }
         set { lock.lock(); _cpaAPIBase = newValue; lock.unlock() }
     }
+    /// WebDAV 同步:目录 URL / 账号 / 密码 / 账本加密口令(密文上云,口令仅存本机)
+    private var _webdavURL: String? = nil
+    private var _webdavUser: String? = nil
+    private var _webdavPass: String? = nil
+    private var _webdavExportPass: String? = nil
+    public var webdavURL: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavURL }
+        set { lock.lock(); _webdavURL = newValue; lock.unlock() }
+    }
+    public var webdavUser: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavUser }
+        set { lock.lock(); _webdavUser = newValue; lock.unlock() }
+    }
+    public var webdavPass: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavPass }
+        set { lock.lock(); _webdavPass = newValue; lock.unlock() }
+    }
+    public var webdavExportPass: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavExportPass }
+        set { lock.lock(); _webdavExportPass = newValue; lock.unlock() }
+    }
 
     init() { load() }
 
@@ -678,6 +699,10 @@ public final class Prefs {
             if let v = obj["proxy"] as? String { _proxy = v }
             _cpaManagementKey = obj["cpaManagementKey"] as? String
             _cpaAPIBase = obj["cpaAPIBase"] as? String
+            _webdavURL = obj["webdavURL"] as? String
+            _webdavUser = obj["webdavUser"] as? String
+            _webdavPass = obj["webdavPass"] as? String
+            _webdavExportPass = obj["webdavExportPass"] as? String
         }
     }
 
@@ -724,6 +749,12 @@ public final class Prefs {
             if let path, !path.isEmpty { obj["cpaConfigPath"] = path }
             if let mgmtKey, !mgmtKey.isEmpty { obj["cpaManagementKey"] = mgmtKey }
             if let apiBase, !apiBase.isEmpty { obj["cpaAPIBase"] = apiBase }
+            // WebDAV 同步配置:URL/账号/密码/导出口令(后者用于账本端到端加密,
+            // WebDAV 服务端只见密文)。prefs 0600,含凭据与账本同级敏感度
+            if let v = _webdavURL, !v.isEmpty { obj["webdavURL"] = v }
+            if let v = _webdavUser, !v.isEmpty { obj["webdavUser"] = v }
+            if let v = _webdavPass, !v.isEmpty { obj["webdavPass"] = v }
+            if let v = _webdavExportPass, !v.isEmpty { obj["webdavExportPass"] = v }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true

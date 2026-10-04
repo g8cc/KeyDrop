@@ -29,6 +29,7 @@ final class MockHTTPServer {
         case billingCentsSpent // 同上但 total_usage=10000(美分=$100)→ 用尽
         case html200All        // 任意路径 200 + HTML 兜底页(SPA),chat 也不例外
         case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
+        case webdav   // WebDAV:PUT 存/GET 取/MKCOL(账本同步回环测试)
     }
     // cpaMgmt 状态:跨线程访问,统一走锁
     let mgmtLock = NSLock()
@@ -37,6 +38,8 @@ final class MockHTTPServer {
     var cpaPatchBody = ""
     var cpaPatchName = ""
     var cpaAuthHeader = ""
+    var davStore: [String: Data] = [:]
+    var davPushCount = 0
     var cpaAuthFiles: [String: String] = [
         "acc-a.json": "{\"type\":\"xai\",\"email\":\"a@x.com\",\"proxy_url\":\"\"}"
     ]
@@ -74,6 +77,10 @@ final class MockHTTPServer {
         // (否则 readBody 会对着已发完的流死等满 SO_RCVTIMEO,4 模型 × 3s 拖死测试)。
         if mode == .cpaMgmt {
             handleCPAMgmt(client, req, method, target)
+            return
+        }
+        if mode == .webdav {
+            handleWebDAV(client, req, method, target)
             return
         }
         if (mode == .selectiveModelQuota || mode == .partialCatalog), method == "POST", target.contains("/chat/completions"),
@@ -268,6 +275,38 @@ final class MockHTTPServer {
         let resp = "HTTP/1.1 \(code) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
         client.write(resp)
         client.close()
+    }
+
+    private func handleWebDAV(_ client: SocketClient, _ req: String, _ method: String, _ target: String) {
+        mgmtLock.lock()
+        defer { mgmtLock.unlock() }
+        var body = Data()
+        if method == "PUT" {
+            if let sep = req.range(of: "\r\n\r\n") {
+                body = Data(req[sep.upperBound...].utf8)
+            }
+            if let r = req.lowercased().range(of: "content-length:"),
+               let n = Int(req.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                   .prefix(while: { $0.isNumber })), n > 0, body.count < n {
+                body.append(client.readBody(toLength: n - body.count).data(using: .utf8) ?? Data())
+            }
+        }
+        switch method {
+        case "PUT":
+            davStore[target] = body
+            davPushCount += 1
+            respond(client, 201, "Created", "")
+        case "GET":
+            if let data = davStore[target], let text = String(data: data, encoding: .utf8) {
+                respond(client, 200, "OK", text, contentType: "application/octet-stream")
+            } else {
+                respond(client, 404, "Not Found", "")
+            }
+        case "MKCOL":
+            respond(client, 201, "Created", "")
+        default:
+            respond(client, 405, "Method Not Allowed", "")
+        }
     }
 
     private func handleCPAMgmt(_ client: SocketClient, _ req: String, _ method: String, _ target: String) {

@@ -261,6 +261,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let importLedgerItem = NSMenuItem(title: "导入账本…", action: #selector(importLedgerAction), keyEquivalent: "")
         importLedgerItem.target = self
         menu.addItem(importLedgerItem)
+        let davSettingsItem = NSMenuItem(title: "WebDAV 同步设置…", action: #selector(webdavSettingsAction), keyEquivalent: "")
+        davSettingsItem.target = self
+        menu.addItem(davSettingsItem)
+        let davPushItem = NSMenuItem(title: "推送到 WebDAV", action: #selector(webdavPushAction), keyEquivalent: "")
+        davPushItem.target = self
+        menu.addItem(davPushItem)
+        let davPullItem = NSMenuItem(title: "从 WebDAV 拉取", action: #selector(webdavPullAction), keyEquivalent: "")
+        davPullItem.target = self
+        menu.addItem(davPullItem)
         menu.addItem(.separator())
         menu.addItem(.separator())
         let versionItem = NSMenuItem(title: "KeyDrop v\(Version.currentVersion())", action: nil, keyEquivalent: "")
@@ -423,6 +432,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.alertOK("导入完成", msg + "\n\n" + replay.joined(separator: "\n"))
             } catch {
                 self?.alertOK("导入失败", error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - WebDAV 同步(Phase 2 简化版:显式推送/拉取加密账本快照)
+
+    /// 4 字段表单(URL/账号/密码/加密口令)→ 存本机 prefs(0600,不上传)
+    @objc private func webdavSettingsAction() {
+        let alert = NSAlert()
+        alert.messageText = "WebDAV 同步设置"
+        alert.informativeText = "推送/拉取的是端到端加密账本(加密口令仅存本机,WebDAV 服务端只见密文)。兼容坚果云等标准 WebDAV。"
+        alert.alertStyle = .informational
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 128))
+        let urlField = NSTextField(frame: NSRect(x: 100, y: 98, width: 272, height: 22))
+        urlField.placeholderString = "https://dav.jianguoyun.com/dav/keydrop"
+        urlField.stringValue = Prefs.shared.webdavURL ?? ""
+        let userField = NSTextField(frame: NSRect(x: 100, y: 68, width: 272, height: 22))
+        userField.stringValue = Prefs.shared.webdavUser ?? ""
+        let passField = NSSecureTextField(frame: NSRect(x: 100, y: 38, width: 272, height: 22))
+        passField.stringValue = Prefs.shared.webdavPass ?? ""
+        let exportField = NSSecureTextField(frame: NSRect(x: 100, y: 8, width: 272, height: 22))
+        exportField.stringValue = Prefs.shared.webdavExportPass ?? ""
+        let rows: [(String, NSView)] = [
+            ("目录 URL", urlField), ("账号", userField),
+            ("密码(应用密码)", passField), ("加密口令(≥8 位)", exportField)
+        ]
+        for (i, (label, field)) in rows.enumerated() {
+            let y: CGFloat = [98, 68, 38, 8][i]
+            field.frame = NSRect(x: 100, y: y, width: 272, height: 22)
+            container.addSubview(field)
+            let l = NSTextField(labelWithString: label)
+            l.frame = NSRect(x: 0, y: y + 3, width: 96, height: 16)
+            l.alignment = .right
+            l.font = NSFont.systemFont(ofSize: 11)
+            container.addSubview(l)
+        }
+        alert.accessoryView = container
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let url = urlField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard url.lowercased().hasPrefix("http://") || url.lowercased().hasPrefix("https://") else {
+            self.alertOK("WebDAV 设置", "目录 URL 必须以 http(s):// 开头")
+            return
+        }
+        let exportPass = exportField.stringValue
+        guard exportPass.count >= 8 else {
+            self.alertOK("WebDAV 设置", "账本加密口令至少 8 位")
+            return
+        }
+        Prefs.shared.webdavURL = url
+        Prefs.shared.webdavUser = userField.stringValue
+        Prefs.shared.webdavPass = passField.stringValue
+        Prefs.shared.webdavExportPass = exportPass
+        try? Prefs.shared.save()
+        AppLog.info("WebDAV 同步设置已保存")
+    }
+
+    @objc private func webdavPushAction() {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let msg = try Core.shared.webdavPush()
+                AppLog.info(msg)
+                self?.alertOK("WebDAV 推送完成", msg)
+            } catch {
+                self?.alertOK("WebDAV 推送失败", error.localizedDescription)
+            }
+        }
+    }
+
+    @objc private func webdavPullAction() {
+        Task.detached(priority: .userInitiated) { [weak self] in
+            do {
+                let msg = try Core.shared.webdavPull()
+                AppLog.info("WebDAV 拉取: \(msg)")
+                self?.alertOK("WebDAV 拉取完成", msg)
+            } catch {
+                self?.alertOK("WebDAV 拉取失败", error.localizedDescription)
             }
         }
     }

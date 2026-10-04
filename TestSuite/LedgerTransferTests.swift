@@ -102,5 +102,52 @@ enum LedgerTransferTests {
             t.expect(!lines2.joined(separator: "\n").contains("已重放"), "[幂等] 二次重放全部跳过")
             t.contains(lines2.joined(separator: "\n"), "本机已有", "[幂等] 跳过原因可见")
         }
+
+        h.runSuite("WebDAV.推送拉取回环") { t in
+            guard let server = try? MockHTTPServer(mode: .webdav) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let env = try! TestEnv("webdav-sync")
+            defer { env.cleanup() }
+            try! CCSwitchWriterTests.createSchema(env)
+            let core = Core()
+            let r1 = try! core.add(raw: "https://a.example.com/v1 sk-K7777777777777",
+                                   ccOverride: true, cpaOverride: false, dshOverride: false,
+                                   models: ["claude-sonnet-4-5"], force: true,
+                                   appType: "claude", appTypeForced: true)
+            Prefs.shared.webdavURL = "http://127.0.0.1:\(server.port)/dav/keydrop"
+            Prefs.shared.webdavUser = "user"
+            Prefs.shared.webdavPass = "pass"
+            Prefs.shared.webdavExportPass = "passphrase-12345"
+            defer {
+                Prefs.shared.webdavURL = nil
+                Prefs.shared.webdavUser = nil
+                Prefs.shared.webdavPass = nil
+                Prefs.shared.webdavExportPass = nil
+            }
+
+            let pushMsg = try! core.webdavPush()
+            t.contains(pushMsg, "已推送", "[推送] 播报")
+            server.mgmtLock.lock()
+            let storedCount = server.davStore.count
+            let storedBody = server.davStore["/dav/keydrop/KeyDrop-ledger.keydrop"] ?? Data()
+            server.mgmtLock.unlock()
+            t.equal(storedCount, 1, "[推送] 远端存了一份快照")
+            t.expect(storedBody.contains("sk-K7777777777777".data(using: .utf8)!) == false,
+                     "[推送] 远端是密文(不含明文 key)")
+
+            // 本机删除 r1(墓碑)→ 拉取不得复活(同 id 已存在跳过,保持已删除)
+            if var e = core.history.find(idPrefix: r1.entry.id) {
+                e.status = "deleted"
+                e.deletedAt = Date().timeIntervalSince1970
+                e.targets = []
+                try! core.history.update(e)
+            }
+            let pullMsg = try! core.webdavPull(replay: false)
+            t.contains(pullMsg, "已存在跳过 1 条", "[墓碑] 本机已删除的同 id 条目不复活")
+            let still = core.history.find(idPrefix: r1.entry.id)
+            t.equal(still?.status, "deleted", "[墓碑] 保持已删除")
+        }
     }
 }

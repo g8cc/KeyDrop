@@ -1392,11 +1392,17 @@ public final class Core {
         }
 
         var added = 0, skippedExisting = 0, skippedSameKey = 0, skippedTombstone = 0
-        let localActiveKeys = Set(history.snapshot().filter { $0.status == "active" }.compactMap { $0.key })
+        let snapshotNow = history.snapshot()
+        var localActiveKeys = Set(snapshotNow.filter { $0.status == "active" }.compactMap { $0.key })
+        // 本机墓碑(已删除)条目的 key:拉取/导入不得复活本机明确删除过的凭据
+        let localTombstoneKeys = Set(snapshotNow.filter { $0.status == "deleted" }.compactMap { $0.key })
         for var e in payload.entries {
             if e.status == "deleted" { skippedTombstone += 1; continue }
             if history.find(idPrefix: e.id) != nil { skippedExisting += 1; continue }
-            if let k = e.key, !k.isEmpty, localActiveKeys.contains(k) { skippedSameKey += 1; continue }
+            if let k = e.key, !k.isEmpty {
+                if localActiveKeys.contains(k) { skippedSameKey += 1; continue }
+                if localTombstoneKeys.contains(k) { skippedTombstone += 1; continue }
+            }
             // 清来源机器的本地产物绑定:账本是可迁移的,产物绑定是机器本地的
             e.ccProviderID = nil
             e.ccRenamedFrom = nil
@@ -1406,6 +1412,8 @@ public final class Core {
             e.ccMissing = nil
             try history.append(e)
             added += 1
+            // 同批导入内的后续条目也要去重(导出文件理论上不会有重复 key,防御性兜底)
+            if let k = e.key { localActiveKeys.insert(k) }
         }
         prefs.useCC = payload.switches?.useCC ?? prefs.useCC
         prefs.useGrok = payload.switches?.useGrok ?? prefs.useGrok
@@ -1502,6 +1510,27 @@ public final class Core {
         }
         lines[0] = "产物重放: \(replayed) 个产物写入本机"
         return lines
+    }
+
+    // MARK: - WebDAV 同步(Phase 2 简化版:显式推送/拉取加密账本快照,无自建后端)
+
+    /// 推送:端到端加密导出 → PUT 覆盖 WebDAV 远端快照。配置从 prefs 读取
+    /// (URL/账号/密码/导出口令,后者仅存本机,WebDAV 服务端只见密文)。
+    public func webdavPush() throws -> String {
+        guard let cfg = WebDAVSync.Config.resolved() else {
+            throw ParseError.io(WebDAVSync.notConfiguredMessage())
+        }
+        let ledger = try exportLedger(passphrase: cfg.exportPass)
+        return try WebDAVSync.push(cfg: cfg, ledger: ledger)
+    }
+
+    /// 拉取:下载远端快照 → 按 id 合并(本机墓碑的 key 不复活)→ 产物重放。
+    @discardableResult
+    public func webdavPull(replay: Bool = true) throws -> String {
+        guard let cfg = WebDAVSync.Config.resolved() else {
+            throw ParseError.io(WebDAVSync.notConfiguredMessage())
+        }
+        return try WebDAVSync.pull(cfg: cfg, core: self, replay: replay)
     }
 
     func testEntry(entryIDPrefix: String) throws -> String {
@@ -2224,7 +2253,12 @@ public final class Core {
                     var cpaLines: [String] = []
                     if keyRotated {
                         let msg = try writer.rotateKey(baseURL: url, oldKey: previousKey, newKey: effectiveKey)
-                        if !msg.isEmpty { cpaLines.append(msg) }
+                        if !msg.isEmpty {
+                            cpaLines.append(msg)
+                        } else {
+                            // 静默跳过会让用户以为 CPA 也换了 key,旧 key 仍留在池内轮询
+                            cpaLines.append("⚠ CPA 组内未找到旧 key,轮换未应用(可能已手动处理)")
+                        }
                     }
                     if !(models ?? []).isEmpty {
                         let msg = try writer.updateAggregatedModels(baseURL: url, models: newModels)
@@ -2240,6 +2274,9 @@ public final class Core {
                 } catch {
                     lines.append("⚠ CPA 同步失败: \(error.localizedDescription)")
                 }
+            } else if keyRotated {
+                // 静默跳过会让用户以为 CPA 也换了 key,旧 key 仍留在池内轮询
+                lines.append("⚠ CPA: 未找到本机 CPA 配置,key 轮换未同步到 CPA(旧 key 仍在池内)")
             }
         }
 

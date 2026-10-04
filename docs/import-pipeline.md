@@ -336,6 +336,7 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 - **加密导出**:菜单栏「导出账本…」或 `keydrop export --out <文件> --passphrase <口令>`。文件端到端加密(PBKDF2-SHA256 60 万轮派生 + AES-256-GCM),口令丢失无法恢复。
 - **导入**:菜单栏「导入账本…」或 `keydrop import --file <文件> --passphrase <口令>`。默认自动执行产物重放;`--no-replay` 跳过。
 - **合并语义**:按 id 合并,绝不覆盖本机已有条目;本机已有同 key 的活跃条目 → 跳过(防制造重复凭据条目);已删除的条目不搬运。
+- **WebDAV 推送/拉取(v1.4.42)**:无需自建账号服务 —— 「WebDAV 同步设置…」里填坚果云等标准 WebDAV 的目录/账号/密码,即可「推送到 WebDAV」(覆盖远端加密快照)/「从 WebDAV 拉取」(按 id 合并 + 产物重放,本机墓碑的 key 不复活)。加密口令仅存本机,WebDAV 服务端只见密文;CLI: `keydrop webdav-push/webdav-pull`。
 - **双层版本化**:信封 formatVersion(加密方式变更)+ 载荷 schemaVersion(字段变更),导入端拒绝比自己新的 schema 并提示升级。
 - **产物重放幂等**:cc-switch 以「账本无本机 pid 或 pid 已不存在」为重放条件;CPA/DSH/Grok 写入器天然 upsert。重放后 cc-switch 里最后重放的条目为激活态,自行切换即可。
 

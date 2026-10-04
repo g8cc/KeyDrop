@@ -21,6 +21,11 @@ enum CLI {
         var importFile: String? = nil
         var importPass: String? = nil
         var noReplay = false
+        var davURL: String? = nil
+        var davUser: String? = nil
+        var davPass: String? = nil
+        var davExportPass: String? = nil
+        var davSave = false
         var force = false
         var appType: String? = nil
         var proxy: String? = nil
@@ -48,6 +53,15 @@ enum CLI {
             case "--passphrase":
                 if i + 1 < a.count { importPass = a[i + 1]; i += 1 }
             case "--no-replay": noReplay = true
+            case "--dav-url":
+                if i + 1 < a.count { davURL = a[i + 1]; i += 1 }
+            case "--dav-user":
+                if i + 1 < a.count { davUser = a[i + 1]; i += 1 }
+            case "--dav-pass":
+                if i + 1 < a.count { davPass = a[i + 1]; i += 1 }
+            case "--export-pass":
+                if i + 1 < a.count { davExportPass = a[i + 1]; i += 1 }
+            case "--save": davSave = true
             case "--name":
                 if i + 1 < a.count {
                     editName = a[i + 1]
@@ -334,6 +348,23 @@ enum CLI {
 
         case "proxy-pool":
             return runProxyPool(remaining)
+
+        case "webdav-push", "webdav-pull":
+            let isPush = a.first == "webdav-push"
+            if let u = davURL { Prefs.shared.webdavURL = u }
+            if let u = davUser { Prefs.shared.webdavUser = u }
+            if let p = davPass { Prefs.shared.webdavPass = p }
+            if let p = davExportPass { Prefs.shared.webdavExportPass = p }
+            if davSave { try? Prefs.shared.save() }
+            do {
+                let msg = isPush ? try Core.shared.webdavPush() : try Core.shared.webdavPull(replay: !noReplay)
+                print(msg)
+                return 0
+            } catch {
+                print("WebDAV \(isPush ? "推送" : "拉取")失败: \(error.localizedDescription)")
+                print("配置: KeyDrop webdav-push --dav-url <目录> --dav-user <账号> --dav-pass <密码> --export-pass <账本口令> [--save]")
+                return 1
+            }
 
         case "export":
             guard let out = exportOut, let pass = importPass, pass.count >= 8 else {
