@@ -1950,22 +1950,24 @@ struct PanelView: View {
                         .foregroundStyle(.secondary)
                     TextField("搜模型/名称/URL,空格分隔多个词", text: $searchText)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 11))
+                        .font(.system(size: 12))
                         .disableAutocorrection(true)
                     if !searchText.isEmpty {
                         Button {
                             searchText = ""
                         } label: {
                             Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 10))
+                                .font(.system(size: 11))
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.borderless)
                         .help("清空搜索")
                     }
                 }
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
+                .padding(.horizontal, 8)
+                // 中文方块字比拉丁字母占的行盒高,内边距太小会显得上下顶死:
+                // 用户实测 3pt 难受,加高到 6pt(总高约 26pt)
+                .padding(.vertical, 6)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color.primary.opacity(0.05))
