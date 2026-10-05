@@ -685,6 +685,10 @@ public final class Prefs {
     private var _webdavUser: String? = nil
     private var _webdavPass: String? = nil
     private var _webdavExportPass: String? = nil
+    private var _webdavAutoPull = false
+    private var _webdavAutoPush = false
+    private var _webdavLastSync: TimeInterval? = nil
+    private var _webdavLastPushFP: String? = nil
     public var webdavURL: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavURL }
         set { lock.lock(); _webdavURL = newValue; lock.unlock() }
@@ -700,6 +704,22 @@ public final class Prefs {
     public var webdavExportPass: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavExportPass }
         set { lock.lock(); _webdavExportPass = newValue; lock.unlock() }
+    }
+    public var webdavAutoPull: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavAutoPull }
+        set { lock.lock(); _webdavAutoPull = newValue; lock.unlock() }
+    }
+    public var webdavAutoPush: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavAutoPush }
+        set { lock.lock(); _webdavAutoPush = newValue; lock.unlock() }
+    }
+    public var webdavLastSync: TimeInterval? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavLastSync }
+        set { lock.lock(); _webdavLastSync = newValue; lock.unlock() }
+    }
+    public var webdavLastPushFP: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavLastPushFP }
+        set { lock.lock(); _webdavLastPushFP = newValue; lock.unlock() }
     }
 
     /// 测试隔离:TestEnv 每个环境调用一次,把全部偏好重置为默认值。
@@ -721,6 +741,10 @@ public final class Prefs {
         _webdavUser = nil
         _webdavPass = nil
         _webdavExportPass = nil
+        _webdavAutoPull = false
+        _webdavAutoPush = false
+        _webdavLastSync = nil
+        _webdavLastPushFP = nil
     }
 
     init() { load() }
@@ -745,6 +769,10 @@ public final class Prefs {
             _webdavUser = obj["webdavUser"] as? String
             _webdavPass = obj["webdavPass"] as? String
             _webdavExportPass = obj["webdavExportPass"] as? String
+            _webdavAutoPull = obj["webdavAutoPull"] as? Bool ?? false
+            _webdavAutoPush = obj["webdavAutoPush"] as? Bool ?? false
+            _webdavLastSync = obj["webdavLastSync"] as? TimeInterval
+            _webdavLastPushFP = obj["webdavLastPushFP"] as? String
         }
     }
 
@@ -797,6 +825,10 @@ public final class Prefs {
             if let v = _webdavUser, !v.isEmpty { obj["webdavUser"] = v }
             if let v = _webdavPass, !v.isEmpty { obj["webdavPass"] = v }
             if let v = _webdavExportPass, !v.isEmpty { obj["webdavExportPass"] = v }
+            obj["webdavAutoPull"] = _webdavAutoPull
+            obj["webdavAutoPush"] = _webdavAutoPush
+            if let v = _webdavLastSync { obj["webdavLastSync"] = v }
+            if let v = _webdavLastPushFP { obj["webdavLastPushFP"] = v }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true

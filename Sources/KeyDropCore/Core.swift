@@ -1379,7 +1379,7 @@ public final class Core {
     /// - 本机已有同 id → 跳过;本机 active 条目已有同 key → 跳过(防制造重复凭据条目);
     /// - 来源机器的本地产物绑定(ccProviderID/cpaConfigPath 等)清除,待本机 replayArtifacts 重建;
     /// - 目标开关按导出值应用(机器特定项:代理/CPA 路径/管理密钥不迁移)。
-    public func importLedger(_ fileData: Data, passphrase: String) throws -> String {
+    public func importLedger(_ fileData: Data, passphrase: String, mode: LedgerImportMode = .migrate) throws -> String {
         let rawPayload = try LedgerCrypto.open(fileData, passphrase: passphrase)
         let payload: LedgerPayload
         do {
@@ -1390,14 +1390,84 @@ public final class Core {
         guard payload.schemaVersion <= LedgerCrypto.currentSchemaVersion else {
             throw LedgerTransferError.schemaTooNew(payload.schemaVersion)
         }
+        return try importPayload(payload, mode: mode)
+    }
 
+    /// 载荷导入:.migrate = 一次性迁移(已存在跳过,目标开关按导出值应用);
+    /// .feed = 订阅同步(同 id 按 updatedAt LWW,维护者墓碑向订阅者传播,
+    /// 本机较新的条目保留,目标开关不动 —— 订阅者自己的偏好自主)
+    func importPayload(_ payload: LedgerPayload, mode: LedgerImportMode) throws -> String {
         var added = 0, skippedExisting = 0, skippedSameKey = 0, skippedTombstone = 0
+        var updatedFromFeed = 0, skippedLocalNewer = 0, tombstonePropagated = 0
         let snapshotNow = history.snapshot()
         var localActiveKeys = Set(snapshotNow.filter { $0.status == "active" }.compactMap { $0.key })
         // 本机墓碑(已删除)条目的 key:拉取/导入不得复活本机明确删除过的凭据
         let localTombstoneKeys = Set(snapshotNow.filter { $0.status == "deleted" }.compactMap { $0.key })
+        var feedChanged: [HistoryEntry] = []
         for var e in payload.entries {
-            if e.status == "deleted" { skippedTombstone += 1; continue }
+            let local = history.find(idPrefix: e.id)
+            if e.status == "deleted" {
+                // 墓碑:.feed 模式下维护者的删除向订阅者传播(本地较新则保留)
+                if mode == .feed, let local, local.status == "active",
+                   (local.updatedAt ?? 0) < (e.deletedAt ?? Date.distantFuture.timeIntervalSince1970) {
+                    var t = local
+                    t.status = "deleted"
+                    t.deletedAt = e.deletedAt ?? Date().timeIntervalSince1970
+                    t.updatedAt = Date().timeIntervalSince1970
+                    t.targets = []
+                    feedChanged.append(t)
+                    tombstonePropagated += 1
+                } else {
+                    skippedTombstone += 1
+                }
+                continue
+            }
+            if mode == .feed, let local {
+                // LWW:维护者版本较新 → 整条以维护者为准,但保留本机的产物绑定
+                // (ccProviderID 是订阅者本机的行,维护者的 pid 对订阅者无意义);
+                // 本机产物同步:cc 行内容更新 / CPA 组内旧 key 换新 / DSH upsert / grok sync
+                let localTS = local.updatedAt ?? 0
+                let remoteTS = e.updatedAt ?? 0
+                if remoteTS > localTS {
+                    if let oldPid = local.ccProviderID, let oldKey = local.key, !oldKey.isEmpty,
+                       let newKey = e.key, !newKey.isEmpty, oldKey != newKey,
+                       let cfg = prefs.resolvedCPAConfig() {
+                        try? CPAWriter(configPath: cfg).rotateKey(baseURL: local.url ?? e.url ?? "", oldKey: oldKey, newKey: newKey)
+                    }
+                    if let pid = local.ccProviderID {
+                        let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                            .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                        var p = ParsedKey()
+                        p.url = e.url
+                        p.key = e.key
+                        p.model = e.models?.first
+                        p.name = e.name
+                        try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: oldApp,
+                                                       models: e.models ?? local.models ?? [],
+                                                       proxy: proxyForHealth())
+                    }
+                    if e.targets.contains("dsh"), let dk = e.key, !dk.isEmpty, let dURL = e.url {
+                        try? DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: e.models ?? [])
+                    }
+                    if e.targets.contains("grok"), let gp = local.grokConfigPath,
+                       let gk = e.key, let gURL = e.url {
+                        try? GrokBuildWriter(configPath: gp).sync(baseURL: gURL, key: gk,
+                                                                  models: e.models ?? [], removing: [])
+                    }
+                    var merged = e
+                    merged.ccProviderID = local.ccProviderID
+                    merged.ccRenamedFrom = local.ccRenamedFrom
+                    merged.ccRenamedTo = local.ccRenamedTo
+                    merged.cpaConfigPath = local.cpaConfigPath
+                    merged.grokConfigPath = local.grokConfigPath
+                    merged.updatedAt = Date().timeIntervalSince1970
+                    feedChanged.append(merged)
+                    updatedFromFeed += 1
+                } else {
+                    skippedLocalNewer += 1
+                }
+                continue
+            }
             if history.find(idPrefix: e.id) != nil { skippedExisting += 1; continue }
             if let k = e.key, !k.isEmpty {
                 if localActiveKeys.contains(k) { skippedSameKey += 1; continue }
@@ -1415,12 +1485,22 @@ public final class Core {
             // 同批导入内的后续条目也要去重(导出文件理论上不会有重复 key,防御性兜底)
             if let k = e.key { localActiveKeys.insert(k) }
         }
-        prefs.useCC = payload.switches?.useCC ?? prefs.useCC
-        prefs.useGrok = payload.switches?.useGrok ?? prefs.useGrok
-        prefs.useCPA = payload.switches?.useCPA ?? prefs.useCPA
-        prefs.useDSH = payload.switches?.useDSH ?? prefs.useDSH
-        prefs.cpaResident = payload.switches?.cpaResident ?? prefs.cpaResident
-        try prefs.save()
+        // feed 模式的 LWW 替换条目整批落盘(含维护者墓碑传播);开关仅 migrate 应用
+        // (订阅者自己的偏好自主,不被维护者的导出覆盖)
+        if mode == .feed, !feedChanged.isEmpty {
+            try history.updateAll(feedChanged)
+        }
+        if mode == .migrate {
+            prefs.useCC = payload.switches?.useCC ?? prefs.useCC
+            prefs.useGrok = payload.switches?.useGrok ?? prefs.useGrok
+            prefs.useCPA = payload.switches?.useCPA ?? prefs.useCPA
+            prefs.useDSH = payload.switches?.useDSH ?? prefs.useDSH
+            prefs.cpaResident = payload.switches?.cpaResident ?? prefs.cpaResident
+            try prefs.save()
+        }
+        if mode == .feed {
+            return "同步: 新增 \(added) 条,更新 \(updatedFromFeed) 条,本机较新保留 \(skippedLocalNewer) 条,墓碑传播 \(tombstonePropagated) 条,已删除跳过 \(skippedTombstone) 条"
+        }
         return "导入: 新增 \(added) 条,已存在跳过 \(skippedExisting) 条,同 key 跳过 \(skippedSameKey) 条,已删除跳过 \(skippedTombstone) 条;目标开关已按导出值应用。跑「产物重放」把各工具的配置在本机重建。"
     }
 
@@ -1527,25 +1607,41 @@ public final class Core {
         return missing
     }
 
-    public func webdavPush() throws -> String {
+    public func webdavPush(force: Bool = true) throws -> String {
         let missing = webdavMissingFields()
         guard missing.isEmpty else {
             throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
         }
         let cfg = WebDAVSync.Config.resolved()!
         let ledger = try exportLedger(passphrase: cfg.exportPass)
-        return try WebDAVSync.push(cfg: cfg, ledger: ledger)
+        // 指纹去重:自动推送只在账本内容真实变化时触发(探测点/健康不在指纹内)
+        let fp = LedgerCrypto.ledgerFingerprint(history.snapshot())
+        if !force, fp == prefs.webdavLastPushFP {
+            return "WebDAV: 账本无变更,跳过推送"
+        }
+        let msg = try WebDAVSync.push(cfg: cfg, ledger: ledger)
+        prefs.webdavLastPushFP = fp
+        try? prefs.save()
+        return msg
     }
 
     /// 拉取:下载远端快照 → 按 id 合并(本机墓碑的 key 不复活)→ 产物重放。
     @discardableResult
-    public func webdavPull(replay: Bool = true) throws -> String {
+    public func webdavPull(replay: Bool = true, onlyIfNewer: Bool = false) throws -> String {
         let missing = webdavMissingFields()
         guard missing.isEmpty else {
             throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
         }
         let cfg = WebDAVSync.Config.resolved()!
-        return try WebDAVSync.pull(cfg: cfg, core: self, replay: replay)
+        let payload = try WebDAVSync.fetchSnapshot(cfg: cfg)
+        if onlyIfNewer, let last = prefs.webdavLastSync, payload.exportedAt <= last {
+            return "WebDAV: 远端无更新,跳过拉取"
+        }
+        var lines = [try importPayload(payload, mode: .feed)]
+        prefs.webdavLastSync = payload.exportedAt
+        try? prefs.save()
+        if replay { lines.append(contentsOf: replayArtifacts()) }
+        return lines.joined(separator: "\n")
     }
 
     func testEntry(entryIDPrefix: String) throws -> String {

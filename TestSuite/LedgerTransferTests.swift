@@ -183,7 +183,7 @@ enum LedgerTransferTests {
                 try! core.history.update(e)
             }
             let pullMsg = try! core.webdavPull(replay: false)
-            t.contains(pullMsg, "已存在跳过 1 条", "[墓碑] 本机已删除的同 id 条目不复活")
+            t.contains(pullMsg, "本机较新保留 1 条", "[墓碑] 本机删除的 key 不复活(较新保留)")
             let still = core.history.find(idPrefix: r1.entry.id)
             t.equal(still?.status, "deleted", "[墓碑] 保持已删除")
         }

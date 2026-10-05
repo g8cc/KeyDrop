@@ -7,6 +7,7 @@ final class AppState: ObservableObject {
     deinit {
         // 卫生清理:timer 不 invalidate 会留在 runloop 空转;task 不 cancel 会延迟触发 weak no-op
         healthTimer?.invalidate()
+        webdavTimer?.invalidate()
         statusClearTask?.cancel()
     }
 
@@ -63,8 +64,10 @@ final class AppState: ObservableObject {
     @Published var editNameText = ""
     @Published var editKeyText = ""
     @Published var editNoteText = ""
+    @Published var syncing = false
     private var statusClearTask: DispatchWorkItem?
     private var healthTimer: Timer?
+    private var webdavTimer: Timer?
 
     let core = Core.shared
 
@@ -76,6 +79,14 @@ final class AppState: ObservableObject {
         proxyText = Prefs.shared.proxy
         cpaAPIKeyInput = Prefs.shared.cpaManagementKey ?? ""
         cpaAPIBaseInput = Prefs.shared.cpaAPIBase ?? ""
+        // WebDAV 自动同步定时器(每 30 分钟 + 启动后 15 秒各一轮;
+        // 推送/拉取开关各自控制是否实际动作,见 webdavAutoSyncTick)
+        webdavTimer = Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in
+            self?.webdavAutoSyncTick()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            self?.webdavAutoSyncTick()
+        }
     }
 
     func doAdd() {
@@ -598,6 +609,37 @@ final class AppState: ObservableObject {
     private var healthScanRunning = false
     /// 上次提醒过的未绑定账号数:数量不变就不重复记日志,变了(新增/绑完)才再提醒
     static var lastLoggedUnboundCount: Int = -1
+    /// WebDAV 自动同步 tick(每 30 分钟 + 启动后 15 秒):
+    /// 自动拉取(订阅端)= 远端快照更新时按 feed 语义合并 + 产物重放;
+    /// 自动推送(维护端)= 账本内容指纹变化时覆盖远端快照。
+    /// 设置面板打开或正在同步时不跑(用户正在编辑字段);网络失败只落日志。
+    func webdavAutoSyncTick() {
+        guard !settingsShown, !isBusy, !syncing else { return }
+        let p = Prefs.shared
+        guard let url = p.webdavURL, !url.isEmpty, let user = p.webdavUser, !user.isEmpty,
+              let pass = p.webdavPass, !pass.isEmpty, let ep = p.webdavExportPass, !ep.isEmpty else { return }
+        let autoPull = p.webdavAutoPull
+        let autoPush = p.webdavAutoPush
+        guard autoPull || autoPush else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            do {
+                if autoPull {
+                    let msg = try Core.shared.webdavPull(replay: true, onlyIfNewer: true)
+                    if !msg.contains("无更新") {
+                        AppLog.info("WebDAV 自动拉取: \(msg)")
+                        self?.notify(summary: "WebDAV 已同步", body: msg)
+                    }
+                }
+                if autoPush {
+                    let msg = try Core.shared.webdavPush(force: false)
+                    if !msg.contains("无变更") { AppLog.info("WebDAV 自动推送: \(msg)") }
+                }
+            } catch {
+                AppLog.error("WebDAV 自动同步失败: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func scanHealth() {
         if let last = lastHealthScanAt, Date().timeIntervalSince(last) < 600 { return }
         guard !healthScanRunning else { return }
@@ -2711,6 +2753,18 @@ struct SettingsSheet: View {
                     .textFieldStyle(.roundedBorder).font(.system(size: 11))
             }
             Text("口令仅存本机;WebDAV 服务端只见密文。兼容坚果云等标准 WebDAV。")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            Toggle("自动拉取(订阅端:远端有更新时自动合并+产物重放)", isOn: Binding(
+                get: { Prefs.shared.webdavAutoPull },
+                set: { Prefs.shared.webdavAutoPull = $0; try? Prefs.shared.save() }
+            ))
+            .toggleStyle(.checkbox)
+            Toggle("自动推送(维护端:账本内容变化时自动覆盖远端)", isOn: Binding(
+                get: { Prefs.shared.webdavAutoPush },
+                set: { Prefs.shared.webdavAutoPush = $0; try? Prefs.shared.save() }
+            ))
+            .toggleStyle(.checkbox)
+            Text("口径:共享发起者只开自动推送,接收者只开自动拉取 —— 单向 feed,不会互相覆盖。")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
             HStack(spacing: 8) {
                 Button("保存设置") { saveWebDAV() }

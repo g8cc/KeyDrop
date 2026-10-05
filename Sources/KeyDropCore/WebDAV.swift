@@ -63,6 +63,16 @@ enum WebDAVSync {
         return (code, payload)
     }
 
+    /// 拉取远端快照并解密解码(GET → 信封解密 → LedgerPayload)
+    static func fetchSnapshot(cfg: Config) throws -> LedgerPayload {
+        let (code, data) = try request("GET", fileURL(cfg.base), cfg: cfg)
+        guard code == 200, !data.isEmpty else {
+            throw LedgerTransferError.badEnvelope("WebDAV 拉取失败: HTTP \(code)(远端还没有快照?)")
+        }
+        let payloadBytes = try LedgerCrypto.open(data, passphrase: cfg.exportPass)
+        return try JSONDecoder().decode(LedgerPayload.self, from: payloadBytes)
+    }
+
     /// 推送:端到端加密导出 → PUT 覆盖远端快照。目录不存在时自动 MKCOL 一次。
     public static func push(cfg: Config, ledger: Data) throws -> String {
         let fileURL = fileURL(cfg.base)
@@ -78,18 +88,5 @@ enum WebDAVSync {
         return "已推送加密账本到 WebDAV(\(ledger.count) 字节,服务端只见密文)"
     }
 
-    /// 拉取:下载远端快照 → importLedger 按 id 合并(绝不覆盖本机已有条目,
-    /// 本机墓碑的 key 不复活)→ 产物重放把新补入的条目在本机重建。
-    public static func pull(cfg: Config, core: Core, replay: Bool = true) throws -> String {
-        let (code, data) = try request("GET", fileURL(cfg.base), cfg: cfg)
-        guard code == 200, !data.isEmpty else {
-            throw LedgerTransferError.badEnvelope("WebDAV 拉取失败: HTTP \(code)(远端还没有快照?)")
-        }
-        let msg = try core.importLedger(data, passphrase: cfg.exportPass)
-        var lines = [msg]
-        if replay {
-            lines.append(contentsOf: core.replayArtifacts())
-        }
-        return lines.joined(separator: "\n")
-    }
+
 }

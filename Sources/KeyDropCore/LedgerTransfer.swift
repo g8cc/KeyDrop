@@ -50,6 +50,13 @@ public struct LedgerPayload: Codable {
     }
 }
 
+/// 导入语义:.migrate = 一次性迁移(已存在跳过);.feed = 订阅同步(同 id 按
+/// updatedAt LWW,维护者的墓碑向订阅者传播)
+public enum LedgerImportMode {
+    case migrate
+    case feed
+}
+
 public enum LedgerTransferError: LocalizedError {
     case badPassphrase
     case badEnvelope(String)
@@ -90,6 +97,16 @@ public enum LedgerCrypto {
         }
         precondition(status == kCCSuccess, "PBKDF2 派生失败")
         return SymmetricKey(data: out)
+    }
+
+    /// 账本变更指纹:内容(id/key/url/status/models/name/note)哈希。
+    /// 探测点/健康等高频变化不参与 —— 自动推送只在真实内容变化时触发。
+    public static func ledgerFingerprint(_ entries: [HistoryEntry]) -> String {
+        let joined = entries
+            .sorted { $0.id < $1.id }
+            .map { "\($0.id)|\($0.key ?? "")|\($0.url ?? "")|\($0.status)|\($0.models?.joined(separator: ",") ?? "")|\($0.name ?? "")|\($0.note ?? "")" }
+            .joined(separator: "\n")
+        return SHA256.hash(data: Data(joined.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
     /// 加密账本载荷 → 导出文件字节(JSON 信封)。口令不足 8 位拒绝。
