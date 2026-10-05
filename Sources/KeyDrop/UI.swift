@@ -2702,13 +2702,13 @@ struct SettingsSheet: View {
             }
             HStack {
                 Text("密码(应用密码)").font(.system(size: 11)).frame(width: 80, alignment: .trailing)
-                NSSecureTextFieldRepresentable(text: $davPass)
-                    .frame(height: 22)
+                SecureField("粘贴坚果云应用密码", text: $davPass)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11))
             }
             HStack {
                 Text("加密口令(≥8 位)").font(.system(size: 11)).frame(width: 80, alignment: .trailing)
-                NSSecureTextFieldRepresentable(text: $davExportPass)
-                    .frame(height: 22)
+                SecureField("自己定一个,两台机器一致", text: $davExportPass)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11))
             }
             Text("口令仅存本机;WebDAV 服务端只见密文。兼容坚果云等标准 WebDAV。")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
@@ -2733,8 +2733,14 @@ struct SettingsSheet: View {
         guard url.lowercased().hasPrefix("http://") || url.lowercased().hasPrefix("https://") else {
             davStatus = "⚠ 目录 URL 必须以 http(s):// 开头"; return
         }
+        guard !davUser.trimmingCharacters(in: .whitespaces).isEmpty else {
+            davStatus = "⚠ 账号未填写(坚果云注册邮箱)"; return
+        }
+        guard !davPass.isEmpty else {
+            davStatus = "⚠ 应用密码未填写(坚果云网页版安全选项里生成)"; return
+        }
         guard davExportPass.count >= 8 else {
-            davStatus = "⚠ 加密口令至少 8 位"; return
+            davStatus = "⚠ 加密口令至少 8 位(自己定,两台机器一致)"; return
         }
         Prefs.shared.webdavURL = url
         Prefs.shared.webdavUser = davUser.trimmingCharacters(in: .whitespaces)
@@ -2769,29 +2775,3 @@ struct SettingsSheet: View {
     }
 }
 
-/// NSSecureTextField 的 SwiftUI 包装(WebDAV 密码/口令输入用)
-struct NSSecureTextFieldRepresentable: NSViewRepresentable {
-    @Binding var text: String
-
-    func makeNSView(context: Context) -> NSSecureTextField {
-        let f = NSSecureTextField()
-        f.font = NSFont.systemFont(ofSize: 11)
-        f.delegate = context.coordinator
-        return f
-    }
-
-    func updateNSView(_ field: NSSecureTextField, context: Context) {
-        if field.stringValue != text { field.stringValue = text }
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator(self) }
-
-    final class Coordinator: NSObject, NSTextFieldDelegate {
-        var parent: NSSecureTextFieldRepresentable
-        init(_ parent: NSSecureTextFieldRepresentable) { self.parent = parent }
-        func controlTextDidChange(_ notification: Notification) {
-            guard let f = notification.object as? NSTextField else { return }
-            parent.text = f.stringValue
-        }
-    }
-}

@@ -1516,10 +1516,23 @@ public final class Core {
 
     /// 推送:端到端加密导出 → PUT 覆盖 WebDAV 远端快照。配置从 prefs 读取
     /// (URL/账号/密码/导出口令,后者仅存本机,WebDAV 服务端只见密文)。
+    /// 校验 WebDAV 四项配置,缺一报出具体缺什么(用户排障友好)
+    private func webdavMissingFields() -> [String] {
+        let p = Prefs.shared
+        var missing: [String] = []
+        if (p.webdavURL ?? "").isEmpty { missing.append("目录 URL") }
+        if (p.webdavUser ?? "").isEmpty { missing.append("账号") }
+        if (p.webdavPass ?? "").isEmpty { missing.append("密码") }
+        if (p.webdavExportPass ?? "").isEmpty { missing.append("加密口令") }
+        return missing
+    }
+
     public func webdavPush() throws -> String {
-        guard let cfg = WebDAVSync.Config.resolved() else {
-            throw ParseError.io(WebDAVSync.notConfiguredMessage())
+        let missing = webdavMissingFields()
+        guard missing.isEmpty else {
+            throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
         }
+        let cfg = WebDAVSync.Config.resolved()!
         let ledger = try exportLedger(passphrase: cfg.exportPass)
         return try WebDAVSync.push(cfg: cfg, ledger: ledger)
     }
@@ -1527,9 +1540,11 @@ public final class Core {
     /// 拉取:下载远端快照 → 按 id 合并(本机墓碑的 key 不复活)→ 产物重放。
     @discardableResult
     public func webdavPull(replay: Bool = true) throws -> String {
-        guard let cfg = WebDAVSync.Config.resolved() else {
-            throw ParseError.io(WebDAVSync.notConfiguredMessage())
+        let missing = webdavMissingFields()
+        guard missing.isEmpty else {
+            throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
         }
+        let cfg = WebDAVSync.Config.resolved()!
         return try WebDAVSync.pull(cfg: cfg, core: self, replay: replay)
     }
 

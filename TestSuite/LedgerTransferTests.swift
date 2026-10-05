@@ -120,6 +120,27 @@ enum LedgerTransferTests {
             t.contains(lines2.joined(separator: "\n"), "本机已有", "[幂等] 跳过原因可见")
         }
 
+        h.runSuite("WebDAV.缺字段报错指明缺什么") { t in
+            let env = try! TestEnv("webdav-missing")
+            defer { env.cleanup() }
+            let core = Core()
+            Prefs.shared.webdavURL = "https://dav.example.com/dav/keydrop"
+            Prefs.shared.webdavUser = "user@example.com"
+            // 密码留空,只配其余三项
+            defer {
+                Prefs.shared.webdavURL = nil
+                Prefs.shared.webdavUser = nil
+                Prefs.shared.webdavPass = nil
+                Prefs.shared.webdavExportPass = nil
+            }
+            do {
+                _ = try core.webdavPush()
+                t.expect(false, "缺密码应报错")
+            } catch {
+                t.contains(error.localizedDescription, "密码", "报错指明缺密码")
+            }
+        }
+
         h.runSuite("WebDAV.推送拉取回环") { t in
             guard let server = try? MockHTTPServer(mode: .webdav) else {
                 t.expect(false, "mock 启动失败")
