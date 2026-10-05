@@ -56,6 +56,7 @@ final class AppState: ObservableObject {
     }
     @Published var updateState: Updater.State = .idle
     @Published var updateSheetShown = false
+    @Published var settingsShown = false
     @Published var editShown = false
     @Published var editTarget: HistoryEntry?
     @Published var editModelsText = ""
@@ -1658,6 +1659,9 @@ struct PanelView: View {
         .sheet(isPresented: $state.editShown) {
             EditView(state: state)
         }
+        .sheet(isPresented: $state.settingsShown) {
+            SettingsSheet(state: state)
+        }
         .overlay(alignment: .top) {
             if let toastText {
                 Text(toastText)
@@ -1762,6 +1766,15 @@ struct PanelView: View {
                 }
                 .help("本地代理,如 http://127.0.0.1:7890;留空则自动探测本机代理(直连失败时补测,连通后自动填入此框)")
                 updateIndicator
+                Button {
+                    state.settingsShown = true
+                } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help("设置:开机自启 / 检查更新 / 账本迁移(导出/导入) / WebDAV 同步")
             }
         }
         .padding(.horizontal, 14)
@@ -2625,5 +2638,160 @@ struct CPAAPISheet: View {
         }
         .padding(16)
         .frame(width: 400)
+    }
+}
+
+/// 设置面板:把右键菜单里"藏着的"能力全部收进界面(用户反馈:一般人找不到入口)。
+/// 分三组:通用(开机自启/检查更新) / 账本迁移(导出/导入,走 AppDelegate 既有流程) /
+/// WebDAV 同步(URL/账号/密码/加密口令 + 推送/拉取)。
+struct SettingsSheet: View {
+    let state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var loginOn = AppDelegateRef.shared?.loginEnabled() ?? false
+    @State private var davURL = Prefs.shared.webdavURL ?? ""
+    @State private var davUser = Prefs.shared.webdavUser ?? ""
+    @State private var davPass = Prefs.shared.webdavPass ?? ""
+    @State private var davExportPass = Prefs.shared.webdavExportPass ?? ""
+    @State private var davStatus = ""
+    @State private var syncing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("设置").font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Button("完成") { dismiss() }
+                    .buttonStyle(.bordered).controlSize(.small)
+            }
+
+            Text("通用").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            Toggle("开机自启", isOn: Binding(
+                get: { AppDelegateRef.shared?.loginEnabled() ?? false },
+                set: { _ in AppDelegateRef.shared?.toggleLogin() }
+            ))
+            .toggleStyle(.checkbox)
+            Button("检查更新…") {
+                Updater.shared.checkForUpdates(force: true)
+                davStatus = "已发起检查更新,结果见菜单栏"
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+
+            Divider()
+
+            Text("账本迁移(换机器用)").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button("导出账本…") { AppDelegateRef.shared?.exportLedgerAction() }
+                Button("导入账本…") { AppDelegateRef.shared?.importLedgerAction() }
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            Text("导出为端到端加密文件;导入按 id 合并并自动产物重放(本机已有条目不覆盖)")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+
+            Divider()
+
+            Text("WebDAV 同步").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            HStack {
+                Text("目录 URL").font(.system(size: 11)).frame(width: 80, alignment: .trailing)
+                TextField("https://dav.jianguoyun.com/dav/keydrop", text: $davURL)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11))
+            }
+            HStack {
+                Text("账号").font(.system(size: 11)).frame(width: 80, alignment: .trailing)
+                TextField("user@example.com", text: $davUser)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11))
+            }
+            HStack {
+                Text("密码(应用密码)").font(.system(size: 11)).frame(width: 80, alignment: .trailing)
+                NSSecureTextFieldRepresentable(text: $davPass)
+                    .frame(height: 22)
+            }
+            HStack {
+                Text("加密口令(≥8 位)").font(.system(size: 11)).frame(width: 80, alignment: .trailing)
+                NSSecureTextFieldRepresentable(text: $davExportPass)
+                    .frame(height: 22)
+            }
+            Text("口令仅存本机;WebDAV 服务端只见密文。兼容坚果云等标准 WebDAV。")
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                Button("保存设置") { saveWebDAV() }
+                Button("推送到 WebDAV") { sync(push: true) }
+                Button("从 WebDAV 拉取") { sync(push: false) }
+                    .disabled(syncing)
+                if syncing { ProgressView().controlSize(.mini) }
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+            if !davStatus.isEmpty {
+                Text(davStatus).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(18)
+        .frame(width: 470)
+    }
+
+    private func saveWebDAV() {
+        let url = davURL.trimmingCharacters(in: .whitespaces)
+        guard url.lowercased().hasPrefix("http://") || url.lowercased().hasPrefix("https://") else {
+            davStatus = "⚠ 目录 URL 必须以 http(s):// 开头"; return
+        }
+        guard davExportPass.count >= 8 else {
+            davStatus = "⚠ 加密口令至少 8 位"; return
+        }
+        Prefs.shared.webdavURL = url
+        Prefs.shared.webdavUser = davUser.trimmingCharacters(in: .whitespaces)
+        Prefs.shared.webdavPass = davPass
+        Prefs.shared.webdavExportPass = davExportPass
+        try? Prefs.shared.save()
+        davStatus = "✓ WebDAV 设置已保存"
+    }
+
+    private func sync(push: Bool) {
+        guard davURL.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("http") else {
+            davStatus = "⚠ 请先填写并保存 WebDAV 目录 URL"; return
+        }
+        guard davExportPass.count >= 8 else {
+            davStatus = "⚠ 请先设置加密口令(≥8 位)并保存"; return
+        }
+        saveWebDAV()
+        syncing = true
+        davStatus = push ? "推送中…" : "拉取中…"
+        Task.detached(priority: .userInitiated) {
+            let msg: String
+            do {
+                msg = push ? try Core.shared.webdavPush() : try Core.shared.webdavPull()
+            } catch {
+                msg = "✗ \(error.localizedDescription)"
+            }
+            DispatchQueue.main.async {
+                davStatus = msg
+                syncing = false
+            }
+        }
+    }
+}
+
+/// NSSecureTextField 的 SwiftUI 包装(WebDAV 密码/口令输入用)
+struct NSSecureTextFieldRepresentable: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeNSView(context: Context) -> NSSecureTextField {
+        let f = NSSecureTextField()
+        f.font = NSFont.systemFont(ofSize: 11)
+        f.delegate = context.coordinator
+        return f
+    }
+
+    func updateNSView(_ field: NSSecureTextField, context: Context) {
+        if field.stringValue != text { field.stringValue = text }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: NSSecureTextFieldRepresentable
+        init(_ parent: NSSecureTextFieldRepresentable) { self.parent = parent }
+        func controlTextDidChange(_ notification: Notification) {
+            guard let f = notification.object as? NSTextField else { return }
+            parent.text = f.stringValue
+        }
     }
 }

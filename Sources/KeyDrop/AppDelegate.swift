@@ -395,7 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @objc private func exportLedgerAction() {
+    @objc func exportLedgerAction() {
         guard let pass = promptPassphrase(confirm: true, title: "导出账本:设置口令") else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = "KeyDrop-export-\(Int(Date().timeIntervalSince1970)).keydrop"
@@ -413,7 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @objc private func importLedgerAction() {
+    @objc func importLedgerAction() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
@@ -439,7 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - WebDAV 同步(Phase 2 简化版:显式推送/拉取加密账本快照)
 
     /// 4 字段表单(URL/账号/密码/加密口令)→ 存本机 prefs(0600,不上传)
-    @objc private func webdavSettingsAction() {
+    @objc func webdavSettingsAction() {
         let alert = NSAlert()
         alert.messageText = "WebDAV 同步设置"
         alert.informativeText = "推送/拉取的是端到端加密账本(加密口令仅存本机,WebDAV 服务端只见密文)。兼容坚果云等标准 WebDAV。"
@@ -491,7 +491,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AppLog.info("WebDAV 同步设置已保存")
     }
 
-    @objc private func webdavPushAction() {
+    @objc func webdavPushAction() {
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let msg = try Core.shared.webdavPush()
@@ -503,7 +503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @objc private func webdavPullAction() {
+    @objc func webdavPullAction() {
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let msg = try Core.shared.webdavPull()
