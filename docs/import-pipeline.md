@@ -343,6 +343,9 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 - **导入**:菜单栏「导入账本…」或 `keydrop import --file <文件> --passphrase <口令>`。默认自动执行产物重放;`--no-replay` 跳过。
 - **合并语义**:按 id 合并,绝不覆盖本机已有条目;本机已有同 key 的活跃条目 → 跳过(防制造重复凭据条目);已删除的条目不搬运。
 - **WebDAV 推送/拉取(v1.4.42)**:无需自建账号服务 —— 「WebDAV 同步设置…」里填坚果云等标准 WebDAV 的目录/账号/密码,即可「推送到 WebDAV」(覆盖远端加密快照)/「从 WebDAV 拉取」(按 id 合并 + 产物重放,本机墓碑的 key 不复活)。加密口令仅存本机,WebDAV 服务端只见密文;CLI: `keydrop webdav-push/webdav-pull`。
+- **Windows 机器(v1.4.47 起)**:坚果云客户端会把加密快照同步到 Windows 本机,配套脚本
+  `Scripts/windows/keydrop-sync.ps1`(PowerShell 7+)解密并更新 Windows 侧 Claude Code 配置;
+  详情见脚本头部说明(需 `winget install Microsoft.PowerShell`)。
 - **自动同步(v1.4.47)**:订阅端开「自动拉取」(每 30 分钟+启动时,远端快照更新才动作);维护端开「自动推送」(账本内容指纹变化才推,健康/探测等高频字段不触发)。拉取按条目 updatedAt LWW 合并 —— 维护者轮换 key/改模型/删条目都会自动传播到订阅者,本机较新的条目保留;目标开关不受维护者导出影响(订阅者偏好自主)。
 - 条目带 `updatedAt`(追加/编辑/刷新/探测自动盖章),为多设备 LWW 同步预留。
 - **双层版本化**:信封 formatVersion(加密方式变更)+ 载荷 schemaVersion(字段变更),导入端拒绝比自己新的 schema 并提示升级。
