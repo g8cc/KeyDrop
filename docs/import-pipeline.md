@@ -273,6 +273,7 @@ API 模式的零触碰覆盖**读路径**:endpointInfo(端口+客户端 key,供�
 - 模型:逐个 chat 验证(慢响应模型可用 `--no-verify`),同步 cc-switch/**CPA(与刷新同口径整替)**/DSH/Grok
 - **key 轮换(v1.4.38)**:站方轮换 key 的高频场景 —— 新 key 先完整实测(失败整体拒绝),通过后 cc-switch 凭据/CPA 组内原位替换/DSH credentials/Grok 段 key/账本 全产物机械替换;CPA 配置缺失或组内无旧 key 时明确告警(v1.4.42)
 - 备注:纯账本字段;名称同步 cc-switch provider 名
+- **验证/探测结果入档(v1.4.48)**:编辑的逐模型验证、导入时的完整探测都会写入模型级监控点 —— 新条目/新加模型不再是灰格,失败也记红格(此前只有刷新写点)。
 
 ### 删除
 逆序清理所有产物:cc-switch provider → Grok 段 → CPA key → DSH route+凭据 → live 回退(防陈旧配置复活)。tag 只在产物删成功后摘除。
