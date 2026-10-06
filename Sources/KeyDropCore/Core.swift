@@ -240,6 +240,9 @@ public final class Core {
         var chatVerifiedModels: Set<String> = []
         var addHealth: (health: String, detail: String)? = nil
         var probedNeedsProxy = false
+        // 导入时的完整探测结果:落监控用的模型级探测点(此前只有刷新写点,
+        // 新导入条目的模型在监控里全灰到第一次扫描/刷新)
+        var probedTest: APITestResult? = nil
         if !force {
             // 必须带上解析出的模型做优先探测。真实事故(vyceai, 2026-09-23):粘贴块里
             // 带了模型 deepseek-v4.1,但这里没传 preferredModel,探测按站点目录轮换,
@@ -248,6 +251,7 @@ public final class Core {
             // 三处调用,唯独漏了导入这条路径。
             let test = APITester.test(url: url, key: key, proxy: proxyURL,
                                       preferredModel: parsed.model, importedModels: parsed.models)
+            probedTest = test
             let hasProxy = proxyURL?.isEmpty == false
             var explicitSelectedModels: [String]? = nil
             var explicitCanRescue = false
@@ -752,6 +756,27 @@ public final class Core {
             } catch {
                 lines.append("⚠ 历史/偏好保存失败: \(error.localizedDescription)")
                 lines.append("  (cc-switch 已写入,但 KeyDrop 历史缺失,删除时无法自动还原)")
+            }
+        }
+
+        // 模型级探测点入档:导入时的探测/验证结果直接喂监控(此前只有刷新写点,
+        // 新导入条目的模型在监控里全灰到第一次扫描/刷新)
+        var importPoints: [String: ProbePoint] = [:]
+        if let t = probedTest {
+            let lat = t.modelLatencies ?? [:]
+            let now = Date().timeIntervalSince1970
+            for m in t.workingModels { importPoints[m] = ProbePoint(t: now, ms: lat[m], ok: true) }
+            for m in t.quotaModels { importPoints[m] = ProbePoint(t: now, ms: lat[m], ok: false) }
+        }
+        for m in chatVerifiedModels where importPoints[m] == nil {
+            // 显式要求且不在站点目录里的模型(逐个 chat 验证过的)也记 ok 点
+            importPoints[m] = ProbePoint(t: Date().timeIntervalSince1970, ms: nil, ok: true)
+        }
+        if !importPoints.isEmpty, entry.status == "active" {
+            do {
+                try history.appendModelProbePoints(id: entry.id, points: importPoints)
+            } catch {
+                AppLog.warn("模型探测点写入失败: \(error.localizedDescription)")
             }
         }
 
@@ -2182,9 +2207,15 @@ public final class Core {
             lines.append("✓ key 已轮换: \(entry.keyMasked)")
         }
 
+        // 模型级探测点入档容器(函数级:models 块与 key 轮换块共用)
+        var editModelPoints: [String: ProbePoint] = [:]
+        let editProbeNow = Date().timeIntervalSince1970
+
         if let models, !models.isEmpty {
             var verified: [String] = []
             var failures: [String] = []
+            // 验证结果入档为模型级探测点(此前编辑路径不写点,新加的模型在监控里
+            // 全灰到下一次扫描;失败也记红格——监控如实记录失败轨迹)
             let verifyProxy = proxyForHealth()
             for m in models {
                 if verify {
@@ -2196,8 +2227,10 @@ public final class Core {
                     }
                     if check.ok {
                         verified.append(m)
+                        editModelPoints[m] = ProbePoint(t: editProbeNow, ms: nil, ok: true)
                     } else {
                         failures.append("\(m) → \(check.detail)")
+                        editModelPoints[m] = ProbePoint(t: editProbeNow, ms: nil, ok: false)
                     }
                 } else {
                     verified.append(m)
@@ -2391,6 +2424,10 @@ public final class Core {
             }
         }
 
+        if !editModelPoints.isEmpty {
+            do { try history.appendModelProbePoints(id: entry.id, points: editModelPoints) }
+            catch { AppLog.warn("编辑验证点写入失败: \(error.localizedDescription)") }
+        }
         try history.update(entry)
         return lines.joined(separator: "\n")
     }
