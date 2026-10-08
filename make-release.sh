@@ -99,11 +99,15 @@ fi
 
 echo "[4/5] 提交并推送…"
 git add Info.plist ${FILES[@]+"${FILES[@]}"}
-git commit -m "$NOTES (v$VERSION)"
+if git diff --cached --quiet; then
+    echo "  工作区无待提交改动(上次已提交),跳过 commit"
+else
+    git commit -m "$NOTES (v$VERSION)"
+fi
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 git push origin "$BRANCH"
 
-echo "[5/5] 创建 GitHub Release v$VERSION…"
+echo "[5/5] 创建 GitHub Release v${VERSION}…"
 gh release create "v$VERSION" "$ZIP" "$DMG" \
     --title "KeyDrop v$VERSION" \
     --notes "$(printf '%s\n\n安装:新用户下载 .dmg 拖进 Applications(直接双击运行会触发 App Translocation,自更新静默失效)。\n已安装用户:下次启动或菜单「检查更新…」即可自动升级(12 小时节流)。' "$NOTES")"
