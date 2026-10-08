@@ -89,6 +89,56 @@ enum ParserTests {
             let env = try! Parser.parseWithFallback("KEY=sk-abc123def456ghi789jkl")
             t.equal(env.key, "sk-abc123def456ghi789jkl", "KEY= 格式")
 
+            // 回归:base64 填充 `==` 曾被当成赋值分隔符,key 从中间劈开、
+            // 值只剩 `==(base64解密)` → 整条粘贴报「无 key 特征」(真实事故:cpa.wuxie233 导入)
+            do {
+                let b64paste = try Parser.parse("""
+                    Base URL: https://cpa.example.com/budget/v1
+                    API Key: c2stRkFLRWFiY2RlZjAxMjM0NTY3ODlBQkNERQ==（base64解密）
+                    Models: gpt-6-astra, gpt-6.1-sol, gpt-6-sol, gpt-5.6-sol
+                    """)
+                t.equal(b64paste.key, "sk-FAKEabcdef0123456789ABCDE", "带中文注释的 base64 key 完整解码")
+                t.equal(b64paste.url, "https://cpa.example.com/budget/v1", "带空格复合标签 Base URL 识别")
+                t.equal(b64paste.model, "gpt-6-astra", "逗号模型列表取第一个")
+                t.equal(b64paste.models?.count, 4, "逗号模型列表完整保留")
+                t.expect(!(b64paste.models ?? []).contains("Base"), "标签词不漏进模型列表")
+            } catch {
+                t.expect(false, "base64 填充样式解析失败: \(error)")
+            }
+            // 同形但无中文注释:此前 `==` 会被「标签行裸 token」分支当成 key 收走,
+            // 垃圾凭据直接写进 cc-switch/CPA
+            do {
+                let noNote = try Parser.parse("""
+                    Base URL: https://sub.example.com/v1
+                    API Key: c2stRkFLRWFiY2RlZjAxMjM0NTY3ODlBQkNERQ==
+                    """)
+                t.equal(noNote.key, "sk-FAKEabcdef0123456789ABCDE", "无注释 base64 key 解码")
+                t.equal(noNote.url, "https://sub.example.com/v1", "无注释样式 URL")
+            } catch {
+                t.expect(false, "无注释 base64 样式解析失败: \(error)")
+            }
+            // 只剩填充符可用时:必须报错,绝不产出 "==" 这类假 key
+            do {
+                _ = try Parser.parse("API Key: ==")
+                t.expect(false, "纯填充符不应被当成 key")
+            } catch {
+                t.expect(true, "纯填充符拒收")
+            }
+            // 裸粘贴(无标签)的 base64 + `==`:同一条 `=` 判定路径
+            do {
+                let bareB64 = try Parser.parse("""
+                    https://sub.example.com/v1
+                    c2stRkFLRWFiY2RlZjAxMjM0NTY3ODlBQkNERQ==
+                    """)
+                t.equal(bareB64.key, "sk-FAKEabcdef0123456789ABCDE", "裸 base64 == 解码")
+                t.equal(bareB64.url, "https://sub.example.com/v1", "裸粘贴 URL")
+            } catch {
+                t.expect(false, "裸 base64 解析失败: \(error)")
+            }
+            // 环境变量式赋值不能被新判定误伤(长名 + 带 `=` 的值)
+            t.equal(try Parser.parse("ANTHROPIC_API_KEY=c2stRkFLRWFiY2RlZjAxMjM0NTY3ODlBQkNERQ==").key,
+                    "sk-FAKEabcdef0123456789ABCDE", "环境式赋值仍生效")
+
             // extractAllKeys 多 key
             let keys = Parser.extractAllKeys("sk-aaa111222333444555 sk-bbb222333444555 sk-ccc222333444555")
             t.equal(keys.count, 3, "提取全部 key")

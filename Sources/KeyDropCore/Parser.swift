@@ -349,10 +349,14 @@ public enum Parser {
             line = stripInlineComment(line).trimmingCharacters(in: .whitespaces)
             var lhs: String? = nil
             var eq: String.Index? = nil
-            if let e = line.firstIndex(of: "="), line.distance(from: line.startIndex, to: e) < 60 {
+            // 冒号优先级高于等号:base64 key 自带 `=` 填充(如 `API Key: c2st…==`),
+            // 若先认等号为赋值,会把 key 从中间劈开、剩余 `==` 当成值,整条粘贴解析失败
+            let colon = line.firstIndex(of: ":")
+            if let e = line.firstIndex(of: "="), line.distance(from: line.startIndex, to: e) < 60,
+               colon == nil || e < colon! {
+                let before = String(line[line.startIndex..<e]).trimmingCharacters(in: .whitespaces)
                 let after = String(line[line.index(after: e)...]).trimmingCharacters(in: .whitespaces)
-                let hasColon = line.firstIndex(of: ":") != nil
-                if !after.isEmpty || !hasColon {
+                if isAssignmentLabel(before), !after.isEmpty || colon == nil {
                     eq = e
                 }
             }
@@ -364,11 +368,11 @@ public enum Parser {
                 line = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
             } else if let ci = line.firstIndex(of: ":") {
                 let pre = String(line[line.startIndex..<ci])
-                // 标签冒号两侧允许空格(京东云控制台样式:"keybase64 : cGst…"):
-                // 只要冒号前是干净标签(去空白后无内部空格)就按「标签:值」处理。
+                // 标签冒号两侧允许空格(京东云控制台样式:"keybase64 : cGst…"),
+                // 也允许带空格的英文复合标签("API Key:"、"Base URL:")。
                 // 曾因只认无空格写法,标签被逐词切分漏进模型列表(真实事故:jdcloud 导入)
                 let trimmedPre = pre.trimmingCharacters(in: .whitespaces)
-                if pre.count < 60, !pre.contains("http"), !trimmedPre.contains(" ") {
+                if pre.count < 60, !pre.contains("http"), isFieldLabel(trimmedPre) {
                     lhs = trimmedPre
                     line = String(line[line.index(after: ci)...]).trimmingCharacters(in: .whitespaces)
                 } else {
@@ -393,6 +397,30 @@ public enum Parser {
             }
         }
         return try classify(cands, separator: separator)
+    }
+
+    /// 「标签:值」里的标签。单词标签沿用旧规则(非空即认);
+    /// 含空格时只接受 2~4 个英文词(API Key / Base URL / Default Model),
+    /// 中文短句仍走逐词切分,不把说明文字当字段名。
+    static func isFieldLabel(_ s: String) -> Bool {
+        guard !s.isEmpty else { return false }
+        guard s.contains(" ") else { return true }
+        let words = s.components(separatedBy: " ").filter { !$0.isEmpty }
+        guard words.count >= 2, words.count <= 4, s.count <= 40 else { return false }
+        return words.allSatisfy {
+            $0.range(of: #"^[A-Za-z][A-Za-z0-9_.-]*$"#, options: .regularExpression) != nil
+        }
+    }
+
+    /// `=` 左侧是否是赋值标签:标识符形状(可含空格)。
+    /// 额外排除「自身就能解出 key 的长 blob」——裸粘贴的 `c2st…==`
+    /// 若在此处被当成赋值劈开,填充符 `==` 会变成值、key 会被截断。
+    static func isAssignmentLabel(_ s: String) -> Bool {
+        guard !s.isEmpty, s.count <= 60,
+              s.range(of: #"^[A-Za-z_][A-Za-z0-9_.\- ]*$"#, options: .regularExpression) != nil
+        else { return false }
+        if !s.contains(" "), s.count >= 20, decodeKeyIfBase64(s) != nil { return false }
+        return true
     }
 
     // MARK: - 分隔符打码 key 重组
@@ -703,9 +731,13 @@ public enum Parser {
                 if lhs.contains("key") || lhs.contains("token") || lhs.contains("secret") {
                     if let decoded = decodeKeyIfBase64(t) { keys.append(decoded); continue }
                     if let k = extractKey(t, separator) { keys.append(k); continue }
-                    // 标签行(keyhub 式 APIKEY: xxx)短 token 也接受
+                    // 标签行(keyhub 式 APIKEY: xxx)短 token 也接受。
+                    // 但必须是「像凭据」的 token:至少 6 字符且含字母数字,
+                    // 否则 base64 残片 `==` / `=` 会被当成 key 写进下游配置
                     let bare = t.trimmingCharacters(in: .whitespaces)
-                    if !bare.isEmpty, !bare.contains(" "), !bare.contains("\t"),
+                    if bare.count >= 6,
+                       bare.range(of: "[A-Za-z0-9]", options: .regularExpression) != nil,
+                       !bare.contains(" "), !bare.contains("\t"),
                        bare.range(of: #"^[\x21-\x7E]+$"#, options: .regularExpression) != nil,
                        !looksLikeURL(bare), !looksLikeModel(bare) {
                         keys.append(bare)
@@ -731,7 +763,12 @@ public enum Parser {
         if keys.count == 1 {
             let vals = rest.map { $0.0 }
             if let m = rest.first(where: { ($0.1 ?? "").contains("model") || ($0.1 ?? "").contains("模型") }) {
-                p.model = m.0
+                // 逗号分隔的多模型列表("Models: a, b, c")只取第一个作激活模型,
+                // 整串当模型名探测必然失败
+                let list = m.0.split(separator: ",")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                p.model = list.first ?? m.0
             }
             let modelCands = vals.filter { looksLikeModel($0) }
             if p.model == nil { p.model = modelCands.first }
