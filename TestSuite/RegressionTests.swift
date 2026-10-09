@@ -494,6 +494,82 @@ enum RegressionTests {
             t.contains(outcome.lines.joined(separator: "\n"), "自动剔除 1 个失效 key", "结果提示剔除数量")
         }
 
+        // 真实反馈(midjok.lol,1 URL + 2 key):多 key 粘贴跳过勾选弹窗,把探测到的
+        // 26 个模型(含 audio/realtime/codex-auto-review)整批写进条目与 CPA;
+        // 且 cpa-multikey 条目账本不落 key,编辑一律报「该记录缺少 URL 或 key」
+        h.runSuite("Regression.多 key 导入走模型勾选") { t in
+            let env = try! TestEnv("reg-cpa-multi-pick")
+            defer { env.cleanup() }
+            let core = Core()
+            env.write("cpa-config.yaml", "port: 18317\n")
+            guard let srv = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            let raw = "\(base) sk-picka1111111111 sk-pickb2222222222"
+            var shown: [String] = []
+            let outcome = try! core.add(raw: raw, ccOverride: false, cpaOverride: true, dshOverride: false, force: true) { options in
+                shown = options
+                return ["glm-5.2"]
+            }
+            t.expect(outcome.ok, "多 key 导入成功")
+            t.equal(shown, ["gpt-5.6-sol", "glm-5.2"], "弹窗拿到探测全量供勾选")
+            t.equal(outcome.entry.models, ["glm-5.2"], "条目只留勾选结果(修复前=探测全量)")
+            t.equal(outcome.entry.model, "glm-5.2", "entry.model = 勾选的第一个")
+            let cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "glm-5.2", "勾选模型写入 CPA")
+            t.expect(!cfg.contains("gpt-5.6-sol"), "未勾选的模型不写进 CPA(修复前全部写入)")
+        }
+
+        h.runSuite("Regression.多 key 取消勾选不写入任何产物") { t in
+            let env = try! TestEnv("reg-cpa-multi-cancel")
+            defer { env.cleanup() }
+            let core = Core()
+            env.write("cpa-config.yaml", "port: 18317\n")
+            guard let srv = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            let raw = "\(base) sk-cancela1111111111 sk-cancelb2222222222"
+            // 账本在测试进程内跨 suite 存活(TestEnv 只换目录名,端口可能被复用),
+            // 因此比对「新增条目数」而不是判空
+            let ledgerBefore = core.history.snapshot().count
+            do {
+                _ = try core.add(raw: raw, ccOverride: false, cpaOverride: true, dshOverride: false, force: true) { _ in [] }
+                t.expect(false, "取消勾选应抛错")
+            } catch {
+                t.contains(error.localizedDescription, "已取消选择模型", "取消语义与单 key 路径一致")
+            }
+            t.equal(env.read("cpa-config.yaml"), "port: 18317\n", "取消后 CPA 配置零改动")
+            t.equal(core.history.snapshot().count, ledgerBefore, "取消后账本无新增残留条目")
+        }
+
+        h.runSuite("Regression.cpa-multikey 条目可探测可编辑") { t in
+            let env = try! TestEnv("reg-cpa-multi-edit")
+            defer { env.cleanup() }
+            let core = Core()
+            env.write("cpa-config.yaml", "port: 18317\n")
+            guard let srv = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            let raw = "\(base) sk-edilta1111111111 sk-edilb2222222222"
+            let outcome = try! core.add(raw: raw, ccOverride: false, cpaOverride: true, dshOverride: false, force: true)
+            t.expect(outcome.entry.key == nil, "多 key 条目账本不落单 key")
+            // 修复前:probeModels/editEntry 直接读 entry.key → 抛「该记录缺少 URL 或 key」
+            let models = try! core.probeModels(entryIDPrefix: outcome.entry.id)
+            t.equal(models, ["gpt-5.6-sol", "glm-5.2"], "编辑弹窗可从 raw 恢复凭据探测模型")
+            let msg = try! core.editEntry(entryIDPrefix: outcome.entry.id, models: ["glm-5.2"])
+            t.contains(msg, "模型已更新", "多 key 条目编辑成功: \(msg)")
+            let e = core.history.find(idPrefix: outcome.entry.id)!
+            t.equal(e.models, ["glm-5.2"], "models 已整替")
+            t.contains(env.read("cpa-config.yaml"), "glm-5.2", "CPA 聚合条目同步更新")
+            t.expect(!env.read("cpa-config.yaml").contains("gpt-5.6-sol"), "CPA 侧旧模型已移除")
+        }
+
         // 真实事故(hashneuron):4 模型中首选 composer 429 quota、glm-5.3-free 可用,
         // 旧逻辑 chat 只探 models.first → 整 key 误判无额度进额度区,用户"导入成功但看不到"
         h.runSuite("Regression.余额接口报0不误判可用key") { t in

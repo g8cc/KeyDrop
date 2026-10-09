@@ -380,35 +380,45 @@ public final class CPAWriter {
             guard let entryRange = findAggregatedEntry(in: lines, providerName: providerName) else {
                 throw WriterError.file("CPA 聚合条目不存在: \(providerName)")
             }
-            guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
-                // 条目无 models 段(上次探测失败):补写本次列表,复用 merge 的插入逻辑
-                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [], models: uniq)
+            if replaceModelsSegment(&lines, entryRange: entryRange, models: uniq) {
                 try atomicWrite(lines.joined(separator: "\n"))
-                return "已补写 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
+                return "已更新 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
             }
-            let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
-            // models 段范围:header+1 起直到缩进 ≤ header 的非空行(段内其它子键更深缩进,一并替换)
-            var end = header + 1
-            var itemIndent = String(repeating: " ", count: headerIndent + 4)
-            while end < entryRange.upperBound {
-                let line = lines[end]
-                if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { end += 1; continue }
-                let ind = line.prefix(while: { $0 == " " || $0 == "\t" }).count
-                if ind <= headerIndent { break }
-                if lines[end].trimmingCharacters(in: .whitespaces).hasPrefix("- name:") {
-                    itemIndent = String(repeating: " ", count: ind)
-                }
-                end += 1
-            }
-            var block: [String] = []
-            for m in uniq {
-                block.append("\(itemIndent)- name: \(yamlScalar(m))")
-                block.append("\(itemIndent)  alias: \(yamlScalar(m))")
-            }
-            lines.replaceSubrange((header + 1)..<end, with: block)
+            // 条目无 models 段(上次探测失败):补写本次列表,复用 merge 的插入逻辑
+            try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [], models: uniq)
             try atomicWrite(lines.joined(separator: "\n"))
-            return "已更新 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
+            return "已补写 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
         }
+    }
+
+    /// 整替聚合条目 models 段内容(不写盘)。段不存在返回 false,由调用方补写。
+    /// 刷新/编辑/多 key 勾选共用此口径:重新确认的列表必须真替换,
+    /// 取消勾选的模型要能删掉 —— merge 只做并集,做不到
+    private func replaceModelsSegment(_ lines: inout [String], entryRange: Range<Int>, models uniq: [String]) -> Bool {
+        guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
+            return false
+        }
+        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
+        // models 段范围:header+1 起直到缩进 ≤ header 的非空行(段内其它子键更深缩进,一并替换)
+        var end = header + 1
+        var itemIndent = String(repeating: " ", count: headerIndent + 4)
+        while end < entryRange.upperBound {
+            let line = lines[end]
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { end += 1; continue }
+            let ind = line.prefix(while: { $0 == " " || $0 == "\t" }).count
+            if ind <= headerIndent { break }
+            if lines[end].trimmingCharacters(in: .whitespaces).hasPrefix("- name:") {
+                itemIndent = String(repeating: " ", count: ind)
+            }
+            end += 1
+        }
+        var block: [String] = []
+        for m in uniq {
+            block.append("\(itemIndent)- name: \(yamlScalar(m))")
+            block.append("\(itemIndent)  alias: \(yamlScalar(m))")
+        }
+        lines.replaceSubrange((header + 1)..<end, with: block)
+        return true
     }
 
     /// 多 key 写聚合条目到 `openai-compatibility:` 段下,同 baseURL 的 key 归一组,
@@ -416,7 +426,8 @@ public final class CPAWriter {
     /// 模型列表自动探测:探测失败返回空 models,条目可后续刷新。
     /// 返回 (提示消息, 探测到的模型) —— 模型回传给历史条目,
     /// UI 才能按真实家族路由「打开应用」(曾因 models 空被误标 claude)
-    func addMulti(baseURL: String, keys: [String], proxy: String? = nil) throws -> (String, [String]) {
+    func addMulti(baseURL: String, keys: [String], proxy: String? = nil,
+                  pickModels: (([String]) -> [String])? = nil) throws -> (String, [String]) {
         var seen = Set<String>()
         let uniqueKeys = keys.compactMap { raw -> String? in
             let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -450,6 +461,10 @@ public final class CPAWriter {
         var rejected = 0
         var accepted: [String] = []
         var probedModels: [String] = []
+        // 勾选弹窗的选项必须是 /models 的原始 ID 列表:looksLikeModel 会把
+        // step-3.7-flash / qwen3.8-flash 这类点分新命名当域名杀掉,用户在弹窗里
+        // 根本看不到(与 add()/refreshModels() 的 picker 误杀同一根因)
+        var probedOptions: [String] = []
         // 必须按索引对齐收集:compactMap+zip 会在任一结果缺失时让后续 key 整体错位,
         // 把好 key 对到别处的探测结果上误剔除。结果缺失(理论不可达)按非认证错误保留
         for (i, key) in uniqueKeys.enumerated() {
@@ -464,13 +479,29 @@ public final class CPAWriter {
             accepted.append(key)
             if probedModels.isEmpty, test.ok {
                 probedModels = test.models.filter { Parser.looksLikeModel($0) }
+                probedOptions = test.models
             }
         }
         guard !accepted.isEmpty else {
             throw WriterError.file("多 key 中没有可用 key,已剔除 \(rejected) 个失效 key")
         }
+        // 勾选在锁外做:弹窗要等用户操作(最长 120s),不能占着 config.yaml 的
+        // flock 让并发的 CLI/菜单栏写入串行排队。条目已有精选列表时不弹窗——
+        // 那列表是用户上次明确确认的,只合 key(见 addMultiLocked 注释)
+        var pickedModels: [String]? = nil
+        if let pickModels, probedOptions.count > 1,
+           existingCuratedModels(for: baseURL).isEmpty {
+            let picked = pickModels(probedOptions)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !picked.isEmpty else {
+                throw WriterError.file("已取消选择模型")
+            }
+            pickedModels = picked
+        }
         let writeMsg = try withCPASync {
-            try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels, proxy: proxy)
+            try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels,
+                               picked: pickedModels, proxy: proxy)
         }
         // 回传条目最终 models(已有精选时=精选原列表,新建/补写时=探测结果):
         // 历史/UI/常驻入口与配置文件同源,绝不把探测全量当精选
@@ -478,23 +509,44 @@ public final class CPAWriter {
         return ("已写入 CPA 配置(\(configPath))\(suffix);\(writeMsg.0);CPA 运行时会自动热重载", writeMsg.1)
     }
 
+    /// 只读预判:该 baseURL 的聚合条目是否已有模型列表。有则本次粘贴不再弹勾选
+    /// (那列表是用户既有精选,addMultiLocked 只会合 key,弹窗结果必然被丢弃)
+    private func existingCuratedModels(for baseURL: String) -> [String] {
+        guard let content = try? readConfigText() else { return [] }
+        let lines = content.components(separatedBy: "\n")
+        guard let range = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL))
+        else { return [] }
+        return Self.entryModels(in: lines, entryRange: range)
+    }
+
     /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,
     /// 不能在 flock 临界区内做 —— 否则 CLI 与菜单栏并发写时互相串行排队到对方超时
     /// 返回 (消息, 条目最终模型列表)。已有非空 models 的条目视为用户精选:
     /// 再导入只合并 key,绝不追加探测模型(真实反馈:CPA 聚合 /models 混入 22 家
     /// 上游共 100+ 模型,用户只要 SOTA 四件套,KeyDrop 不得把一大堆回填)
-    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String], proxy rawProxy: String? = nil) throws -> (String, [String]) {
+    private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String],
+                                picked pickedModels: [String]? = nil, proxy rawProxy: String? = nil) throws -> (String, [String]) {
         let content = try readConfigText()
         let proxy = Self.rewriteProxyForDocker(rawProxy, configContent: content)
         var lines = content.components(separatedBy: "\n")
         let providerName = aggregatedName(for: baseURL)
-        var finalModels = probedModels
+        var finalModels = pickedModels ?? probedModels
         var preservedNote = ""
 
         // 定位 openai-compatibility 段下同 name 的现有条目
         if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
             let existingModels = Self.entryModels(in: lines, entryRange: entryRange)
-            if existingModels.isEmpty {
+            if let pickedModels {
+                // 本次粘贴用户明确勾选过:整替为新列表(与 refreshModels 同一口径,
+                // merge 的并集语义会留下未勾选的模型),再把本次 key 合进池子
+                if replaceModelsSegment(&lines, entryRange: entryRange, models: pickedModels) {
+                    let shifted = findAggregatedEntry(in: lines, providerName: providerName) ?? entryRange
+                    try mergeIntoAggregatedEntry(&lines, range: shifted, providerName: providerName, keys: keys, models: [])
+                } else {
+                    try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: pickedModels)
+                }
+                finalModels = pickedModels
+            } else if existingModels.isEmpty {
                 // 条目无模型列表(上次探测失败):补写本次探测结果
                 try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: probedModels)
             } else {
@@ -506,7 +558,7 @@ public final class CPAWriter {
         } else {
             // 新建条目
             try appendAggregatedEntry(&lines, providerName: providerName, baseURL: baseURL,
-                                      keys: keys, models: probedModels, proxy: proxy)
+                                      keys: keys, models: finalModels, proxy: proxy)
         }
         try atomicWrite(lines.joined(separator: "\n"))
         let modelPart = finalModels.isEmpty ? "" : ", 模型 \(finalModels.count) 个"

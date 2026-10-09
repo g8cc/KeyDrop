@@ -193,7 +193,17 @@ public final class Core {
                 throw ParseError.io("检测到多 key,需要写入 CPA 但未找到 config.yaml")
             }
             prefs.cpaConfigPath = cfg
-            let (msg, probedModels) = try CPAWriter(configPath: cfg).addMulti(baseURL: url, keys: allKeys, proxy: proxyURL)
+            // 多 key 粘贴此前直接落「探测全量」(真实反馈:midjok.lol 1 URL + 2 key
+            // 导入 26 个模型,含 audio/realtime/codex-auto-review,用户没得选)。
+            // 显式 --model 优先,否则走与单 key 同一套勾选弹窗
+            let explicitModels = (models ?? [])
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            let chooser: (([String]) -> [String])? = !explicitModels.isEmpty
+                ? { _ in explicitModels }
+                : pickModels
+            let (msg, probedModels) = try CPAWriter(configPath: cfg)
+                .addMulti(baseURL: url, keys: allKeys, proxy: proxyURL, pickModels: chooser)
             var multiLines = [msg]
             // 常驻模型来源 = 条目最终 models(已有精选时即精选列表);
             // 空(探测失败且无既有列表)传 nil 回退收集其它条目的精选
@@ -1673,7 +1683,7 @@ public final class Core {
         guard let entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
-        guard let url = entry.url, let key = entry.key, !key.isEmpty else {
+        guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
         let px = proxyForHealth()
@@ -1846,7 +1856,7 @@ public final class Core {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
         let effProxy = proxy ?? proxyForHealth()
-        guard let url = entry.url, let key = entry.key, !key.isEmpty else {
+        guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
         let test = APITester.test(url: url, key: key, proxy: effProxy,
@@ -2162,6 +2172,22 @@ public final class Core {
         return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
     }
 
+    /// 编辑弹窗「勾选模型」的数据源:只探测不写任何目标/账本
+    /// (test.models 是 /models 的原始 ID 列表,未经 looksLikeModel 去噪,
+    ///  否则点分新命名在弹窗里根本看不到)
+    public func probeModels(entryIDPrefix: String) throws -> [String] {
+        guard let entry = history.find(idPrefix: entryIDPrefix) else {
+            throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
+        }
+        guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
+            throw ParseError.io("该记录缺少 URL 或 key,无法探测模型")
+        }
+        let test = APITester.test(url: url, key: key, proxy: proxyForHealth(),
+                                  preferredModel: entry.model, importedModels: entry.models)
+        guard test.ok else { throw ParseError.io("探测失败: \(test.detail)") }
+        return test.models
+    }
+
     /// 编辑条目:改模型列表/名称,重新验证模型并同步所有目标(cc-switch/dsh)
     public func editEntry(
         entryIDPrefix: String,
@@ -2176,7 +2202,7 @@ public final class Core {
         else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
-        guard let url = entry.url, let key = entry.key, !key.isEmpty else {
+        guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法编辑")
         }
 
@@ -2647,7 +2673,10 @@ public final class Core {
         return lines.isEmpty ? "已删除" : lines.joined(separator: "\n")
     }
 
-    private func extractKey(_ e: HistoryEntry) -> String? {
+    /// 取条目可用于探测/验证的凭据:单 key 条目直接读 key;多 key 条目(cpa-multikey)
+    /// 账本里不落 key(只落 "N 个 key"),从 raw 恢复第一个 —— 编辑/重测/curl 复制
+    /// 都只需要一把有效凭据,CPA 侧组内会自行轮询全池
+    public func extractKey(_ e: HistoryEntry) -> String? {
         if let key = e.key, !key.isEmpty { return key }
         if let parsed = try? Parser.parse(e.raw) { return parsed.key }
         return nil

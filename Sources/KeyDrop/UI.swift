@@ -472,6 +472,41 @@ final class AppState: ObservableObject {
         editShown = true
     }
 
+    /// 编辑弹窗「勾选模型」:探测端点真实 /models → 复用导入的勾选弹窗 → 回填文本框。
+    /// 多模型条目(20+)用逗号手敲既易漏又易错(真实反馈:midjok.lol 26 模型条目)
+    func pickModelsForEdit() {
+        guard let entry = editTarget else { return }
+        guard !isBusy else { return }
+        editShown = false
+        isBusy = true
+        busyLabel = "探测模型…"
+        Task { @MainActor in
+            defer {
+                isBusy = false
+                busyLabel = ""
+                editShown = true
+            }
+            do {
+                let picked = try await Task.detached(priority: .userInitiated) { () throws -> [String] in
+                    let options = try Core.shared.probeModels(entryIDPrefix: entry.id)
+                    guard !options.isEmpty else {
+                        throw NSError(domain: "KeyDrop", code: 1,
+                                      userInfo: [NSLocalizedDescriptionKey: "该端点未返回模型列表,请手输模型名"])
+                    }
+                    return self.pickModelsSync(options)
+                }.value
+                if picked.isEmpty {
+                    setStatus("已取消勾选,模型未改动", ok: true)
+                } else {
+                    editModelsText = picked.joined(separator: ", ")
+                    setStatus("已勾选 \(picked.count) 个模型,保存后生效", ok: true)
+                }
+            } catch {
+                setStatus("模型探测失败: \(error.localizedDescription)", ok: false)
+            }
+        }
+    }
+
     func doEdit() {
         guard let entry = editTarget else { return }
         guard !isBusy else { return }
@@ -1408,10 +1443,18 @@ struct EditView: View {
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                TextField("模型(逗号分隔)", text: $state.editModelsText)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textFieldStyle(.roundedBorder)
-                    .help("留空则不改动模型;填写后逐一自动验证(大小写敏感)")
+                HStack(spacing: 6) {
+                    TextField("模型(逗号分隔)", text: $state.editModelsText)
+                        .font(.system(size: 12, design: .monospaced))
+                        .textFieldStyle(.roundedBorder)
+                        .help("留空则不改动模型;填写后逐一自动验证(大小写敏感)")
+                    Button("勾选…") {
+                        state.pickModelsForEdit()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(state.isBusy)
+                    .help("探测该端点真实模型列表后勾选,不用手敲逗号")
+                }
                 TextField("新 key(留空不改动;站方轮换 key 时填这里,保存前会实测)", text: $state.editKeyText)
                     .font(.system(size: 12, design: .monospaced))
                     .textFieldStyle(.roundedBorder)
@@ -2088,7 +2131,7 @@ struct PanelView: View {
                                     onRefresh: { id in state.doRefresh(id) },
                                     onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                     onCopyCurl: {
-                                        guard let url = e.url, let key = e.key, !key.isEmpty else {
+                                        guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
                                             showToast("缺少 URL 或 key")
                                             return
                                         }
@@ -2152,7 +2195,7 @@ struct PanelView: View {
                                             onRefresh: { id in state.doRefresh(id) },
                                             onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                             onCopyCurl: {
-                                                guard let url = e.url, let key = e.key, !key.isEmpty else {
+                                                guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
                                                     showToast("缺少 URL 或 key")
                                                     return
                                                 }
@@ -2238,7 +2281,7 @@ struct PanelView: View {
                                             onRefresh: { id in state.doRefresh(id) },
                                             onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                             onCopyCurl: {
-                                                guard let url = e.url, let key = e.key, !key.isEmpty else {
+                                                guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
                                                     showToast("缺少 URL 或 key")
                                                     return
                                                 }
