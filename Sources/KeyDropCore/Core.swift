@@ -54,6 +54,29 @@ public final class Core {
         proxy: String? = nil,
         pickModels: (([String]) -> [String])? = nil
     ) throws -> AddOutcome {
+        var stage = "parse"
+        do {
+            let outcome = try addImpl(raw: raw, ccOverride: ccOverride, grokOverride: grokOverride,
+                                      cpaOverride: cpaOverride, dshOverride: dshOverride,
+                                      models: models, force: force, appType: appType,
+                                      appTypeForced: appTypeForced, proxy: proxy,
+                                      pickModels: pickModels, stage: &stage)
+            for line in outcome.lines where line.contains("✗") || line.contains("失败") {
+                ImportFailureLog.record(ParseError.io(line), stage: ImportFailureLog.stage(forLine: line))
+            }
+            return outcome
+        } catch {
+            ImportFailureLog.record(error, stage: stage)
+            throw error
+        }
+    }
+
+    private func addImpl(
+        raw: String, ccOverride: Bool?, grokOverride: Bool?, cpaOverride: Bool?,
+        dshOverride: Bool?, models: [String]?, force: Bool, appType: String?,
+        appTypeForced: Bool, proxy: String?, pickModels: (([String]) -> [String])?,
+        stage: inout String
+    ) throws -> AddOutcome {
         let appType = appType ?? Core.defaultAppType
         AppLog.info("add 开始(force=\(force))")
         defer { AppLog.info("add 结束") }
@@ -82,6 +105,7 @@ public final class Core {
         let clashOnly = proxyCount > 0 && proxyCount * 2 >= rawLines.count
 
         if clashOnly {
+            stage = "write_clash"
             var proxies: [ClashProxy] = []
             for l in rawLines {
                 if let p = Parser.parseProxyURL(l), !p.server.isEmpty, p.port > 0, !p.uuid.isEmpty {
@@ -185,6 +209,7 @@ public final class Core {
 
         let allKeys = Parser.extractAllKeys(raw)
         if allKeys.count > 1 {
+            stage = "multikey_cpa"
             let useCPA = cpaOverride ?? prefs.useCPA
             guard useCPA else {
                 throw ParseError.io("检测到 \(allKeys.count) 个 key,多 key 仅支持写入 CPA。请启用 CPA(--cpa) 或单独添加单个 key。")
@@ -232,6 +257,7 @@ public final class Core {
         }
 
         var name = parsed.name?.isEmpty == false ? parsed.name! : cc.defaultName(for: url)
+        stage = "verify"
         parsed.name = name
 
         let requestedModels = (models ?? parsed.models ?? parsed.model.map { [$0] } ?? [])
@@ -521,6 +547,7 @@ public final class Core {
         }
 
         var anyOK = false
+        stage = "write"
         var anyTarget = false
 
         if useCC && resolvedAppType != "grok" {

@@ -354,6 +354,16 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 - **双层版本化**:信封 formatVersion(加密方式变更)+ 载荷 schemaVersion(字段变更),导入端拒绝比自己新的 schema 并提示升级。
 - **产物重放幂等**:cc-switch 以「账本无本机 pid 或 pid 已不存在」为重放条件;CPA/DSH/Grok 写入器天然 upsert。重放后 cc-switch 里最后重放的条目为激活态,自行切换即可。
 
+## 14. 导入错误分类日志(v1.4.51)
+
+GUI / CLI 的 `Core.add` 导入失败统一落在 `~/.keydrop/logs/import-failures.json`(设置 `KEYDROP_HOME` 时用对应目录)。
+
+- **去重键是 `stage + reason`**:每种组合只留一条,重复发生只累加 `count`、刷新 `lastSeen`,保留 `firstSeen`;时间为 ISO 8601。这是类型统计,不替代 §附 的诊断流水。
+- **覆盖的 stage**:`parse`、`write_clash`、`multikey_cpa`、`verify`、`write_*`(按失败行里的目标名归类:`write_ccswitch`/`write_cpa`/`write_grok`/`write_dsh`)、`save`(账本落盘)、兜底 `write`。异常路径与「返回失败结果但不抛异常」的部分写入失败都记;`✗ CPA 失败:` 这类行即使错误文本里带着模型验证字样,也按目标归 `write_cpa`。
+- **不记的情况**:用户主动取消模型选择(`已取消`)、成功导入。
+- **隐私**:只存阶段、错误类型、次数、时间;不存粘贴原文、密钥、URL 或服务端响应。无法细分的错误归为该 stage 的 `other`。
+- **并发与损坏**:NSLock + 跨进程 flock 保护读改写,临时文件原子替换,目录 `0700`/文件 `0600`;日志写失败只告警,绝不阻断导入。文件已损坏时保留原文件不自动覆盖。历史普通日志不会自动回填。
+
 ## 附:排查一条 key 的入口清单
 
 1. `~/.keydrop/history.json` → 找条目:看 `targets`(写了哪些产物)、`models`(精选列表)、`health/healthDetail`(探测详情)、`note`(导入过程记录)。
@@ -361,3 +371,4 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 3. cc-switch:`sqlite3 ~/.cc-switch/cc-switch.db "SELECT name,settings_config FROM providers WHERE id LIKE 'xxx%'"`。
 4. CPA:config.yaml 搜聚合条目名(网关域名)。
 5. DSH:`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`(确认凭据在 `refs:` 内)。
+6. `~/.keydrop/logs/import-failures.json` → 按 `stage + reason` 看失败类型统计(§14)。

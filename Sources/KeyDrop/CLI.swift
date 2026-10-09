@@ -139,7 +139,7 @@ enum CLI {
                 else { AppLog.error("CLI add failed: \(outcome.lines.joined(separator: "; "))") }
                 return outcome.ok ? 0 : 1
             } catch {
-                AppLog.error("CLI add error: \(error.localizedDescription) | 原文: \(text)")
+                AppLog.error("CLI add error: \(error.localizedDescription)")
                 print("失败: \(error.localizedDescription)")
                 return 1
             }

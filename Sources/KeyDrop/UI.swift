@@ -197,7 +197,7 @@ final class AppState: ObservableObject {
                    body: outcome.lines.joined(separator: "\n"))
         } catch {
             let msg = error.localizedDescription
-            AppLog.error("导入失败: \(msg) | 原文: \(raw)")
+            AppLog.error("导入失败: \(msg)")
             if case ParseError.duplicate(let id, _) = error {
                 highlightID = id
                 highlightPulse += 1

@@ -15,6 +15,7 @@ signal(SIGPIPE, SIG_IGN)
 
 let harness = Harness()
 
+ImportFailureLogTests.run(harness)
 ParserTests.run(harness)
 DSHWriterTests.run(harness)
 APITesterTests.run(harness)
