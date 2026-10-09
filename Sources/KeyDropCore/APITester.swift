@@ -200,15 +200,17 @@ public enum APITester {
     /// - Parameter preferredModel: 用户实际激活的模型(new-api TestModel 思路),探测时优先验证它
     /// - Parameter modelProbeTimes: 模型 → 上次被探测的时间戳(监控轮换用)。nil=不轮换
     public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil) -> APITestResult {
-        // 先按真实环境(直连)测试;直连失败仅当配置了代理时才补测代理,并标记需代理
+        // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
         let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
-        if direct.ok || direct.authFailed {
-            return direct
-        }
+        if direct.ok { return direct }
         let p = proxy?.trimmingCharacters(in: .whitespaces)
         if p == nil || p!.isEmpty {
             return direct
         }
+        // 这里曾额外用 `|| direct.authFailed` 短路:直连被判「key 失效」就不补测代理。
+        // 但区域/合规封锁返回的正是 JSON 403(真实事故:tokenharbor
+        // 「API access from your region is not available」),key 有效、经代理 200,
+        // 短路把这类 key 直接判死,用户配好的代理一次都没用上
         let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
         if via.ok {
             // 必须透传探测明细:只拷 ok/models/detail 会把 workingModels/quotaModels/延迟/
@@ -221,6 +223,9 @@ public enum APITester {
                                  workingModels: via.workingModels, quotaModels: via.quotaModels,
                                  latencyMs: via.latencyMs, modelLatencies: via.modelLatencies)
         }
+        // 两路都失败:直连拿到了 key 级结论(401/403)而代理侧只是连不通
+        // (超时/无响应)→ 保留直连结论,别把代理故障说成 key 失效
+        if direct.authFailed, !via.authFailed { return direct }
         return via
     }
 
@@ -256,9 +261,9 @@ public enum APITester {
 
             // 401/403 需区分「认证失败」与「CF 盾拦截」:盾页是 HTML(如 Cloudflare 挑战页),
             // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(真实事故:某中转站多代理链)
-            if status == 401 || status == 403 {
-                let looksHTML = bodyHead.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
-                if !looksHTML { authFailed = true }
+            // 区域封锁 403 同理——它是 JSON,但说的是所在地而非 key
+            if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
+                authFailed = true
             }
             if status == 200 {
                 // 200 但非 JSON(SPA/前端兜底页,任何 key 都 200)→ 不是 API 端点,继续下一候选
@@ -441,10 +446,10 @@ public enum APITester {
             // HTML 盾页(CF 挑战/basic-auth realm)≠ 认证失败,与 /models 探测口径一致:
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
-            if status == 401 || status == 403 {
-                if !isHTMLBody(body) { return (nil, nil, status, nil) }
-                continue   // 盾页:跳过本候选,不误判 authFailed
+            if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
+                return (nil, nil, status, nil)
             }
+            if status == 403 { continue }   // 盾页/地域封锁:跳过本候选,不误判 authFailed
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
@@ -494,8 +499,8 @@ public enum APITester {
             if ok {
                 return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)")
             }
-            // HTML 盾页(CF 挑战)≠ 认证失败,不计入 authFailed
-            if status == 401 || (status == 403 && !isHTMLBody(body)) { authFailed = true }
+            // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败,不计入 authFailed
+            if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) { authFailed = true }
             lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }
         return (false, authFailed, lastDesc)
@@ -503,6 +508,17 @@ public enum APITester {
 
     private static func isHTMLBody(_ s: String) -> Bool {
         s.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
+    }
+
+    /// 区域/合规封锁类 403(「API access from your region is not available」、
+    /// US sanctions / export controls 等)。它描述的是客户端所在地,不是这把 key:
+    /// 计成 authFailed 会让无代理环境把活 key 判死、健康扫描自动移出
+    private static func isGeoBlockBody(_ s: String) -> Bool {
+        guard !s.isEmpty else { return false }
+        return s.range(
+            of: "(access from your (region|country)|region(s)? (is|are) not available|not available in your (region|country)|under [a-z ]{0,24}sanction|sanctions|export controls?|geo[- ]?blocked|regional(ly)? (unavailable|blocked|restricted))",
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     private static func isJSONBody(_ s: String) -> Bool {
@@ -548,8 +564,8 @@ public enum APITester {
         let status = NetSync.statusCode(o)
         let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
         let ok = status == 400 || (status == 200 && isJSONBody(body))
-        // HTML 盾页(CF 挑战)≠ 认证失败
-        let authFail = status == 401 || (status == 403 && !isHTMLBody(body))
+        // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败
+        let authFail = status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body))
         return (ok, authFail,
                 "POST \(messagesPath) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))"))
     }

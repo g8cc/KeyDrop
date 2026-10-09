@@ -28,6 +28,7 @@ final class MockHTTPServer {
         case billingCentsOK    // /auth/key 404;new-api billing:hard_limit_usd=100($),total_usage=500(美分=$5)→ 有余额
         case billingCentsSpent // 同上但 total_usage=10000(美分=$100)→ 用尽
         case html200All        // 任意路径 200 + HTML 兜底页(SPA),chat 也不例外
+        case regionBlock403    // 任意路径 → 403 + JSON「access from your region is not available」(地域封锁,非 key 失效)
         case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
         case webdav   // WebDAV:PUT 存/GET 取/MKCOL(账本同步回环测试)
     }
@@ -188,6 +189,8 @@ final class MockHTTPServer {
             }
         } else if mode == .html200All {
             body = "<!doctype html><html><body>app</body></html>"
+        } else if mode == .regionBlock403 {
+            body = "{\"error\":{\"message\":\"API access from your region is not available. Token Harbor cannot serve requests from regions under US sanctions or export controls.\"}}"
         } else if mode == .balanceNoInfo {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
         } else if mode == .html200 {
@@ -259,6 +262,8 @@ final class MockHTTPServer {
             status = "200 OK"
         } else if mode == .html200All {
             status = "200 OK"
+        } else if mode == .regionBlock403 {
+            status = "403 Forbidden"
         } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || mode == .partialCatalog && target.hasSuffix("/models") || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
@@ -632,6 +637,28 @@ enum APITesterTests {
                 proxy: "http://127.0.0.1:1"
             )
             t.expect(!deadProxy.ok, "代理也不可用 → 失败")
+
+            // 回归(真实事故 tokenharbor 导入):区域封锁返回的正是 JSON 403(不是 HTML 盾页),
+            // 旧口径标 authFailed → test() 短路 `direct.ok || direct.authFailed`,
+            // 用户配好的代理一次都没跑,活 key 被判「失效」且导入被拒
+            if let block = try? MockHTTPServer(mode: .regionBlock403) {
+                let blockURL = "http://127.0.0.1:\(block.port)/v1"
+                let noProxy = APITester.test(url: blockURL, key: "thk_live_test123", timeout: 5)
+                t.expect(!noProxy.ok, "地域封锁且无代理 → 不可用")
+                t.expect(!noProxy.authFailed, "地域封锁 403 不得判 key 失效: \(noProxy.detail)")
+                if let px = try? MockHTTPServer(proxy: true) {
+                    let via = APITester.test(
+                        url: blockURL, key: "thk_live_test123", timeout: 5,
+                        proxy: "http://127.0.0.1:\(px.port)"
+                    )
+                    t.expect(via.ok, "地域封锁 + 代理可达 → 必须补测代理: \(via.detail)")
+                    t.expect(via.needsProxy, "经代理通过要标 needsProxy")
+                } else {
+                    t.expect(false, "mock proxy 失败")
+                }
+            } else {
+                t.expect(false, "mock regionBlock403 失败")
+            }
 
             // proxyDictionary:socks5 必须走 SOCKS 键(曾按 HTTP 代理建 session,
             // 对 SOCKS 端口发 CONNECT → 每 key 误判 err/dead → 小时级扫描清库)
