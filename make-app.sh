@@ -1,12 +1,25 @@
 #!/bin/bash
-# 打包 KeyDrop.app:release 构建 → bundle → 签名 → 安装到 ~/Applications
+# 打包 KeyDrop.app:release 构建 → bundle → 签名 → 安装到唯一位置(优先 /Applications)
 set -e
 cd "$(dirname "$0")"
 
 APP=KeyDrop
 DIST=dist
 APP_BUNDLE="$DIST/$APP.app"
-INSTALL="$HOME/Applications/$APP.app"
+# 安装位置必须唯一:自动更新替换的是「正在运行的那一份」(Updater 用 Bundle.main.bundlePath),
+# 而这里写死装哪。两处不一致时 /Applications 与 ~/Applications 各自演化 ——
+# 2026-10-09 实证:旧的那份停在 1.4.48,用户在用的是它,连着几轮修复都「没生效」。
+# 优先系统标准位置;不可写(无管理员权限的机器)才回落用户目录。
+if [ -w /Applications ]; then
+    INSTALL="/Applications/$APP.app"
+    OTHER_INSTALL="$HOME/Applications/$APP.app"
+else
+    INSTALL="$HOME/Applications/$APP.app"
+    OTHER_INSTALL="/Applications/$APP.app"
+fi
+if [ -d "$OTHER_INSTALL" ]; then
+    echo "⚠ 检测到第二份安装:$OTHER_INSTALL —— 只保留一处,否则更新与发版会分别写两份" >&2
+fi
 
 echo "[1/4] release 构建..."
 swift build -c release

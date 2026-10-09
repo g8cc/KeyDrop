@@ -41,7 +41,7 @@
 
 ```bash
 swift build -c release
-cp .build/release/KeyDrop ~/Applications/KeyDrop.app  # 或直接运行 .build/release/KeyDrop
+cp .build/release/KeyDrop /Applications/KeyDrop.app  # 或直接运行 .build/release/KeyDrop
 ```
 
 ### 方式二:打包分发(make release 一条命令出 zip + dmg)
@@ -51,9 +51,11 @@ make release      # 出 dist/KeyDrop-vX.Y.Z.zip(已装用户的自动更新) + .
 gh release create vX.Y.Z dist/KeyDrop-vX.Y.Z.zip dist/KeyDrop-vX.Y.Z.dmg --title "vX.Y.Z" --notes "..."
 ```
 
-dmg 即标准的拖动安装:打开后把 KeyDrop.app 拖进旁边的 Applications。两个注意:
-① 首次打开被 Gatekeeper 拦时,右键 → 打开(或 `xattr -dr com.apple.quarantine ~/Applications/KeyDrop.app`);
-② 不要在下载目录里直接运行没拖动的 app——App Translocation 会让自动更新静默失效。
+dmg 即标准的拖动安装:打开后把 KeyDrop.app 拖进旁边的 Applications。三个注意:
+① 首次打开被 Gatekeeper 拦时,右键 → 打开(或 `xattr -dr com.apple.quarantine /Applications/KeyDrop.app`);
+② 不要在下载目录里直接运行没拖动的 app——App Translocation 会让自动更新静默失效;
+③ 只保留一份安装。`/Applications` 和 `~/Applications` 各装一份时,自动更新与 `make app`
+可能分别写进不同那份,本机版本号会分叉(1.4.48 与 1.4.52 同时存在的真实事故)。
 
 ### 首次运行说明
 
