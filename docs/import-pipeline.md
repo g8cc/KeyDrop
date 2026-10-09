@@ -335,7 +335,7 @@ A:live 配置文件的三种落法:直写=已同步写 live 文件(新会话即�
 | v1.4.31 | 更新重启确认后 `kill -9` 无业务任务校验:导入流程"外部产物已写、账本未记"的毫秒级窗口被杀会留下孤儿 provider。影响面评估:监控数据采集不受影响(探测点逐条即时落盘)、各文件均有原子写/事务保护;唯一缺口是孤儿 | **孤儿收养**:cc.add 在 provider 行 meta 写入导入来源标记;对账时未认领的带标记行从行内重建账本条目(收养而非删除),key 重复时跳过告警 |
 | v1.4.40 | 账本压实截断公式 600+9+3400=4009 仍超 4000 上限,每次启动渐进啃掉超长备注尾部(v1.4.39 引入,测试最长 3600 字符未覆盖 cap 路径) | 590+9+3390=3989<4000 稳定;补 >4000 字符互异分句用例(首尾保留+二次压实长度不变) |
 | v1.4.39 | 账本无限增长三源:已删条目永不清理(70% 占比,含明文 key)、note 无上限累积(单条同句重复 655 遍 25KB)、probeLog 虽有 30 点滚动但已删条目照带 | **账本压实**:note 分句去重+4000 字符上限;删除超 30 天转审计桩(元数据留痕、明文清除);启动 self-heal 执行,updateAll 整批一次落盘 |
-| v1.4.51 | 粘贴 1 URL + 2 key(midjok.lol)导入:①没弹模型勾选,探测到的 26 个模型(含 audio/realtime/codex-auto-review)整包落成精选列表——多 key 走 CPA 聚合分支时压根没调 `pickModels`,只有单 key 路径有勾选阶梯;②随后编辑/重测/复制 curl 全报「缺少 URL 或 key」——`cpa-multikey` 条目按设计不落 `key` 字段,而各处 guard 直接读 `entry.key`;③编辑面板只有一个逗号分隔输入框,保存即报错 | **多 key 也走勾选**:`addMulti` 收 `pickModels`,探测选项在 flock 之外弹(避免 UI 阻塞写锁),`--model` 显式指定优先,取消则整体失败且不留残条目;已存在精选列表时仍走「只并 key 不改模型」原语义(故需 `replaceModelsSegment` 整段替换而非 union)。**key 统一从 `extractKey` 取**(账本无 key 时回落 raw 原文首行),三处 guard 与 `probeModels` 同口径 |
+| v1.4.51 | 粘贴 1 URL + 2 key(midjok.lol)导入:①没弹模型勾选,探测到的 26 个模型(含 audio/realtime/codex-auto-review)整包落成精选列表——多 key 走 CPA 聚合分支时压根没调 `pickModels`,只有单 key 路径有勾选阶梯;②随后编辑/重测/复制 curl 全报「缺少 URL 或 key」——`cpa-multikey` 条目按设计不落 `key` 字段,而各处 guard 直接读 `entry.key`;③编辑面板只有一个逗号分隔输入框,保存即报错 | **多 key 也走勾选**:`addMulti` 收 `pickModels`,探测选项在 flock 之外弹(避免 UI 阻塞写锁),`--model` 显式指定优先,取消则整体失败且不留残条目;已存在精选列表时仍走「只并 key 不改模型」原语义(故需 `replaceModelsSegment` 整段替换而非 union)。**key 统一从 `extractKey` 取**(账本无 key 时回落 raw 原文首行),三处 guard 与 `probeModels` 同口径;编辑面板补「勾选…」按钮——`probeModels` 只探测不落盘,选完仍由保存路径统一写入 |
 
 ---
 
