@@ -1006,7 +1006,7 @@ public final class Core {
         }
         let now = Date().timeIntervalSince1970
         var targets: [HistoryEntry] = []
-        for e in history.snapshot() where e.status == "active" && e.key != nil && e.url != nil {
+        for e in history.snapshot() where e.status == "active" && e.url != nil && extractKey(e) != nil {
             if let at = e.healthAt, now - at < staleAfter { continue }
             targets.append(e)
         }
@@ -1024,7 +1024,7 @@ public final class Core {
             // 在进入并发闭包前解包:过滤条件已保证非 nil,但 e.url!/e.key! 是在
             // 后台线程里求值的强制解包 —— 一旦将来过滤条件放宽就是崩溃点。
             // 提前 guard 掉,让「不可能」变成安全跳过而不是 crash。
-            guard let entryURL = e.url, let entryKey = e.key, !entryKey.isEmpty else { continue }
+            guard let entryURL = e.url, let entryKey = extractKey(e), !entryKey.isEmpty else { continue }
             sem.wait()
             group.enter()
             queue.async {

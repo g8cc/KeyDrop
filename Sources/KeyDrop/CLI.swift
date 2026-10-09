@@ -197,9 +197,9 @@ enum CLI {
             Core.shared.scanHealth(staleAfter: 0) { _ in sem.signal() }
             sem.wait()
             let entries = Core.shared.history.snapshot()
-                .filter { $0.status == "active" && $0.key != nil && $0.url != nil }
+                .filter { $0.status == "active" && $0.url != nil && Core.shared.extractKey($0) != nil }
             let skipped = Core.shared.history.snapshot()
-                .filter { $0.status == "active" && ($0.key == nil || $0.url == nil) }.count
+                .filter { $0.status == "active" && ($0.url == nil || Core.shared.extractKey($0) == nil) }.count
             var dead: [String] = [], quota: [String] = [], err: [String] = [], ok = 0, demoted: [String] = []
             for e in entries {
                 let prev = before[e.id] ?? "未测"

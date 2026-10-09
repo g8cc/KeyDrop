@@ -1545,6 +1545,30 @@ openai-compatibility:
                 let e2 = core.history.find(idPrefix: "mon-model")!
                 t.equal(e2.modelProbeLog?["z-ai/glm-5.3-free"]?.count, 2, "二轮扫描轨迹增长(增量合并不覆盖)")
             }
+            // 场景 8:多 key 条目(账本不落 key 字段)也要进监控 —— 否则它的格子永远灰着
+            do {
+                let env = try! TestEnv("reg-mon-multikey")
+                defer { env.cleanup() }
+                guard let srv = try? MockHTTPServer(mode: .openAI) else {
+                    t.expect(false, "mock 启动失败"); return
+                }
+                let url = "http://127.0.0.1:\(srv.port)/v1"
+                let core = Core()
+                try! core.history.append(HistoryEntry(
+                    id: "mon-multikey-0001", ts: Date().timeIntervalSince1970,
+                    raw: "\(url) sk-mkfirst000001\nsk-mksecond00002",
+                    format: "cpa-multikey", name: "multikey", url: url, model: "model-a",
+                    models: ["model-a"], key: nil, keyMasked: "2 个 key", targets: [],
+                    ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                    cpaConfigPath: nil, status: "active"
+                ))
+                let done = DispatchSemaphore(value: 0)
+                core.scanHealth(staleAfter: 0) { _ in done.signal() }
+                _ = done.wait(timeout: .now() + 60)
+                let e = core.history.find(idPrefix: "mon-multikey")!
+                t.equal(e.health, "ok", "多 key 条目凭据从 raw 恢复后参与探测")
+                t.equal(e.probeLog?.count, 1, "监控格不再「未采集」灰格: \(e.probeLog?.count ?? -1)")
+            }
         }
 
         h.runSuite("Regression.自动探测本机代理") { t in

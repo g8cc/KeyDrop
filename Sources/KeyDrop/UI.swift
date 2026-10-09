@@ -924,7 +924,10 @@ struct HistoryRow: View {
 
     var body: some View {
         let displayModels = entry.models ?? (entry.model.map { [$0] })
-        let testable = entry.status == "active" && entry.key != nil && entry.url != nil
+        // 多 key 条目账本不落 key 字段(只记「N 个 key」),凭据能从 raw 恢复,
+        // 所以按钮可见性也必须走 extractKey —— 否则 v1.4.51 修好的重测/curl 在这类行上根本点不到
+        let testable = entry.status == "active" && entry.url != nil
+            && Core.shared.extractKey(entry) != nil
         let dotColor: Color = {
             if entry.status != "active" { return Color.secondary.opacity(0.6) }
             switch entry.health {
