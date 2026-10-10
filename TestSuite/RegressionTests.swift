@@ -1077,6 +1077,50 @@ openai-compatibility:
             t.equal(core.history.snapshot().count, cntBefore, "取消后不入库")
         }
 
+        h.runSuite("Regression.监控只测勾选模型") { t in
+            guard let srv = try? MockHTTPServer(mode: .partialCatalog) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let url = "http://127.0.0.1:\(srv.port)/v1"
+            let catalogProbe = APITester.test(url: url, key: "sk-pool-000000000000000000", timeout: 5)
+            t.expect(!catalogProbe.ok, "不传探测池时按目录探测(撞 424): \(catalogProbe.detail)")
+            let poolProbe = APITester.test(url: url, key: "sk-pool-000000000000000000", timeout: 5,
+                                           preferredModel: "z-ai/glm-5.3",
+                                           probePool: ["z-ai/glm-5.3"])
+            t.expect(poolProbe.ok, "探测池收窄为勾选模型后,目录外的自配模型也能测到: \(poolProbe.detail)")
+            t.equal(poolProbe.workingModels, ["z-ai/glm-5.3"], "working 只含勾选的模型")
+            let times: [String: TimeInterval] = ["m1": 100, "m2": 50, "m3": 200]
+            let order = APITester.configuredProbeOrder(["act", "m1", "m2", "m3", "m4", "m5", "m6"],
+                                                       preferred: "act", modelProbeTimes: times)
+            t.equal(order.count, 4, "勾选再多也每轮 4 个请求")
+            t.equal(order.first, "act", "激活模型置顶")
+            t.equal(order, ["act", "m4", "m5", "m6"], "槽位给勾选里从未测过的,不再被目录模型占掉")
+            t.equal(APITester.configuredProbeOrder(["a", "b", "a"], preferred: "a", modelProbeTimes: nil),
+                    ["a", "b"], "勾选列表去重")
+            t.equal(APITester.configuredProbeOrder(["x", "y"], preferred: "z", modelProbeTimes: nil),
+                    ["z", "x", "y"], "激活模型不在勾选里也照测")
+        }
+
+        h.runSuite("Regression.proxy-ok 条目本轮跳过直连") { t in
+            guard let px = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "代理 mock 启动失败"); return
+            }
+            let proxy = "http://127.0.0.1:\(px.port)"
+            let blocked = "http://10.255.255.1:9/v1"
+            let first = APITester.test(url: blocked, key: "sk-geoblocked-0000000000000000",
+                                       timeout: 3, proxy: proxy)
+            t.expect(first.ok, "首轮:直连失败后经代理可用: \(first.detail)")
+            t.contains(first.detail, "直连失败,需代理", "首轮口径仍是先直连再补代理")
+            let second = APITester.test(url: blocked, key: "sk-geoblocked-0000000000000000",
+                                        timeout: 3, proxy: proxy, knownNeedsProxy: true)
+            t.expect(second.ok, "第二轮:已知需代理,直接走代理: \(second.detail)")
+            t.expect(second.needsProxy, "仍标需代理(下轮继续跳过)")
+            t.expect(!second.detail.contains("直连失败"), "不再白打注定 403/超时的直连: \(second.detail)")
+            let pxDown = APITester.test(url: blocked, key: "sk-geoblocked-0000000000000000",
+                                        timeout: 3, proxy: "http://127.0.0.1:1", knownNeedsProxy: true)
+            t.expect(!pxDown.ok, "代理挂 + 直连不通 → 判不可用,不谎报")
+        }
+
         // MARK: - CPA 生图渠道(image: true + 独立条目,与文本条目零交叉)
 
         // 场景 1:已有文本聚合条目,image-add 新建独立 -image 条目并打 image: true,
@@ -1413,11 +1457,11 @@ openai-compatibility:
         // ② 单次失败立即降级(抖动误杀),反之无失败记忆;③ 健康测试直连上游,
         // 用户实际走 CPA(8317)—— 上游 OK ≠ CPA 链路 OK(路由/容器/代理都可能断)
         h.runSuite("Regression.实战监控") { t in
-            func entry(_ id: String, _ url: String, _ key: String, _ model: String, targets: [String]) -> HistoryEntry {
+            func entry(_ id: String, _ url: String, _ key: String, _ model: String, targets: [String], models: [String]? = nil) -> HistoryEntry {
                 HistoryEntry(
                     id: id, ts: Date().timeIntervalSince1970, raw: url + " " + key,
                     format: "multiline", name: id.prefix(8).description, url: url, model: model,
-                    models: [model], key: key, keyMasked: "sk-t…", targets: targets,
+                    models: models ?? [model], key: key, keyMasked: "sk-t…", targets: targets,
                     ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
                     cpaConfigPath: nil, status: "active"
                 )
@@ -1604,8 +1648,11 @@ openai-compatibility:
                     t.expect(false, "mock 启动失败"); return   // 1 个 free 可用 + 3 个 429
                 }
                 let core = Core()
+                // 监控只测勾选的模型:这里用户勾选了全部 4 个(限流的 3 个也在其中),
+                // 才会各自记到失败格;没勾的目录模型不再占探测槽
                 try! core.history.append(entry("mon-model-006", "http://127.0.0.1:\(srv.port)/v1", "sk-mdl000000001",
-                                               "z-ai/glm-5.3-free", targets: []))
+                                               "z-ai/glm-5.3-free", targets: [],
+                                               models: ["z-ai/glm-5.3-free", "composer-2.5", "grok-4.5", "grok-4.6"]))
                 let done = DispatchSemaphore(value: 0)
                 core.scanHealth(staleAfter: 0) { _ in done.signal() }
                 _ = done.wait(timeout: .now() + 90)

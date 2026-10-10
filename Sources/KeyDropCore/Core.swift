@@ -1064,10 +1064,17 @@ public final class Core {
             queue.async {
                 defer { sem.signal(); group.leave() }
                 let px = self.proxyForHealth()
+                // 监控只测用户勾选的模型(激活模型置顶):站点目录里没勾的模型与本次
+                // 监控无关,拿去轮换只会把我自己的模型挤到十几轮之后才补一格。
+                // 发现新可用模型是「行内 ↻ 刷新」的活,不是巡检的活
+                var probePool = e.models ?? []
+                if let am = e.model, !probePool.contains(am) { probePool.insert(am, at: 0) }
                 let test = APITester.test(url: entryURL, key: entryKey, timeout: 10,
                                           proxy: px, preferredModel: e.model,
                                           modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t },
-                                          importedModels: e.models)
+                                          importedModels: e.models,
+                                          probePool: probePool.isEmpty ? nil : probePool,
+                                          knownNeedsProxy: e.health == "proxy-ok")
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 let (h, d) = Self.healthFor(test)
                 var updated = e

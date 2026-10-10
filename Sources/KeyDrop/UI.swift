@@ -871,7 +871,7 @@ struct HistoryRow: View {
         let log = entry.modelProbeLog?[m] ?? []
         if log.isEmpty {
             MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6)
-                .help("该模型尚未被探测(每轮只测 4 个:激活模型置顶,其余按「从未测过→最久未测」轮换,几轮内全覆盖);灰=无证据,≠不可用")
+                .help("该模型尚未被探测(巡检只测你勾选的模型,每轮最多 4 个:激活模型置顶,其余按「从未测过→最久未测」在勾选范围内轮换);灰=无证据,≠不可用")
         } else {
             let okc = log.filter { $0.ok }.count
             let up = Int((Double(okc) / Double(log.count) * 100).rounded())

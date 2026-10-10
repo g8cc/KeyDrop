@@ -199,11 +199,32 @@ public enum APITester {
 
     /// - Parameter preferredModel: 用户实际激活的模型(new-api TestModel 思路),探测时优先验证它
     /// - Parameter modelProbeTimes: 模型 → 上次被探测的时间戳(监控轮换用)。nil=不轮换
-    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil) -> APITestResult {
-        // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
-        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
-        if direct.ok { return direct }
+    /// - Parameter probePool: chat 探测池。nil=沿用站点 /models 目录;非 nil 时**只探这份**
+    ///   (监控传用户勾选的模型,站点目录里的其它模型与本次监控无关)
+    /// - Parameter knownNeedsProxy: 上轮已判定「直连必被地域/合规封锁、经代理可用」。
+    ///   为 true 时本轮先走代理,不再白打一次注定 403 的直连;代理侧仍不通才回退直连复核
+    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, knownNeedsProxy: Bool = false) -> APITestResult {
         let p = proxy?.trimmingCharacters(in: .whitespaces)
+        if knownNeedsProxy, let p, !p.isEmpty {
+            let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+            if via.ok {
+                return APITestResult(ok: true, style: via.style, models: via.models,
+                                     detail: via.detail + " | 需代理(本轮跳过直连)",
+                                     authFailed: false, needsProxy: true,
+                                     quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
+                                     workingModels: via.workingModels, quotaModels: via.quotaModels,
+                                     latencyMs: via.latencyMs, modelLatencies: via.modelLatencies)
+            }
+            // 代理侧也不通才回退直连一次:可能是本机代理挂了,也可能是地区限制解除
+            // (或 key 真失效)。直连恢复可用就不再标 needsProxy,下轮回到常规路径
+            let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+            if direct.ok { return direct }
+            if direct.authFailed, !via.authFailed { return direct }
+            return via
+        }
+        // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
+        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+        if direct.ok { return direct }
         if p == nil || p!.isEmpty {
             return direct
         }
@@ -211,7 +232,7 @@ public enum APITester {
         // 但区域/合规封锁返回的正是 JSON 403(真实事故:tokenharbor
         // 「API access from your region is not available」),key 有效、经代理 200,
         // 短路把这类 key 直接判死,用户配好的代理一次都没用上
-        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
+        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
         if via.ok {
             // 必须透传探测明细:只拷 ok/models/detail 会把 workingModels/quotaModels/延迟/
             // quotaExhausted 全部丢掉 → 需代理的 key 导入时限流模型不被排除、监控图无延迟、
@@ -229,7 +250,7 @@ public enum APITester {
         return via
     }
 
-    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil) -> APITestResult {
+    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil) -> APITestResult {
         let base = url.hasSuffix("/") ? String(url.dropLast()) : url
         let candidates = endpointCandidates(base)
         let s = session(for: proxy)
@@ -278,7 +299,15 @@ public enum APITester {
                 // 401/403 仅在没有任何可用模型时才判 key 失效(见下方 gatedModels 注释)。
                 // 真实事故:4 模型中首选 composer 429、
                 // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
-                let probeOrder = chatProbeOrder(models, preferred: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels)
+                let probeOrder: [String]
+                if let pool = probePool, !pool.isEmpty {
+                    probeOrder = configuredProbeOrder(pool, preferred: preferredModel,
+                                                      modelProbeTimes: modelProbeTimes)
+                } else {
+                    probeOrder = chatProbeOrder(models, preferred: preferredModel,
+                                                modelProbeTimes: modelProbeTimes,
+                                                importedModels: importedModels)
+                }
                 var working: [String] = []
                 var quotaModels: [String] = []
                 var degradedModel: (String, Int)? = nil
@@ -411,6 +440,31 @@ public enum APITester {
         let freeFirst = rest.filter { $0.lowercased().contains("free") }
         let others = rest.filter { !$0.lowercased().contains("free") }
         return Array((importedOnly + freeFirst + others).prefix(4))
+    }
+
+    /// 监控探测池 = 用户勾选的模型,站点 /models 目录里的其余模型一律不探。
+    /// 真实反馈(tokenharbor): 目录 68 个模型,勾选的 2 个里非激活那个排在一串
+    /// 「从未测过」的目录模型后面,13 小时才补到一格;而监控真正要回答的是
+    /// 「我在用的模型现在还好不好」。上限仍 4 次请求:激活模型置顶,其余按
+    /// 「从未测过 > 最久未测」在勾选范围内轮换,勾得多也不会加压
+    public static func configuredProbeOrder(_ pool: [String], preferred: String?, modelProbeTimes: [String: TimeInterval]?) -> [String] {
+        var seen = Set<String>()
+        let uniq = pool.filter { seen.insert($0).inserted }
+        let trimmed = preferred?.trimmingCharacters(in: .whitespaces)
+        let pinned = (trimmed?.isEmpty == false) ? trimmed : nil
+        var order: [String] = []
+        if let pinned { order.append(pinned) }   // 激活模型即便不在勾选列表里也要测
+        let rest = uniq.filter { $0 != pinned }
+        let slots = 4 - order.count
+        if let times = modelProbeTimes, !times.isEmpty, rest.count > slots {
+            let never = rest.filter { times[$0] == nil }
+            let probed = rest.filter { times[$0] != nil }
+                .sorted { (times[$0] ?? 0) < (times[$1] ?? 0) }
+            order.append(contentsOf: (never + probed).prefix(slots))
+        } else {
+            order.append(contentsOf: rest.prefix(slots))
+        }
+        return order
     }
 
     /// POST chat 健康检查结果
