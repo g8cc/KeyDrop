@@ -422,16 +422,18 @@ public final class Core {
                 let q = Set(test.quotaModels)
                 selectedModels = test.models.filter { !q.contains($0) }
                 notes.append("自动排除 \(q.count) 个限流模型: \(test.quotaModels.prefix(3).joined(separator: "、"))\(q.count > 3 ? " 等" : "")")
-            } else if test.models.count <= 5 {
-                selectedModels = test.models
-                notes.append("可用模型仅 \(test.models.count) 个,已全部导入")
             } else if let picker = pickModels {
+                // 一律手选(用户明确要求):名义上的 SOTA 名单本身在变,而且里面不少是垃圾,
+                // 所以哪怕只有 ≤5 个候选也不替用户拍板。CLI 没有选择器,才走下面的自动路径
                 let picked = picker(test.models)
                 if picked.isEmpty {
                     throw ParseError.io("已取消选择模型")
                 }
                 pickedViaPicker = true
                 selectedModels = picked
+            } else if test.models.count <= 5 {
+                selectedModels = test.models
+                notes.append("可用模型仅 \(test.models.count) 个,已全部导入")
             } else if !pastedModelsFailed, let pm = parsed.model, !pm.isEmpty {
                 selectedModels = [pm]
             } else {
@@ -955,6 +957,38 @@ public final class Core {
     /// 测试辅助:清空探测缓存
     public static func resetProxyProbeForTest() {
         probeLock.lock(); cachedAutoProxy = nil; lastProbeAt = 0; probeLock.unlock()
+    }
+
+    /// 代理候选:顶栏「代理」下拉里的一条(地址 + 在听状态)
+    public struct ProxyCandidate: Identifiable, Equatable {
+        public let url: String
+        public let note: String
+        public let alive: Bool
+        public var id: String { url }
+    }
+
+    /// 候选端口的可读来源。认不出的端口只说「本地端口」,不假装知道是谁在监听
+    public static func proxyCandidateNote(_ proxy: String) -> String {
+        switch URL(string: proxy)?.port {
+        case 7890, 7891: return "Clash Verge / mihomo"
+        case 1087:  return "Clash 旧版"
+        case 6152:  return "Surge"
+        case 10808: return "v2rayN"
+        case 8118:  return "Privoxy"
+        default:    return "本地端口"
+        }
+    }
+
+    /// 逐个 TCP 探测候选端口,给顶栏下拉展示:在听的排前面,同组保持候选原序。
+    /// 单次探测 300ms 超时 × 6 个端口 ≈ 最坏 1.8s,调用方必须放后台队列
+    public static func localProxyCandidates() -> [Core.ProxyCandidate] {
+        let probed = autoProxyCandidates.enumerated().map { idx, url in
+            (order: idx, item: ProxyCandidate(url: url, note: proxyCandidateNote(url),
+                                              alive: tcpReachable(url)))
+        }
+        return probed.sorted { a, b in
+            a.item.alive != b.item.alive ? a.item.alive : a.order < b.order
+        }.map(\.item)
     }
 
     private static func tcpReachable(_ proxy: String) -> Bool {
@@ -1872,6 +1906,17 @@ public final class Core {
 
     public static func addClashProxies(_ proxies: [ClashProxy]) throws -> (message: String, fileName: String?) {
         try ClashWriter.add(proxies: proxies)
+    }
+
+    /// 节点能否真正写进 Clash 配置:缺 server/port/uuid 任一项都会被 ClashWriter 拒
+    public static func clashNodeValid(_ p: ClashProxy) -> Bool {
+        !p.server.isEmpty && p.port > 0 && !p.uuid.isEmpty
+    }
+
+    /// 勾选过滤:只保留「被勾选且有效」的节点,顺序保持预览列表原样(下标即视图顺序)。
+    /// 无效节点即使被勾也不写 —— 写进去也是一条永远连不上的配置
+    public static func chosenClashProxies(_ all: [ClashProxy], selected: Set<Int>) -> [ClashProxy] {
+        all.enumerated().filter { selected.contains($0.offset) && clashNodeValid($0.element) }.map(\.element)
     }
 
     public func refreshModels(

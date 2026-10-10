@@ -1000,6 +1000,83 @@ openai-compatibility:
             t.contains(yaml, "uuid: \"11111111", "vless 仍用 uuid 字段")
         }
 
+        // 用户明确要求:Clash 节点导入必须能勾选,不要的一律不入库
+        h.runSuite("Regression.Clash 节点勾选过滤") { t in
+            let ok = ClashProxy(name: "ok", type: "vless", server: "s.example.org", port: 443,
+                                uuid: "u-ok", sni: "s.example.org")
+            let junk = ClashProxy(name: "junk", type: "vless", server: "", port: 0, uuid: "", sni: "")
+            let ok2 = ClashProxy(name: "ok2", type: "trojan", server: "t.example.org", port: 8443,
+                                 uuid: "u-2", sni: "t.example.org")
+            let all = [ok, junk, ok2]
+            t.expect(Core.clashNodeValid(ok), "完整节点判为有效")
+            t.expect(!Core.clashNodeValid(junk), "缺 server/port/uuid 判为无效")
+
+            t.equal(Core.chosenClashProxies(all, selected: [0, 2]).map(\.name), ["ok", "ok2"],
+                    "只写勾选的,顺序保持预览列表原样")
+            t.equal(Core.chosenClashProxies(all, selected: [0, 1, 2]).count, 2,
+                    "无效节点即使被勾也不写")
+            t.expect(Core.chosenClashProxies(all, selected: []).isEmpty,
+                     "一个没勾 → 什么都不导入")
+            t.equal(Core.chosenClashProxies(all, selected: [0, 99]).count, 1,
+                    "越界下标安全忽略,不崩")
+        }
+
+        // 用户明确要求:模型一律手选。名义上的 SOTA 名单本身在变,里面不少还是垃圾,
+        // 所以哪怕候选只有 2 个(≤5)也不替用户拍板 —— 有选择器就必须问
+        h.runSuite("Regression.模型一律手选(≤5 不再自动全导)") { t in
+            let env = try! TestEnv("reg-model-handpick")
+            defer { env.cleanup() }
+            for ddl in ["""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """, """
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """] {
+                try? DB(path: env.dir + "/cc-switch.db").run(ddl)
+            }
+            guard let srv = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let base = "http://127.0.0.1:\(srv.port)"
+            let core = Core()
+
+            // ① CLI 没有选择器,才走 ≤5 自动全导
+            let r1 = try! core.add(raw: "\(base) sk-handcli-0000000000000000000000000",
+                                   ccOverride: true, cpaOverride: false, dshOverride: false)
+            t.contains(r1.lines.joined(separator: "\n"), "已全部导入", "无选择器时保留自动路径")
+
+            // ② 有选择器:catalog 仅 2 个模型,仍然弹给用户,只入库勾选的那一个
+            // (force=false 才会真探测——force 跳过整段探测,弹窗逻辑也就不存在)
+            var seen: [String] = []
+            let r2 = try! core.add(raw: "\(base) sk-handpick-000000000000000000000000",
+                                   ccOverride: true, cpaOverride: false, dshOverride: false,
+                                   pickModels: { cands in seen = cands; return ["glm-5.2"] })
+            t.equal(seen.sorted(), ["glm-5.2", "gpt-5.6-sol"], "≤5 候选也弹给用户手选")
+            let lines2 = r2.lines.joined(separator: "\n")
+            t.expect(!lines2.contains("已全部导入"), "不再有「已全部导入」: \(lines2)")
+            t.equal(r2.entry.models, ["glm-5.2"], "只入库用户勾选的模型")
+            let e2 = core.history.snapshot().first { $0.id == r2.entry.id }
+            t.equal(e2?.models, ["glm-5.2"], "落盘条目同样只有勾选的模型")
+
+            // ③ 用户取消 → 抛错,不落一条半成品
+            let cntBefore = core.history.snapshot().count
+            do {
+                _ = try core.add(raw: "\(base) sk-handcancel-00000000000000000000000",
+                                 ccOverride: true, cpaOverride: false, dshOverride: false,
+                                 pickModels: { _ in [] })
+                t.expect(false, "取消选择应抛错")
+            } catch {
+                t.contains(error.localizedDescription, "取消", "取消选择回执明确")
+            }
+            t.equal(core.history.snapshot().count, cntBefore, "取消后不入库")
+        }
+
         // MARK: - CPA 生图渠道(image: true + 独立条目,与文本条目零交叉)
 
         // 场景 1:已有文本聚合条目,image-add 新建独立 -image 条目并打 image: true,
@@ -1609,6 +1686,17 @@ openai-compatibility:
             Prefs.shared.proxy = ""
             core.noteProxyWorked(needsProxy: false, used: hit)
             t.equal(Prefs.shared.proxy, "", "直连成功不需要代理,不写")
+
+            // ④ 顶栏「代理」下拉:候选逐条带在听状态,在听的排前面(手输之外的第二条路)
+            Core.autoProxyCandidates = ["http://127.0.0.1:1", "http://127.0.0.1:\(srv.port)",
+                                        "http://127.0.0.1:2"]
+            let cands = Core.localProxyCandidates()
+            t.equal(cands.count, 3, "候选条数与注入列表一致")
+            t.equal(cands.first?.url, "http://127.0.0.1:\(srv.port)", "在听的排第一")
+            t.equal(cands.filter { $0.alive }.count, 1, "只有 mock 端口标记在听")
+            t.equal(Core.proxyCandidateNote("http://127.0.0.1:7890"), "Clash Verge / mihomo", "常见端口标注来源")
+            t.equal(Core.proxyCandidateNote("http://127.0.0.1:6152"), "Surge", "Surge 端口标注")
+            t.equal(Core.proxyCandidateNote("http://127.0.0.1:9999"), "本地端口", "认不出的端口不瞎猜来源")
         }
 
         // MARK: - 回写污染自愈:cc-switch 把陈旧 loopback live 环境回写进托管 claude 行 → 对账修复

@@ -25,11 +25,16 @@ final class AppState: ObservableObject {
     private var modelPickerResolved = false
     @Published var clashPreviewShown = false
     @Published var clashPreviewProxies: [ClashProxy] = []
+    /// 预览弹窗里被勾选的节点下标。默认全选,但用户可以只留自己要的几个
+    @Published var clashSelected: Set<Int> = []
     @Published var useCC: Bool
     @Published var useGrok: Bool
     @Published var useCPA: Bool
     @Published var useDSH: Bool
     @Published var proxyText: String
+    /// 顶栏「代理」下拉的候选端口(在听的排前面),面板出现时后台探测
+    @Published var proxyCandidates: [Core.ProxyCandidate] = []
+    @Published var proxyProbing = false
     @Published var highlightID: String?
     @Published var highlightPulse = 0
     @Published var helpShown = false
@@ -102,8 +107,7 @@ final class AppState: ObservableObject {
             let proxies = Core.parseClashProxies(raw: raw)
             if !proxies.isEmpty {
                 input = ""
-                clashPreviewProxies = proxies
-                clashPreviewShown = true
+                openClashPreview(proxies)
                 return
             }
         }
@@ -133,8 +137,7 @@ final class AppState: ObservableObject {
                     isBusy = false
                     busyLabel = ""
                     input = ""
-                    clashPreviewProxies = list
-                    clashPreviewShown = true
+                    openClashPreview(list)
                     setStatus("检测到订阅,请确认导入", ok: true)
                     return
                 }
@@ -260,7 +263,22 @@ final class AppState: ObservableObject {
     func handleClashPreviewDismiss() {
         if clashPreviewShown == false {
             clashPreviewProxies = []
+            clashSelected = []
         }
+    }
+
+    /// 节点能不能真正写进 Clash 配置:缺 server/port/uuid 任一项都会被 ClashWriter 拒
+    /// (判定放在 Core,和勾选过滤一起测)
+    static func clashNodeValid(_ p: ClashProxy) -> Bool { Core.clashNodeValid(p) }
+
+    /// 打开节点预览:默认勾上全部有效节点(无效节点勾了也导不进去),
+    /// 但用户常常只想留其中几个 —— 订阅链接动辄上百节点
+    func openClashPreview(_ proxies: [ClashProxy]) {
+        clashPreviewProxies = proxies
+        clashSelected = Set(proxies.enumerated()
+            .filter { Core.clashNodeValid($0.element) }
+            .map(\.offset))
+        clashPreviewShown = true
     }
 
     func doDelete(_ id: String) {
@@ -288,16 +306,19 @@ final class AppState: ObservableObject {
     }
 
     func doAddClashProxies() {
-        let proxies = clashPreviewProxies
+        let all = clashPreviewProxies
+        let chosen = clashSelected
         clashPreviewShown = false
         clashPreviewProxies = []
-        guard !proxies.isEmpty else {
+        clashSelected = []
+        guard !all.isEmpty else {
             setStatus("没有可导入的节点", ok: false)
             return
         }
-        let valid = proxies.filter { !$0.server.isEmpty && $0.port > 0 && !$0.uuid.isEmpty }
+        // 只写勾选的:按订阅链接动辄上百节点,全灌进 Clash 等于塞一堆没在用的配置
+        let valid = Core.chosenClashProxies(all, selected: chosen)
         guard !valid.isEmpty else {
-            setStatus("节点无效(缺少 server/port/uuid)", ok: false)
+            setStatus(chosen.isEmpty ? "未勾选任何节点" : "节点无效(缺少 server/port/uuid)", ok: false)
             return
         }
         isBusy = true
@@ -801,6 +822,25 @@ final class AppState: ObservableObject {
         try? prefs.save()
     }
 
+    /// 顶栏「代理」下拉的候选:逐个 TCP 探测候选端口。
+    /// 最坏 6×300ms,必须后台跑,否则面板出现时会卡住主线程
+    func refreshProxyCandidates() {
+        guard !proxyProbing else { return }
+        proxyProbing = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let found = Core.localProxyCandidates()
+            DispatchQueue.main.async {
+                self?.proxyCandidates = found
+                self?.proxyProbing = false
+            }
+        }
+    }
+
+    /// 选中一个代理:走 setProxy 同一条路,保证规范化 + 落盘一致
+    func pickProxy(_ candidate: Core.ProxyCandidate) {
+        setProxy(candidate.url)
+    }
+
     private var prefs: Prefs { Prefs.shared }
 
     func notify(summary: String, body: String) {
@@ -1279,46 +1319,67 @@ struct ClashPreviewView: View {
     @ObservedObject var state: AppState
 
     private var validCount: Int {
-        state.clashPreviewProxies.filter { !$0.server.isEmpty && $0.port > 0 }.count
+        state.clashPreviewProxies.filter { AppState.clashNodeValid($0) }.count
+    }
+
+    private var validIndexes: [Int] {
+        Array(state.clashPreviewProxies.enumerated()
+            .filter { AppState.clashNodeValid($0.element) }
+            .map(\.offset))
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("检测到 \(state.clashPreviewProxies.count) 个代理节点")
                 .font(.system(size: 14, weight: .semibold))
-            Text("确认后写入 Clash Party profiles 目录")
+            Text("勾选要写入的节点(默认全选);没勾的不会进 Clash 配置")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(state.clashPreviewProxies.enumerated()), id: \.offset) { _, p in
-                        let valid = !p.server.isEmpty && p.port > 0
-                        HStack(spacing: 8) {
-                            Text(p.type.uppercased())
-                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 2)
-                                .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.08)))
-                            Text(p.name)
-                                .font(.system(size: 11))
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer()
-                            Text(valid ? "\(p.server):\(p.port)" : "无效节点")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(valid ? .secondary : Color(red: 0.8, green: 0.3, blue: 0.25))
+                    ForEach(Array(state.clashPreviewProxies.enumerated()), id: \.offset) { idx, p in
+                        let valid = AppState.clashNodeValid(p)
+                        Toggle(isOn: Binding(
+                            get: { state.clashSelected.contains(idx) },
+                            set: { on in
+                                if on { state.clashSelected.insert(idx) } else { state.clashSelected.remove(idx) }
+                            }
+                        )) {
+                            HStack(spacing: 8) {
+                                Text(p.type.uppercased())
+                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(RoundedRectangle(cornerRadius: 3).fill(Color.primary.opacity(0.08)))
+                                Text(p.name)
+                                    .font(.system(size: 11))
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                Text(valid ? "\(p.server):\(p.port)" : "无效节点")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundStyle(valid ? .secondary : Color(red: 0.8, green: 0.3, blue: 0.25))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .padding(.vertical, 5)
+                        .toggleStyle(.checkbox)
+                        .disabled(!valid)
+                        .padding(.vertical, 3)
                         Divider().opacity(0.25)
                     }
                 }
             }
             .frame(minHeight: 160, maxHeight: 300)
 
-            HStack {
+            HStack(spacing: 8) {
+                Button("全选") { state.clashSelected = Set(validIndexes) }
+                Button("清空") { state.clashSelected = [] }
+                Text("已选 \(state.clashSelected.count) / \(validCount)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
                 if validCount < state.clashPreviewProxies.count {
-                    Text("将跳过 \(state.clashPreviewProxies.count - validCount) 个无效节点")
+                    Text("另有 \(state.clashPreviewProxies.count - validCount) 个无效节点")
                         .font(.system(size: 10))
                         .foregroundStyle(Color(red: 0.85, green: 0.45, blue: 0.15))
                 }
@@ -1326,12 +1387,15 @@ struct ClashPreviewView: View {
                 Button("取消") {
                     state.clashPreviewShown = false
                     state.clashPreviewProxies = []
+                    state.clashSelected = []
                 }
                 .keyboardShortcut(.escape, modifiers: [])
-                Button("确认导入") { state.doAddClashProxies() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(validCount == 0 || state.isBusy)
-                    .keyboardShortcut(.return, modifiers: [])
+                Button(state.clashSelected.isEmpty ? "请勾选节点" : "导入 \(state.clashSelected.count) 个") {
+                    state.doAddClashProxies()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(state.clashSelected.isEmpty || state.isBusy)
+                .keyboardShortcut(.return, modifiers: [])
             }
         }
         .padding(18)
@@ -1373,7 +1437,7 @@ struct HelpView: View {
                         item("顶栏 cc-switch / CPA 开关控制写入目标,可同时开启")
                     }
                     section("代理", icon: "network") {
-                        item("顶栏「代理」框填本地代理,如 http://127.0.0.1:7890")
+                        item("顶栏「代理」框填本地代理,如 http://127.0.0.1:7890;右侧 ▾ 列出本机在听的代理端口,点一下即填入")
                         item("写入时同步到 Claude Code 环境变量与 CPA 条目级 proxy-url;留空则清除旧代理")
                         item("Codex 特殊:其配置不支持代理字段。被墙网关导入 codex 后,请在 cc-switch「代理」面板开启 Codex 接管,或启动 codex 前 export HTTPS_PROXY")
                     }
@@ -1718,6 +1782,7 @@ struct PanelView: View {
             DispatchQueue.main.async { inputFocused = true }
             state.scanHealth()
             state.startHealthTimer()
+            state.refreshProxyCandidates()
         }
         .onChange(of: state.statusText) { _, newValue in
             if newValue.isEmpty { showStatusDetail = false }
@@ -1853,6 +1918,39 @@ struct PanelView: View {
                     if !focused { state.commitProxy() }
                 }
                 .help("本地代理,如 http://127.0.0.1:7890;留空则自动探测本机代理(直连失败时补测,连通后自动填入此框)")
+                // 候选下拉:手输仍保留,这里只是把「本机哪些端口真有代理在听」摆出来,
+                // 免得用户凭记忆猜端口 —— 没在听的端口置灰不可选,选了必踩空
+                Menu {
+                    Button { state.setProxy("") } label: {
+                        Label("自动(留空)", systemImage: state.proxyText.isEmpty ? "checkmark.circle.fill" : "circle")
+                    }
+                    Divider()
+                    ForEach(state.proxyCandidates) { c in
+                        Button { state.pickProxy(c) } label: {
+                            HStack(spacing: 8) {
+                                Text(c.url)
+                                Spacer(minLength: 12)
+                                Text(c.alive ? "在听 · \(c.note)" : "未监听")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(c.alive ? Color(red: 0.22, green: 0.58, blue: 0.40) : Color.secondary)
+                            }
+                        }
+                        .disabled(!c.alive)
+                    }
+                    Divider()
+                    Button { state.refreshProxyCandidates() } label: {
+                        Label(state.proxyProbing ? "探测中…" : "重新探测", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(state.proxyProbing)
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 14, height: 14)
+                }
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("本机在听的代理端口,点一下填进左框;灰色=该端口没有代理在监听。留空 = 直连优先,直连失败才自动探测")
                 updateIndicator
                 Button {
                     state.settingsShown = true
