@@ -250,6 +250,53 @@ enum ParserTests {
                 t.equal(sep.url, "https://api-relay-test.example.com/v1", "分隔符指令:URL 不受影响")
             }
         }
+
+        h.runSuite("Parser.JWT 与请求头形态") { t in
+            // 合成 JWT(不带任何真实凭据):天翼云 EAI 这类开放平台直接拿 3 段 JWT 当 Bearer key。
+            // 双漏判:①278 字符超通用 256 上限;②lowercase 后是 [a-z0-9.-] 串,正好过
+            // 裸域名正则被当 hostname 抢走 → 用户照文档粘贴只能报「未找到 API key」
+            func b64u(_ s: String) -> String {
+                Data(s.utf8).base64EncodedString()
+                    .replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: "=", with: "")
+            }
+            let jwtHead = b64u("{\"kid\":\"16d0c7b026e548a2\",\"typ\":\"JWT\",\"alg\":\"HS256\"}")
+            let jwtBody = b64u("{\"role\":\"openApi\",\"createTime\":1792112740211,\"iss\":\"cgt.eai\","
+                + "\"exp\":1824998400,\"aud\":\"eai-openapi\",\"sub\":\"openapi-app\"}")
+            let jwtSig = b64u("sigAB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2yZ3aB4cD5eF6gH7iJ9kL")
+            let jwt = jwtHead + "." + jwtBody + "." + jwtSig
+            t.expect(jwt.count > 256, "样本必须超通用 key 上限才有覆盖意义: \(jwt.count)")
+            t.expect(!Parser.looksLikeURL(jwt.lowercased()), "JWT 不得再被当裸域名抢走(真域名末段恒为字母 TLD)")
+            t.expect(Parser.looksLikeURL("my.cool.relay.example.com"), "真域名仍认")
+            t.expect(Parser.looksLikeURL("1.2.2.8"), "IPv4 裸主机仍认(各段全数字例外)")
+            t.expect(Parser.looksLikeURL("relay.technology"), "长后缀域名仍认(IANA 最长 24)")
+
+            let p = try! Parser.parseWithFallback("https://eaichat.ctyun.cn/ai/platform/v2/cp\nglm-5.3-oc\n" + jwt)
+            t.equal(p.key, jwt, "JWT 识别为 key(结构合格即放行,不受 256 上限限制)")
+            t.equal(p.url, "https://eaichat.ctyun.cn/ai/platform/v2/cp", "同段文本的 URL 不被 JWT 干扰")
+            t.equal(p.model, "glm-5.3-oc", "同段文本的模型名保留")
+
+            let hdr = try! Parser.parseWithFallback("baseurl: https://eaichat.ctyun.cn/ai/platform/v2/cp\nAuthorization: Bearer " + jwt)
+            t.equal(hdr.key, jwt, "请求头形态 Authorization: Bearer <jwt> 剥壳成 key")
+            t.equal(hdr.url, "https://eaichat.ctyun.cn/ai/platform/v2/cp", "请求头形态的 URL 正常")
+
+            let cfg = try! Parser.parseWithFallback("{\"baseURL\":\"https://x.example.com/v1\",\"apiKey\":\"\(jwt)\",\"model\":\"glm-5.3-oc\"}")
+            t.equal(cfg.key, jwt, "cc-switch JSON 里的 JWT")
+            t.equal(cfg.model, "glm-5.3-oc", "JSON 里的模型")
+
+            // 负例:只按结构放行,长度放宽不能让证书/私钥级大 blob 混进来
+            do {
+                let bad = try Parser.parseWithFallback("https://x.example.com/v1 " + String(repeating: "A", count: 400))
+                t.expect(false, "400 字符无点 base64 blob 不该被当 key: \(bad.key ?? "")")
+            } catch { t.expect(true, "400 字符 base64 blob 仍拒收") }
+            t.equal(Parser.extractAllKeys(jwt + "." + b64u("extra")).count, 0, "四段串不算 JWT")
+            // 改头不换长度:否则缩到通用 256 以内会被通用规则收下,测不到「必须有 alg」这条
+            let noAlg = b64u("{\"kid\":\"16d0c7b026e548a2\",\"typ\":\"JWT\",\"enc\":\"A256GCM\"}")
+                + "." + jwtBody + "." + jwtSig
+            t.expect(noAlg.count > 256, "无 alg 变体也必须超通用上限: \(noAlg.count)")
+            t.equal(Parser.extractAllKeys(noAlg).count, 0, "头部无 alg 不算 JWT")
+        }
     }
 
     // MARK: - 重构对照实现(照抄重构前的字面量表达式,仅用于断言等价)

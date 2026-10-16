@@ -453,6 +453,17 @@ public enum Parser {
             s = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
             hadLabel = true
         }
+        // 从 curl / 请求头里直接复制的一行:`Authorization: Bearer <token>`。
+        // 上面那条通用标签式吃不下它("auth" 后面跟的是 "orization"),整行含空格与冒号
+        // 又必然过不了 key 校验 → 用户照文档粘一遍、报「未找到 API key」(真实反馈:
+        // 天翼云 EAI 给的示例就是请求头形态 + JWT)
+        if let r = s.range(of: #"^(?:(?:proxy-)?authorization|x-api-key)\s*[:=]\s*(?:bearer|basic|token)\s+"#, options: [.regularExpression, .caseInsensitive]) {
+            s = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            hadLabel = true
+        } else if let r = s.range(of: #"^(?:bearer|basic)\s+"#, options: [.regularExpression, .caseInsensitive]) {
+            s = String(s[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+            hadLabel = true
+        }
         if let sep, !sep.isEmpty {
             let cleaned = s.replacingOccurrences(of: sep, with: "")
             if looksLikeKey(cleaned) { return cleaned }
@@ -1152,6 +1163,16 @@ public enum Parser {
               !isDottedVersionModel(l),
               !regexMatch(l, modelFamilyPrefixPattern)
         else { return false }
+        // 末段必须是字母 TLD:真域名的最后一段永远是字母(com/cn/top,以及 .technology
+        // .international 这类长后缀——IANA 最长 24),而 JWT(三段 base64url,末段是
+        // 43/86 位且必含数字)形状上正好过上面的 hostname 正则,会被当裸域名抢走
+        // → key 永远识别不出来(真实反馈:天翼云 EAI 开放平台的 Bearer 就是 JWT)。
+        // 纯数字各段放行:那是 IPv4 裸主机(1.2.2.8)
+        let labels = l.split(separator: ".")
+        if !labels.allSatisfy({ seg in seg.allSatisfy({ $0.isNumber }) }) {
+            guard let last = labels.last, last.count >= 2, last.count <= 24,
+                  last.allSatisfy({ $0.isLetter }) else { return false }
+        }
         return URL(string: "https://" + l)?.host?.isEmpty == false
     }
 
@@ -1267,8 +1288,29 @@ public enum Parser {
         return UnicodeScalar(d - 26 + 48)!
     }
 
+    /// JWT 形态令牌(天翼云 EAI 等开放平台直接拿 3 段 JWT 当 Bearer key,实测 278 字符,
+    /// 超通用 256 上限就被判「不是 key」)。只按结构放行:三段非空 base64url + 头部解出
+    /// 带 alg 的 JSON。不做「长度够长就算」的放宽 —— 证书、私钥、大段 base64 都不满足本式
+    static func looksLikeJWT(_ s: String) -> Bool {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        guard t.count >= 48, t.count <= 4096 else { return false }
+        let segs = t.split(separator: ".", omittingEmptySubsequences: false)
+        guard segs.count == 3 else { return false }
+        let b64url = CharacterSet(charactersIn:
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+        for seg in segs {
+            guard !seg.isEmpty, seg.unicodeScalars.allSatisfy({ b64url.contains($0) }) else { return false }
+        }
+        guard let data = base64DecodeLoose(String(segs[0])),
+              let header = String(data: data, encoding: .utf8) else { return false }
+        let compact = header.replacingOccurrences(of: " ", with: "")
+        guard compact.hasPrefix("{"), compact.contains("\"alg\":") else { return false }
+        return compact.contains("\"typ\"") || compact.contains("\"kid\"")
+    }
+
     static func looksLikeKey(_ s: String) -> Bool {
         let t = stripCJK(s).trimmingCharacters(in: .whitespaces)
+        if looksLikeJWT(t) { return true }
         guard t.count >= 16, t.count <= 256 else { return false }
         guard regexMatch(t, #"^[\x21-\x7E]+$"#) else { return false }
         if t.contains(":") { return false }
