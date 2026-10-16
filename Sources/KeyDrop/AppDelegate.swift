@@ -31,7 +31,7 @@ class KeyDropPanel: NSPanel {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     var statusItem: NSStatusItem!
     var panel: KeyDropPanel?
     let state = AppState()
@@ -123,12 +123,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let editItem = NSMenuItem()
         main.addItem(editItem)
         let editMenu = NSMenu(title: "编辑")
+        // 撤销/重做不走 AppKit 的 undo:——它只认 window 那份 undoManager,而字段编辑器
+        // (SwiftUI/NSTextField 的编辑载体)另有自己的一份;这里显式取当前第一响应器的栈
+        let undoItem = editMenu.addItem(withTitle: "撤销", action: #selector(undoTextEdit(_:)), keyEquivalent: "z")
+        undoItem.target = self
+        let redoItem = editMenu.addItem(withTitle: "重做", action: #selector(redoTextEdit(_:)), keyEquivalent: "Z")
+        redoItem.target = self
+        editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
         NSApp.mainMenu = main
+    }
+
+    @objc func undoTextEdit(_ sender: Any?) {
+        guard let um = editingUndoManager(), um.canUndo else { return }
+        um.undo()
+        syncResponderAfterUndo()
+    }
+
+    @objc func redoTextEdit(_ sender: Any?) {
+        guard let um = editingUndoManager(), um.canRedo else { return }
+        um.redo()
+        syncResponderAfterUndo()
+    }
+
+    /// 撤销/重做不触发 textDidChange(实测通知数为 0),SwiftUI 绑定会停在改写前的值:
+    /// 框里看着撤回了内容、state 里还是空的。补一次通知把真实文本推回去
+    private func syncResponderAfterUndo() {
+        (panel?.firstResponder as? NSTextView)?.didChangeText()
+    }
+
+    private func editingUndoManager() -> UndoManager? {
+        guard let panel else { return nil }
+        if let um = (panel.firstResponder as? NSTextView)?.undoManager { return um }
+        return panel.undoManager
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(undoTextEdit(_:)): return editingUndoManager()?.canUndo ?? false
+        case #selector(redoTextEdit(_:)): return editingUndoManager()?.canRedo ?? false
+        default: return true
+        }
     }
 
     private func logHotKey(_ s: String) {

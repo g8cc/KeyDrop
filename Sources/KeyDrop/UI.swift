@@ -1574,6 +1574,8 @@ struct ImportTextView: NSViewRepresentable {
         tv.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
         tv.isRichText = false
         tv.drawsBackground = false
+        // 程序化创建的 NSTextView 默认 allowsUndo = false,不开就没有撤销档案
+        tv.allowsUndo = true
         tv.isEditable = enabled
         tv.isSelectable = true
         tv.textContainerInset = .zero
@@ -1601,7 +1603,7 @@ struct ImportTextView: NSViewRepresentable {
         guard !tv.hasMarkedText() else { return }
         if tv.string != text {
             let selected = tv.selectedRanges
-            tv.string = text
+            setStringProgrammatically(tv, text)
             tv.selectedRanges = selected
             tv.needsDisplay = true
         }
@@ -1626,6 +1628,27 @@ struct ImportTextView: NSViewRepresentable {
             parent.text = tv.string
             tv.needsDisplay = true
         }
+    }
+}
+
+/// 程序化改写(粘贴、导入后清空、拖文件)必须走 shouldChangeText/didChangeText——直接赋
+/// tv.string 不登记撤销;而它写完会留一个未闭合撤销组,把后续改写全并进同一档,所以要自己
+/// begin/end 收口。仅在没有别人的组开着时接管:去拆键入/粘贴事件内的组会崩
+private func setStringProgrammatically(_ tv: NSTextView, _ s: String) {
+    let um = tv.undoManager
+    let base = um?.groupingLevel ?? 0
+    let ours = base == 0
+    if ours { um?.beginUndoGrouping() }
+    let full = NSRange(location: 0, length: (tv.string as NSString).length)
+    if tv.shouldChangeText(in: full, replacementString: s) {
+        tv.textStorage?.replaceCharacters(in: full, with: s)
+        tv.didChangeText()
+    }
+    if ours {
+        var safety = 4
+        while (um?.groupingLevel ?? 0) > base + 1, safety > 0 { um?.endUndoGrouping(); safety -= 1 }
+        um?.setActionName("撤销覆盖")
+        um?.endUndoGrouping()
     }
 }
 
