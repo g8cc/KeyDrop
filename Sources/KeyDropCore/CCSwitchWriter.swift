@@ -819,11 +819,6 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
     func remove(providerID: String, renamedFrom: String?, renamedTo: String?, appType: String = "claude") throws -> String {
         try Self.ensureDB()
         let db = try DB(path: Self.dbPath)
-        if Self.ccSwitchStateMayBeStale() && (appType == "claude" || appType == "codex") {
-            throw WriterError.currentMutationBlocked(
-                "cc-switch 正在运行，当前 provider 状态可能仍在进程内缓存；为避免界面、DB 与 live 配置分叉，请先在 cc-switch 中切换其他 provider 或退出 cc-switch 后再删除"
-            )
-        }
         // COMMIT 之后任何附属文件(settings/opencode.json/codex备份)写入失败都只降级为
         // 警告附在返回消息里,不再 throw:此刻事务已提交、DB 已删干净,
         // 抛错会让调用方(Core.delete)误判"删除失败",制造历史↔DB 账目不一致。
@@ -831,11 +826,21 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         func warn(_ e: Error) { warnings.append(e.localizedDescription) }
         try db.exec("BEGIN IMMEDIATE")
         do {
+            let wasCurrent = (try db.scalar(
+                "SELECT is_current FROM providers WHERE id = ? AND app_type = ?",
+                [providerID, appType]
+            )) == "1"
+            // 只有会动到激活状态的删除才需要拦:删 current 时下面要扶下一条兜底、重写
+            // settings.json 与 live,而运行中的 cc-switch 把 settings.json 缓在进程里,
+            // 一改就分叉(真实事故 2026-09)。非 current 只 DELETE 两行 DB,不碰 current
+            // 也不碰 live;早先守卫放在读 is_current 之前,把这种也一起禁了 —— 用户连一条
+            // 用不上的废 provider 都删不掉(真实卡死 c30beaa0:刷新失败 + 删除被拦,两头堵)
+            if wasCurrent && Self.ccSwitchStateMayBeStale() && (appType == "claude" || appType == "codex") {
+                throw WriterError.currentMutationBlocked(
+                    "cc-switch 正在运行，且这条正是它当前激活的 provider；为避免界面、DB 与 live 配置分叉，请先在 cc-switch 中切换其他 provider 或退出 cc-switch 后再删除"
+                )
+            }
             if appType == "opencode" || appType == "codex" {
-                let wasCurrent = (try db.scalar(
-                    "SELECT is_current FROM providers WHERE id = ? AND app_type = ?",
-                    [providerID, appType]
-                )) == "1"
                 try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [providerID])
                 try db.run("DELETE FROM providers WHERE id = ? AND app_type = ?", [providerID, appType])
                 if wasCurrent {
@@ -873,10 +878,6 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             _ = renamedFrom
             _ = renamedTo
 
-            let wasCurrent = (try db.scalar(
-                "SELECT is_current FROM providers WHERE id = ? AND app_type = 'claude'",
-                [providerID]
-            )) == "1"
             try db.run("DELETE FROM provider_endpoints WHERE provider_id = ?", [providerID])
             try db.run("DELETE FROM providers WHERE id = ? AND app_type = 'claude'", [providerID])
 

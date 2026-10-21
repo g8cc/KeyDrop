@@ -363,6 +363,156 @@ enum CoreTests {
             t.contains(res.detail, "chat 端点 HTTP 424", "detail 标注 chat 状态")
         }
 
+        // 真实卡死(c30beaa0):勾选的模型 503/424 → 刷新一上来就抛错,勾选弹窗永远出不来,
+        // 模型改不了;又因 cc-switch 在跑删不掉 → 两头堵。端点自己 /models 有清单就必须给改选机会
+        h.runSuite("Core.refresh 端点报错仍可改选") { t in
+            let env = try! TestEnv("core-repick-fail")
+            defer { env.cleanup() }
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """)
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """)
+            let core = Core()
+            guard let srv = try? MockHTTPServer(mode: .chat524) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let base = "http://127.0.0.1:\(srv.port)"
+            _ = try! core.add(raw: "\(base) sk-repick524-00000000000000000000",
+                                   ccOverride: true, cpaOverride: false, dshOverride: false,
+                                   models: ["gpt-5.6-sol"], force: true,
+                                   appType: "codex", appTypeForced: true)
+            let e0 = core.history.snapshot().first { $0.key!.hasPrefix("sk-repick524") }
+            // 无勾选回调(CLI)时失败刷新仍须抛错,不能静默改账本
+            do {
+                _ = try core.refreshModels(entryIDPrefix: e0!.id)
+                t.expect(false, "CLI 失败刷新应抛错")
+            } catch {
+                t.contains(error.localizedDescription, "不可用", "CLI 保留失败报错: \(error.localizedDescription)")
+            }
+            t.equal(core.history.snapshot().first { $0.key!.hasPrefix("sk-repick524") }?.models,
+                    ["gpt-5.6-sol"], "抛错路径不改模型")
+
+            var seen: [String] = []
+            let msg = try! core.refreshModels(entryIDPrefix: e0!.id) { cand in
+                seen = cand
+                return ["gpt-5.6-sol"]
+            }
+            t.equal(seen, ["gpt-5.6-sol"], "报错时弹窗仍拿到 /models 清单")
+            t.contains(msg, "改选", "改选结果如实措辞: \(msg)")
+            t.expect(!msg.contains("✓ 可用"), "首探失败不得冒充可用: \(msg)")
+            let e1 = core.history.snapshot().first { $0.key!.hasPrefix("sk-repick524") }
+            t.equal(e1?.models, ["gpt-5.6-sol"], "改选结果落账")
+            t.expect(e1?.health != "ok", "改选后按重探结果标健康: \(e1?.health ?? "nil")")
+            t.contains(e1?.healthDetail ?? "", "424", "健康详情记录重探失败: \(e1?.healthDetail ?? "")")
+        }
+
+        h.runSuite("Core.改选判定与删除原因去重") { t in
+            t.equal(Core.shouldRepickAfterFail(ok: false, modelList: ["m"], hasPicker: true), true,
+                    "失败+有清单+有弹窗 → 给改选")
+            t.equal(Core.shouldRepickAfterFail(ok: false, modelList: [], hasPicker: true), false,
+                    "端点 /models 空 → 无从改选")
+            t.equal(Core.shouldRepickAfterFail(ok: false, modelList: ["m"], hasPicker: false), false,
+                    "CLI 无弹窗 → 不放行")
+            t.equal(Core.shouldRepickAfterFail(ok: true, modelList: ["m"], hasPicker: true), false,
+                    "首探成功走原路径")
+            t.equal(Core.mergedNote("导入成功; 旧原因", ["旧原因", "新原因"]), "导入成功; 旧原因; 新原因",
+                    "已有原因不重复叠加")
+            t.equal(Core.mergedNote(nil, ["x", "x"]), "x", "同一句话重试只记一次")
+            t.equal(Core.mergedNote("", ["a"]), "a", "空 note 直接写入")
+        }
+
+        // 回归(真实卡死 c30beaa0):删除守卫只能拦「会动到激活状态」的那条分支。
+        // 非 current 的 provider 删除只 DELETE 两行 DB,不碰 settings.json/live,
+        // cc-switch 在跑也必须删得掉;否则改不了模型又清不掉废条目,两头堵
+        h.runSuite("Core.delete 运行中只拦 current") { t in
+            let env = try! TestEnv("core-remove-current")
+            defer { env.cleanup() }
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """)
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """)
+            let core = Core()
+            guard let srvA = try? MockHTTPServer(mode: .openAI),
+                  let srvB = try? MockHTTPServer(mode: .openAI) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            let urlA = "http://127.0.0.1:\(srvA.port)"
+            let urlB = "http://127.0.0.1:\(srvB.port)"
+            // cc-switch 未运行:第一条导入正常成为 current
+            _ = try! core.add(raw: "\(urlA) sk-rmcur-active-00000000000000000000",
+                                   ccOverride: true, cpaOverride: false, dshOverride: false,
+                                   models: ["gpt-5.6-sol"], force: true,
+                                   appType: "codex", appTypeForced: true)
+            setenv("KEYDROP_FAKE_CC_STATE_CACHED", "1", 1)
+            defer { setenv("KEYDROP_FAKE_CC_STATE_CACHED", "0", 1) }
+            // cc-switch 在跑:第二条延迟激活 → is_current = 0(正是用户卡住的那条)
+            _ = try! core.add(raw: "\(urlB) sk-rmcur-idle-000000000000000000000",
+                                   ccOverride: true, cpaOverride: false, dshOverride: false,
+                                   models: ["gpt-5.6-sol"], force: true,
+                                   appType: "codex", appTypeForced: true)
+            let snap = core.history.snapshot()
+            let idleID = snap.first { $0.key!.hasPrefix("sk-rmcur-idle") }!.id
+            let curID = snap.first { $0.key!.hasPrefix("sk-rmcur-active") }!.id
+            let db = try! DB(path: env.dir + "/cc-switch.db")
+            let idlePid = snap.first { $0.key!.hasPrefix("sk-rmcur-idle") }!.ccProviderID!
+            let curPid = snap.first { $0.key!.hasPrefix("sk-rmcur-active") }!.ccProviderID!
+            t.equal(try! db.scalar("SELECT is_current FROM providers WHERE id=?", [curPid]), "1",
+                    "前置条件:另一条才是 current")
+            let beforeSettings = env.read("settings.json")
+            let beforeLive = env.read("codex.toml")
+
+            let msg = try! core.delete(entryIDPrefix: idleID)
+            t.contains(msg, "已删除", "运行中删非 current 放行: \(msg)")
+            t.expect((try! db.scalar("SELECT 1 FROM providers WHERE id=?", [idlePid])) == nil,
+                    "非 current 删除确实移除 DB 行")
+            t.equal(try! db.scalar("SELECT is_current FROM providers WHERE id=?", [curPid]), "1",
+                    "删非 current 不动别的条目激活状态")
+            t.equal(env.read("settings.json"), beforeSettings, "删非 current 不改 settings.json 激活指针")
+            t.equal(env.read("codex.toml"), beforeLive, "删非 current 不改 Codex live 配置")
+            t.equal(core.history.snapshot().first { $0.id == idleID }?.status, "deleted",
+                    "账本同步为已删除")
+
+            // current 仍须拦:改激活指针会让运行中的 cc-switch 与磁盘分叉
+            do {
+                _ = try core.delete(entryIDPrefix: curID)
+                t.expect(false, "运行中删 current 应被拦")
+            } catch {
+                t.contains(error.localizedDescription, "正在运行", "拦截原因可懂: \(error.localizedDescription)")
+            }
+            t.notNil(try! db.scalar("SELECT 1 FROM providers WHERE id=?", [curPid]),
+                     "被拦时不得删掉 current 行")
+            let note1 = core.history.snapshot().first { $0.id == curID }?.note ?? ""
+            t.equal(note1.components(separatedBy: "正在运行").count - 1, 1,
+                    "失败原因入 note 且不重复: \(note1)")
+            // 用户多半会再点一次删除:同一句话不得逐次叠加
+            _ = try? core.delete(entryIDPrefix: curID)
+            let note2 = core.history.snapshot().first { $0.id == curID }?.note ?? ""
+            t.equal(note2, note1, "重试删除不重复堆同一条失败原因: \(note2)")
+
+            // cc-switch 退出后(状态不再可能陈旧)current 照旧可删
+            setenv("KEYDROP_FAKE_CC_STATE_CACHED", "0", 1)
+            let backMsg = try! core.delete(entryIDPrefix: curID)
+            t.contains(backMsg, "已删除", "cc-switch 不在运行删 current 放行: \(backMsg)")
+        }
+
         h.runSuite("Core.chat401 认证失效") { t in
             let env = try! TestEnv("core-401")
             defer { env.cleanup() }

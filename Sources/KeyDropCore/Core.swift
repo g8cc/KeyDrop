@@ -1926,6 +1926,23 @@ public final class Core {
         all.enumerated().filter { selected.contains($0.offset) && clashNodeValid($0.element) }.map(\.element)
     }
 
+    /// 刷新首探失败后是否仍应给出勾选弹窗:有勾选回调 + 端点自己的 /models 有清单就要给。
+    /// 恰恰是勾选的那个模型挂了才最需要改选,一报错就 return 等于把用户锁死
+    /// (真实卡死 c30beaa0:模型改不了、又因 cc-switch 在跑删不掉 → 两头堵)
+    public static func shouldRepickAfterFail(ok: Bool, modelList: [String], hasPicker: Bool) -> Bool {
+        !ok && hasPicker && !modelList.isEmpty
+    }
+
+    /// 删除失败原因并入 note:同一句话不重复追加(重试 5 次就重复 5 遍,note 无界增长)
+    public static func mergedNote(_ existing: String?, _ failures: [String]) -> String {
+        var out: [String] = []
+        for piece in (existing ?? "").components(separatedBy: "; ") + failures
+        where !piece.isEmpty && !out.contains(piece) {
+            out.append(piece)
+        }
+        return out.joined(separator: "; ")
+    }
+
     public func refreshModels(
         entryIDPrefix: String,
         proxy: String? = nil,
@@ -1940,7 +1957,12 @@ public final class Core {
         }
         let test = APITester.test(url: url, key: key, proxy: effProxy,
                                   preferredModel: entry.model, importedModels: entry.models)
-        guard test.ok else {
+        // 端点报错但 /models 拿到了清单 ≠ 不能改选:恰恰是勾选的那个模型 503/429 才最需要
+        // 换掉它。以前一报错就 throw,弹窗永远出不来(真实卡死 c30beaa0:模型改不了,
+        // 又因 cc-switch 在跑删不掉 → 两头堵)。放行到弹窗,选完按新模型重探。
+        let repickAfterFail = Self.shouldRepickAfterFail(
+            ok: test.ok, modelList: test.models, hasPicker: pickModels != nil)
+        guard test.ok || repickAfterFail else {
             let h = Self.healthFor(test)
             // 只改 health 不动 status:status="dead" 会让条目从 UI 全部列表消失,
             // 且 delete() 只认 status=="active",记录变成删不掉的僵尸。
@@ -1960,35 +1982,43 @@ public final class Core {
         // 捞回可用区 —— 两条路径来回横跳
         var quotaNote: String? = nil
         var balanceZero = false
-        if test.quotaExhausted {
-            quotaNote = "无额度(chat 端点 429/402 quota exhausted)"
-        } else {
-            balanceZero = APITester.checkBalance(url: url, key: key, proxy: effProxy) == .zero
-            if test.workingModels.isEmpty, balanceZero {
-                quotaNote = "无余额/配额耗尽(余额接口)"
+        if test.ok {
+            if test.quotaExhausted {
+                quotaNote = "无额度(chat 端点 429/402 quota exhausted)"
+            } else {
+                balanceZero = APITester.checkBalance(url: url, key: key, proxy: effProxy) == .zero
+                if test.workingModels.isEmpty, balanceZero {
+                    quotaNote = "无余额/配额耗尽(余额接口)"
+                }
             }
-        }
-        entry.health = quotaNote != nil ? "quota" : "ok"
-        if quotaNote == nil, balanceZero {
-            // 余额接口报 0 但 chat 实测可用:保留可用判定,详情里留痕提醒用户
-            entry.healthDetail = test.detail + " ⚠ 余额接口报 0,但 chat 实测可用 — 以实测为准"
+            entry.health = quotaNote != nil ? "quota" : "ok"
+            if quotaNote == nil, balanceZero {
+                // 余额接口报 0 但 chat 实测可用:保留可用判定,详情里留痕提醒用户
+                entry.healthDetail = test.detail + " ⚠ 余额接口报 0,但 chat 实测可用 — 以实测为准"
+            } else {
+                entry.healthDetail = quotaNote ?? test.detail
+            }
+            entry.healthAt = Date().timeIntervalSince1970
+            // 手动重测同样进监控图(所有探测路径统一入档);probeLog 由 history.update
+            // 保留,不怕后续整条覆盖
+            do {
+                try history.appendProbePoint(id: entry.id, ok: entry.health == "ok",
+                                             ms: test.latencyMs, cpa: nil,
+                                             at: entry.healthAt ?? Date().timeIntervalSince1970)
+                var mps: [String: ProbePoint] = [:]
+                let lat = test.modelLatencies ?? [:]
+                for m in test.workingModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: true) }
+                for m in test.quotaModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: false) }
+                try history.appendModelProbePoints(id: entry.id, points: mps)
+            } catch {
+                AppLog.warn("探测点写入失败: \(error.localizedDescription)")
+            }
         } else {
-            entry.healthDetail = quotaNote ?? test.detail
-        }
-        entry.healthAt = Date().timeIntervalSince1970
-        // 手动重测同样进监控图(所有探测路径统一入档);probeLog 由 history.update
-        // 保留,不怕后续整条覆盖
-        do {
-            try history.appendProbePoint(id: entry.id, ok: entry.health == "ok",
-                                         ms: test.latencyMs, cpa: nil,
-                                         at: entry.healthAt ?? Date().timeIntervalSince1970)
-            var mps: [String: ProbePoint] = [:]
-            let lat = test.modelLatencies ?? [:]
-            for m in test.workingModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: true) }
-            for m in test.quotaModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: false) }
-            try history.appendModelProbePoints(id: entry.id, points: mps)
-        } catch {
-            AppLog.warn("探测点写入失败: \(error.localizedDescription)")
+            // 改选路径:先如实记下本次失败,选完再重探覆盖(别停在旧模型的 503 上)
+            let h = Self.healthFor(test)
+            entry.health = h.health
+            entry.healthDetail = h.detail
+            entry.healthAt = Date().timeIntervalSince1970
         }
         let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
         let currentModels = Set(previousModels)
@@ -2154,7 +2184,7 @@ public final class Core {
             }
         }
 
-        if testModels.isEmpty {
+        if testModels.isEmpty, !repickAfterFail {
             // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
@@ -2171,7 +2201,7 @@ public final class Core {
         // 拿过滤后的列表比对着会把「无变化」误判成「已变化」,每次刷新都弹窗
         let modelsChanged = currentModels != Set(test.models)
 
-        if !modelsChanged {
+        if !modelsChanged, !repickAfterFail {
             historyUpdateLogged(entry)
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
@@ -2201,6 +2231,22 @@ public final class Core {
         }
         entry.models = filtered
         entry.model = filtered.first
+
+        // 报错放行进来的改选:选完必须重探,否则 health 还停在旧模型的报错上,新模型
+        // 是死是活无从判断。全挂也保留用户的选择(清单是端点自己 /models 给的),
+        // 只如实标 err 并留痕,下次扫描会重测
+        var retestNote: String? = nil
+        if repickAfterFail {
+            let retest = APITester.test(url: url, key: key, proxy: effProxy,
+                                        preferredModel: filtered.first, importedModels: filtered)
+            let h = Self.healthFor(retest)
+            entry.health = h.health
+            entry.healthDetail = h.detail
+            entry.healthAt = Date().timeIntervalSince1970
+            retestNote = retest.ok
+                ? "✓ 改选的模型实测可用: \(h.detail)"
+                : "⚠ 已改选 \(filtered.count) 个模型,当前仍不可用: \(h.detail)(下次扫描自动重测)"
+        }
 
         var syncWarn: String? = nil
         // 主分支:模型已变化,ccSyncOrMigrate 会按新模型列表决定原地 sync 还是迁移家族
@@ -2248,6 +2294,11 @@ public final class Core {
         try history.update(entry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
+        let r = retestNote.map { "\n\($0)" } ?? ""
+        if repickAfterFail {
+            // 首探就是失败的,绝不能冒充「✓ 可用」
+            return "已改选 \(filtered.count) 个模型(端点: \(test.detail))\(w)\(dshNote)\(cpaNote)\(r)"
+        }
         return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
     }
 
@@ -2739,7 +2790,7 @@ public final class Core {
         // 记删除时间供账本压实计龄;恢复 active 时清除
         entry.deletedAt = remaining.isEmpty ? Date().timeIntervalSince1970 : nil
         if !failures.isEmpty {
-            entry.note = ([entry.note].compactMap { $0 } + failures).joined(separator: "; ")
+            entry.note = Self.mergedNote(entry.note, failures)
         }
         do {
             try history.update(entry)
