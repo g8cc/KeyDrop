@@ -373,3 +373,12 @@ GUI / CLI 的 `Core.add` 导入失败统一落在 `~/.keydrop/logs/import-failur
 4. CPA:config.yaml 搜聚合条目名(网关域名)。
 5. DSH:`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`(确认凭据在 `refs:` 内)。
 6. `~/.keydrop/logs/import-failures.json` → 按 `stage + reason` 看失败类型统计(§14)。
+
+# 已有条目同步到 DSH
+
+导入到 cc-switch / OpenCode 后，可在 KeyDrop 条目行点击向下箭头按钮同步到
+DeepSeek Harness。KeyDrop 会直接使用该条目已保存的 URL、key 和模型列表写入
+`settings.yaml` 与 `.credentials.yaml`，随后把 `dsh` 目标登记到账本；原有目标会保留。
+同一条目重复点击只更新同一个 `keydrop-<ID前8位>` route，不会产生重复 provider。
+
+同步成功后条目元信息会显示 `DSH` 标记；模型为空的条目需要先刷新或编辑模型。

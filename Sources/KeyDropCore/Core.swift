@@ -2656,6 +2656,43 @@ public final class Core {
         return msg
     }
 
+    /// 将已有条目同步到 DeepSeek Harness。该操作只新增/更新 DSH 目标，
+    /// 不改变条目当前的 cc-switch、CPA 或 Grok Build 目标。
+    /// DSH route 以条目 ID 为稳定键，重复同步只会原位更新。
+    public func syncToDSH(entryIDPrefix: String) throws -> String {
+        guard var entry = history.find(idPrefix: entryIDPrefix)
+            ?? history.findActiveByRaw(entryIDPrefix)
+        else {
+            throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
+        }
+        guard entry.status == "active" else {
+            throw ParseError.io("该记录已删除,无法同步到 DSH")
+        }
+        guard let url = entry.url, !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let key = extractKey(entry), !key.isEmpty else {
+            throw ParseError.io("该记录缺少 URL 或 key,无法同步到 DSH")
+        }
+        let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !models.isEmpty else {
+            throw ParseError.io("该记录没有模型,请先编辑或刷新模型后再同步到 DSH")
+        }
+
+        let alreadyLinked = entry.targets.contains("dsh")
+        let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
+        if !alreadyLinked { entry.targets.append("dsh") }
+        do {
+            try history.update(entry)
+        } catch {
+            // 新增目标时可以安全回滚,避免留下没有账本认领的 DSH route。
+            // 已有目标不能删除,否则账本保存失败会反而破坏原来可用的配置。
+            if !alreadyLinked { try? DSHWriter.remove(providerID: entry.id) }
+            throw ParseError.io("DSH 已写入,但 KeyDrop 记录保存失败: \(error.localizedDescription)")
+        }
+        return "✓ DeepSeek Harness: 已\(alreadyLinked ? "更新" : "添加") provider「\(route)」(\(models.count) 个模型)"
+    }
+
     public func delete(entryIDPrefix: String) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix)
             ?? history.findActiveByRaw(entryIDPrefix)

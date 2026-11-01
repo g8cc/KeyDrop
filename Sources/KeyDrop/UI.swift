@@ -484,6 +484,29 @@ final class AppState: ObservableObject {
         }
     }
 
+    func doSyncDSH(_ id: String) {
+        guard !isBusy else { return }
+        isBusy = true
+        busyLabel = "同步 DSH…"
+        Task { @MainActor in
+            defer {
+                isBusy = false
+                busyLabel = ""
+            }
+            do {
+                let msg = try await Task.detached(priority: .userInitiated) {
+                    try Core.shared.syncToDSH(entryIDPrefix: id)
+                }.value
+                setStatus(msg, ok: true)
+                historyVersion += 1
+                notify(summary: "DSH 同步完成", body: msg)
+            } catch {
+                setStatus("同步 DSH 失败: \(error.localizedDescription)", ok: false)
+                historyVersion += 1
+            }
+        }
+    }
+
     func showEdit(_ entry: HistoryEntry) {
         editTarget = entry
         editModelsText = (entry.models ?? (entry.model.map { [$0] } ?? [])).joined(separator: ", ")
@@ -933,6 +956,7 @@ struct HistoryRow: View {
     let onCopy: (String) -> Void
     let onCopyId: (String) -> Void
     let onRefresh: (String) -> Void
+    let onSyncDSH: () -> Void
     let onLaunchApp: (String, String) -> Void
     let onCopyCurl: () -> Void
     let onReimport: () -> Void
@@ -1031,6 +1055,17 @@ struct HistoryRow: View {
                         Text(entry.format)
                         Text("·")
                         Text(entry.keyMasked)
+                        if entry.targets.contains("dsh") {
+                            Text("DSH")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.15))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(Color(red: 0.85, green: 0.55, blue: 0.15).opacity(0.13))
+                                )
+                        }
                         monitorBadges(entry)
                     }
                     .font(.system(size: 10))
@@ -1102,6 +1137,27 @@ struct HistoryRow: View {
                             .buttonStyle(.borderless)
                             .disabled(refreshing || busy)
                             .help(refreshing ? "测试中…" : "重新测试并更新模型列表")
+
+                            Menu {
+                                Section("同步目标") {
+                                    Button {
+                                        onSyncDSH()
+                                    } label: {
+                                        Label(entry.targets.contains("dsh")
+                                              ? "重新同步到 DSH" : "同步到 DSH",
+                                              systemImage: entry.targets.contains("dsh")
+                                              ? "checkmark.circle" : "arrow.down.circle")
+                                    }
+                                }
+                            } label: {
+                                Image(systemName: entry.targets.contains("dsh")
+                                      ? "checkmark.circle.fill" : "arrow.down.circle")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.15))
+                            }
+                            .menuStyle(.borderlessButton)
+                            .disabled(busy)
+                            .help("选择同步目标")
                         }
                         if let app = appLaunch {
                             Button {
@@ -1147,7 +1203,7 @@ struct HistoryRow: View {
                             Button("删除", role: .destructive) { onDelete() }
                             Button("取消", role: .cancel) {}
                         } message: {
-                            Text("将删除: \(entry.summary)\n此操作会从 cc-switch / CPA 移除该配置。")
+                            Text("将删除: \(entry.summary)\n此操作会从 cc-switch / CPA / DSH 移除该配置。")
                         }
                         if entry.ccMissing == true {
                             Button {
@@ -1434,7 +1490,8 @@ struct HelpView: View {
                     section("双通道写入", icon: "arrow.left.arrow.right") {
                         item("cc-switch:创建 provider 并激活;直写 Claude Code 配置,重开会话生效")
                         item("CPA:写入 Cliproxy API 的 config.yaml,运行时会自动热重载")
-                        item("顶栏 cc-switch / CPA 开关控制写入目标,可同时开启")
+                        item("顶栏 cc-switch / CPA / DSH 开关控制首次导入目标,可同时开启")
+                        item("已有条目可点击行内向下箭头,把同一 URL / key / 模型同步到 DSH;重复点击会更新")
                     }
                     section("代理", icon: "network") {
                         item("顶栏「代理」框填本地代理,如 http://127.0.0.1:7890;右侧 ▾ 列出本机在听的代理端口,点一下即填入")
@@ -2253,6 +2310,7 @@ struct PanelView: View {
                                         showToast("已复制 ID: \(id.prefix(8))…")
                                     },
                                     onRefresh: { id in state.doRefresh(id) },
+                                    onSyncDSH: { state.doSyncDSH(e.id) },
                                     onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                     onCopyCurl: {
                                         guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
@@ -2317,6 +2375,7 @@ struct PanelView: View {
                                                 showToast("已复制 ID: \(id.prefix(8))…")
                                             },
                                             onRefresh: { id in state.doRefresh(id) },
+                                            onSyncDSH: { state.doSyncDSH(e.id) },
                                             onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                             onCopyCurl: {
                                                 guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
@@ -2403,6 +2462,7 @@ struct PanelView: View {
                                                 showToast("已复制 ID: \(id.prefix(8))…")
                                             },
                                             onRefresh: { id in state.doRefresh(id) },
+                                            onSyncDSH: { state.doSyncDSH(e.id) },
                                             onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                             onCopyCurl: {
                                                 guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
@@ -2995,4 +3055,3 @@ struct SettingsSheet: View {
         }
     }
 }
-
