@@ -70,6 +70,11 @@ final class AppState: ObservableObject {
     @Published var editKeyText = ""
     @Published var editNoteText = ""
     @Published var syncing = false
+    /// 真伪鉴定:进行中的条目 id + 最近一次鉴定结论(id → verdict)
+    @Published var verifyingID: String?
+    @Published var verifyVerdicts: [String: String] = [:]
+    @Published var verifyReports: [String: [String]] = [:]
+    @Published var verifySheetShown = false
     private var statusClearTask: DispatchWorkItem?
     private var healthTimer: Timer?
     private var webdavTimer: Timer?
@@ -355,6 +360,32 @@ final class AppState: ObservableObject {
             } catch {
                 setStatus("Clash 导入失败: \(error.localizedDescription)", ok: false)
             }
+        }
+    }
+
+    /// 真伪鉴定(按需,用户点击条目行的盾形按钮触发):跑能力阶梯探针,
+    /// 结论记入 verifyVerdicts(行内图标着色)并弹出结果明细
+    func doVerify(_ id: String) {
+        guard !isBusy, verifyingID == nil else { return }
+        guard let entry = core.history.find(idPrefix: id) else { return }
+        let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
+        guard let url = entry.url, !url.isEmpty,
+              let key = Core.shared.extractKey(entry), !key.isEmpty,
+              let model = models.first else {
+            setStatus("该条目缺少 URL/key/模型,无法鉴定", ok: false)
+            return
+        }
+        verifyingID = id
+        Task { @MainActor in
+            defer { verifyingID = nil }
+            let report = await Task.detached(priority: .userInitiated) { () -> AuthenticityProbe.Report in
+                AuthenticityProbe.run(base: url, key: key, model: model,
+                                      proxy: Core.shared.proxyForHealthPublic(), timeout: 40)
+            }.value
+            verifyVerdicts[id] = report.verdict
+            verifyReports[id] = report.lines
+            verifySheetShown = true
+            historyVersion += 1
         }
     }
 
@@ -953,6 +984,9 @@ struct HistoryRow: View {
     let refreshing: Bool
     let busy: Bool
     let onDelete: () -> Void
+    let onVerify: (String) -> Void
+    var verifyRunning: Bool = false
+    var verifyVerdict: String? = nil
     let onCopy: (String) -> Void
     let onCopyId: (String) -> Void
     let onRefresh: (String) -> Void
@@ -1110,6 +1144,29 @@ struct HistoryRow: View {
                 if entry.status == "active" {
                     HStack(spacing: 10) {
                         if testable {
+                            Button {
+                                onVerify(entry.id)
+                            } label: {
+                                if verifyRunning {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .frame(width: 14, height: 14)
+                                } else {
+                                    Image(systemName: "checkmark.seal")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(verifyVerdict == nil
+                                            ? Color(red: 0.45, green: 0.45, blue: 0.52)
+                                            : (verifyVerdict == "旗舰级"
+                                               ? Color(red: 0.22, green: 0.58, blue: 0.40)
+                                               : Color(red: 0.85, green: 0.55, blue: 0.15)))
+                                }
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(verifyRunning || busy)
+                            .help(verifyVerdict == nil
+                                  ? "真伪鉴定:能力阶梯实测该模型(约 6 次请求)"
+                                  : "上次鉴定: \(verifyVerdict!) · 点击重新鉴定")
+
                             Button {
                                 onCopyCurl()
                             } label: {
@@ -2357,6 +2414,9 @@ struct PanelView: View {
                                     refreshing: state.refreshingID == e.id,
                                     busy: state.isBusy,
                                     onDelete: { state.doDelete(e.id) },
+                                    onVerify: { id in state.doVerify(id) },
+                                    verifyRunning: state.verifyingID == e.id,
+                                    verifyVerdict: state.verifyVerdicts[e.id],
                                     onCopy: { m in
                                         let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
                                         NSPasteboard.general.clearContents()
@@ -2422,6 +2482,9 @@ struct PanelView: View {
                                             refreshing: state.refreshingID == e.id,
                                             busy: state.isBusy,
                                             onDelete: { state.doDelete(e.id) },
+                                            onVerify: { id in state.doVerify(id) },
+                                            verifyRunning: state.verifyingID == e.id,
+                                            verifyVerdict: state.verifyVerdicts[e.id],
                                             onCopy: { m in
                                                 let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
                                                 NSPasteboard.general.clearContents()
@@ -2509,6 +2572,9 @@ struct PanelView: View {
                                             refreshing: state.refreshingID == e.id,
                                             busy: state.isBusy,
                                             onDelete: { state.doDelete(e.id) },
+                                            onVerify: { id in state.doVerify(id) },
+                                            verifyRunning: state.verifyingID == e.id,
+                                            verifyVerdict: state.verifyVerdicts[e.id],
                                             onCopy: { m in
                                                 let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
                                                 NSPasteboard.general.clearContents()

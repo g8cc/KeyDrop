@@ -919,6 +919,9 @@ public final class Core {
         return ("err", test.detail)
     }
 
+    /// 供 UI 层按需探针(真伪鉴定)读取当前代理口径
+    public func proxyForHealthPublic() -> String? { proxyForHealth() }
+
     private func proxyForHealth() -> String? {
         let p = prefs.proxy
         if !p.isEmpty { return p }
