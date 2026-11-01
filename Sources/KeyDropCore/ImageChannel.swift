@@ -142,6 +142,9 @@ public enum ImageMCPWriter {
                 withIntermediateDirectories: true
             )
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            // atomic 写按 umask 落地 0644;settings.json 由 CCSwitchWriter 写入
+            // ANTHROPIC_AUTH_TOKEN 等明文凭据,必须与 history/prefs 同级收紧
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
             return false
         }
     }
@@ -171,6 +174,8 @@ public enum ImageMCPWriter {
                 withIntermediateDirectories: true
             )
             try out.write(toFile: path, atomically: true, encoding: .utf8)
+            // config.toml 写入 experimental_bearer_token(明文 key),同 writeClaude 收紧
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
             return false
         }
     }
@@ -198,31 +203,37 @@ public enum ImageMCPWriter {
     public static func writeOpencode() throws -> Bool {
         let path = ProcessInfo.processInfo.environment["KEYDROP_OPENCODE_CONFIG"]
             ?? (NSHomeDirectory() + "/.config/opencode/opencode.json")
-        var root: [String: Any]
-        if FileManager.default.fileExists(atPath: path) {
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw WriterError.file("\(path) 不是有效 JSON,为避免覆盖未修改")
+        // 与 writeClaude/writeCodex 同锁:opencode.json 是「读全文→改→整体覆盖写」,
+        // 且 CCSwitchWriter 会在里面写上游 API key,无锁并发会互相丢更新
+        return try FileLock.withLock(FileLock.lockPath(for: path)) {
+            var root: [String: Any]
+            if FileManager.default.fileExists(atPath: path) {
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    throw WriterError.file("\(path) 不是有效 JSON,为避免覆盖未修改")
+                }
+                root = obj
+            } else {
+                root = [:]
             }
-            root = obj
-        } else {
-            root = [:]
+            var mcp = root["mcp"] as? [String: Any] ?? [:]
+            let existed = mcp["keydrop-image"] != nil
+            mcp["keydrop-image"] = [
+                "type": "local",
+                "enabled": true,
+                "command": mcpCommand(),
+            ]
+            root["mcp"] = mcp
+            let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+            // 同 writeClaude:~/.config/opencode 可能不存在;写用原子避免半截 JSON
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+            // opencode.json 含上游 API key(CCSwitchWriter 双写),同 writeClaude 收紧
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+            return existed
         }
-        var mcp = root["mcp"] as? [String: Any] ?? [:]
-        let existed = mcp["keydrop-image"] != nil
-        mcp["keydrop-image"] = [
-            "type": "local",
-            "enabled": true,
-            "command": mcpCommand(),
-        ]
-        root["mcp"] = mcp
-        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
-        // 同 writeClaude:~/.config/opencode 可能不存在;写用原子避免半截 JSON
-        try FileManager.default.createDirectory(
-            at: URL(fileURLWithPath: path).deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
-        return existed
     }
 }

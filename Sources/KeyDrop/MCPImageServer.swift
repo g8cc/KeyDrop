@@ -47,8 +47,22 @@ enum MCPImageServer {
                 buffer.removeSubrange(..<(bodyStart + len))
                 scannedUpTo = 0
 
-                guard let msg = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-                      let method = msg["method"] as? String else { continue }
+                // 畸形 JSON / 缺 method 也要按 JSON-RPC 回 -32700:按帧静默丢弃会让
+                // 等响应的客户端无限挂起。无 id 的请求无法回包,仍丢弃
+                let parsed = (try? JSONSerialization.jsonObject(with: body)).flatMap { $0 as? [String: Any] }
+                guard let msg = parsed, let method = msg["method"] as? String else {
+                    if let id = parsed?["id"] {
+                        let parseErr: [String: Any] = [
+                            "jsonrpc": "2.0", "id": id,
+                            "error": ["code": -32700, "message": "Parse error"],
+                        ]
+                        if let errData = try? JSONSerialization.data(withJSONObject: parseErr),
+                           let frame = "Content-Length: \(errData.count)\r\n\r\n".data(using: .utf8) {
+                            do { try stdout.write(contentsOf: frame + errData) } catch { return 0 }
+                        }
+                    }
+                    continue
+                }
                 // notification(无 id)不需要也不能回包,回包会被部分客户端当成协议错误
                 let id = msg["id"]
                 guard id != nil else { continue }

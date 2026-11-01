@@ -56,6 +56,11 @@ public enum CPAAPI {
               components.password == nil,
               components.fragment == nil,
               let url = components.url else {
+            // 显式配置存在但解析失败:不能静默回落默认端口 —— 管理密钥会以 Bearer 头
+            // 发到用户没指定的地址。留痕让配置错误可被发现(仅未配置时才用 fallback)
+            if !candidate.isEmpty {
+                AppLog.error("CPAAPI: cpaAPIBase 配置非法(\(candidate.prefix(80))),回落 \(fallback)")
+            }
             return URL(string: fallback)!
         }
         return url

@@ -233,6 +233,9 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(healthAt, forKey: .healthAt)
         try c.encodeIfPresent(ccMissing, forKey: .ccMissing)
         try c.encodeIfPresent(clashFile, forKey: .clashFile)
+        try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
+        try c.encodeIfPresent(updatedAt, forKey: .updatedAt)
+        try c.encodeIfPresent(verifyVerdict, forKey: .verifyVerdict)
         try c.encodeIfPresent(latencyMs, forKey: .latencyMs)
         try c.encodeIfPresent(failStreak, forKey: .failStreak)
         try c.encodeIfPresent(viaCPAOk, forKey: .viaCPAOk)
@@ -286,6 +289,9 @@ public final class HistoryStore {
     /// 上次读文件时的 mtime:snapshot 检测到外部(CLI)改过文件就重载,
     /// 否则常驻 app 看不到 CLI 新增的条目,直到重启
     private var lastMtime: Date? = nil
+    /// 上次解析失败的时间。解析失败期间(文件持续损坏)不更新 lastMtime 会反复重读 +
+    /// 全量解码失败(最多 64MB),这是最热的读路径 —— 按 5s 退避,期间沿用内存快照
+    private var lastParseFailureAt: TimeInterval? = nil
 
     /// 非线程安全快照入口;UI/CLI 请用 snapshot()
     var items: [HistoryEntry] { snapshot() }
@@ -338,9 +344,14 @@ public final class HistoryStore {
             _items = w.items
             loadedIDs = Set(w.items.map { $0.id })
             lastMtime = currentMtime
+            lastParseFailureAt = nil   // 成功消费后清除退避,后续失败立即重试
         } else {
             // 解析失败:很可能是 CLI 写到一半被并发读到(partial JSON)。保留上一份内存,不要清空,
-            // 否则 mtime 刷新路径下 UI 会出现短暂的「历史清空」闪动
+            // 否则 mtime 刷新路径下 UI 会出现短暂的「历史清空」闪动。
+            // 5s 退避:文件持续损坏期间 snapshot 每次都重读+解码失败(最热读路径)
+            let now = Date().timeIntervalSince1970
+            if let f = lastParseFailureAt, now - f < 5 { return }
+            lastParseFailureAt = now
             Logger.warn("history 文件解析失败,保留内存快照(可能是并发写入): \(fileURL.path)")
         }
     }
@@ -463,6 +474,24 @@ public final class HistoryStore {
         // (refreshModels 先 appendProbePoint 再 update 整条),整条覆盖会回滚监控历史
         merged.probeLog = _items[i].probeLog
         merged.modelProbeLog = _items[i].modelProbeLog
+        _items[i] = merged
+        try saveLocked(dirtyIDs: [e.id])
+    }
+
+    /// 对账路径专用:整条更新 + 追加单个探测点,一次落盘。
+    /// 拆成 update + appendProbePoint 是每条对账 2 次全量序列化写(N 条失联 key
+    /// 离线时 2N 次 IO);语义与两者连用完全一致(probeLog 仍以 store 现状为准)
+    public func updateWithProbePoint(_ e: HistoryEntry, point: ProbePoint) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
+        var merged = e
+        merged.updatedAt = Date().timeIntervalSince1970
+        merged.probeLog = _items[i].probeLog
+        merged.modelProbeLog = _items[i].modelProbeLog
+        var log = (merged.probeLog ?? []) + [point]
+        if log.count > 30 { log = Array(log.suffix(30)) }
+        merged.probeLog = log
         _items[i] = merged
         try saveLocked(dirtyIDs: [e.id])
     }
@@ -601,6 +630,13 @@ public final class HistoryStore {
                let w = try? JSONDecoder().decode(Wrapper.self, from: data),
                let dup = w.items.first(where: isDup) {
                 survivor = dup
+                // 文件侧幸存者必须并入 _items:它只存在于文件,后续 Core 拿它合并产物后
+                // 调 update(merged) —— update 对 _items 里查无此 id 的条目静默 no-op,
+                // 合并结果将永远不落盘
+                if !_items.contains(where: { $0.id == dup.id }) {
+                    _items.insert(dup, at: 0)
+                    loadedIDs.insert(dup.id)
+                }
                 return  // 已有同 key 条目:不插入
             }
             _items.insert(e, at: 0)
@@ -817,6 +853,16 @@ public final class Prefs {
         let proxy = _proxy
         let mgmtKey = _cpaManagementKey
         let apiBase = _cpaAPIBase
+        // WebDAV 字段必须在同一锁内快照:flock 只管跨进程文件写,
+        // 管不住本进程 UI 线程写 _webdav* 与这里读的并发
+        let webdavURL = _webdavURL
+        let webdavUser = _webdavUser
+        let webdavPass = _webdavPass
+        let webdavExportPass = _webdavExportPass
+        let webdavAutoPull = _webdavAutoPull
+        let webdavAutoPush = _webdavAutoPush
+        let webdavLastSync = _webdavLastSync
+        let webdavLastPushFP = _webdavLastPushFP
         lock.unlock()
         // flock 串行化跨进程写:app 与 CLI 并发 save 时,固定 tmp 路径会被对方
         // replaceItemAt 拽走导致写失败,并发覆盖也会丢掉对方的设置变更
@@ -827,14 +873,14 @@ public final class Prefs {
             if let apiBase, !apiBase.isEmpty { obj["cpaAPIBase"] = apiBase }
             // WebDAV 同步配置:URL/账号/密码/导出口令(后者用于账本端到端加密,
             // WebDAV 服务端只见密文)。prefs 0600,含凭据与账本同级敏感度
-            if let v = _webdavURL, !v.isEmpty { obj["webdavURL"] = v }
-            if let v = _webdavUser, !v.isEmpty { obj["webdavUser"] = v }
-            if let v = _webdavPass, !v.isEmpty { obj["webdavPass"] = v }
-            if let v = _webdavExportPass, !v.isEmpty { obj["webdavExportPass"] = v }
-            obj["webdavAutoPull"] = _webdavAutoPull
-            obj["webdavAutoPush"] = _webdavAutoPush
-            if let v = _webdavLastSync { obj["webdavLastSync"] = v }
-            if let v = _webdavLastPushFP { obj["webdavLastPushFP"] = v }
+            if let v = webdavURL, !v.isEmpty { obj["webdavURL"] = v }
+            if let v = webdavUser, !v.isEmpty { obj["webdavUser"] = v }
+            if let v = webdavPass, !v.isEmpty { obj["webdavPass"] = v }
+            if let v = webdavExportPass, !v.isEmpty { obj["webdavExportPass"] = v }
+            obj["webdavAutoPull"] = webdavAutoPull
+            obj["webdavAutoPush"] = webdavAutoPush
+            if let v = webdavLastSync { obj["webdavLastSync"] = v }
+            if let v = webdavLastPushFP { obj["webdavLastPushFP"] = v }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true

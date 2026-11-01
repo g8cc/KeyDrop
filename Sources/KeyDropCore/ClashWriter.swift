@@ -24,6 +24,23 @@ final class ClashWriter {
         let dir = URL(fileURLWithPath: profilesDir)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
+        // mihomo 拒绝重复 proxy name —— 整个订阅文件拒载,而错误发生在导入之后的
+        // mihomo 侧,用户只看到「已生成 N 个节点」的成功提示。订阅源同名节点
+        // (名称靠序号区分被截断等)必须在此去重:重名追加序号后缀,
+        // proxies 与 proxy-groups 引用同一份名字
+        var deduped: [(proxy: ClashProxy, name: String)] = []
+        var seenNames = Set<String>()
+        for p in valid {
+            var n = p.name
+            if seenNames.contains(n) {
+                var i = 2
+                while seenNames.contains("\(p.name) \(i)") { i += 1 }
+                n = "\(p.name) \(i)"
+            }
+            seenNames.insert(n)
+            deduped.append((p, n))
+        }
+
         var yaml = """
         port: 7890
         socks-port: 1080
@@ -47,22 +64,23 @@ final class ClashWriter {
 
         proxies:
         """
-        for p in valid {
-            yaml += """
-            \n  - name: \(yamlQuote(p.name))
-              type: \(yamlScalar(p.type))
-              server: \(yamlScalar(p.server))
-              port: \(p.port)
-            """
-            yaml += credentialLine(for: p)
-            yaml += """
-              sni: \(yamlScalar(p.sni))
-              skip-cert-verify: \(p.skipCertVerify)
-              udp: \(p.udp)
-            """
+        for d in deduped {
+            let p = d.proxy
+            // 显式拼接,不用多行字符串字面量:旧写法的续行缩进(14 空格)相对收尾
+            // 定界符(12 空格)剥完只剩 2 列,与 `- name:` 的序列缩进齐平,且末行
+            // 无换行导致 port 与 password 并行 —— 生成的订阅 YAML 一直是非法的
+            // (严格解析器/mihomo 直接拒载,既有测试只做字符串包含,从未暴露)
+            yaml += "\n  - name: \(yamlQuote(d.name))"
+            yaml += "\n    type: \(yamlScalar(p.type))"
+            yaml += "\n    server: \(yamlScalar(p.server))"
+            yaml += "\n    port: \(p.port)"
+            yaml += "\n" + credentialLine(for: p)
+            yaml += "    sni: \(yamlScalar(p.sni))"
+            yaml += "\n    skip-cert-verify: \(p.skipCertVerify)"
+            yaml += "\n    udp: \(p.udp)"
         }
 
-        let names = valid.map { yamlQuote($0.name) }.joined(separator: ", ")
+        let names = deduped.map { yamlQuote($0.name) }.joined(separator: ", ")
         yaml += """
 
         proxy-groups:

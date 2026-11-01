@@ -144,10 +144,24 @@ public enum AuthenticityProbe {
         firstNumber(in: response) == expected
     }
 
-    /// 回答判定:数值题精确比对;人名题(排名谜题)在回答前 80 字符内找对人名
+    /// 回答判定:数值题精确比对;人名题(排名谜题)提取显式结论句。
+    /// 曾用「前 80 字符 contains」:答案名是单字(甲/乙/…),思维链复述题面约束时
+    /// 前 80 字符几乎必然含全部五个人名,连错误结论都能判对,T3 形同虚设。
+    /// 现优先匹配「第一名是/为 X」结论句(取最后一次出现),无结论句才退回
+    /// 最后一个非空行(模型被要求只回答名字)
     public static func isCorrect(_ response: String, question: Question) -> Bool {
         if let name = question.expectedName {
-            return response.prefix(80).contains(name)
+            let ns = response as NSString
+            if let re = try? NSRegularExpression(pattern: #"第一名[^甲乙丙丁戊]{0,6}([甲乙丙丁戊])"#) {
+                let matches = re.matches(in: response, range: NSRange(location: 0, length: ns.length))
+                if let last = matches.last, last.numberOfRanges >= 2,
+                   last.range(at: 1).location != NSNotFound {
+                    return ns.substring(with: last.range(at: 1)) == name
+                }
+            }
+            let lastLine = response.split(whereSeparator: { $0.isNewline })
+                .reversed().first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
+            return lastLine.contains(name)
         }
         guard let expected = question.expectedNumber else { return false }
         return firstNumber(in: response) == expected
@@ -155,16 +169,30 @@ public enum AuthenticityProbe {
 
     // MARK: - 探针执行
 
+    /// 鉴定专用 session:旗舰模型的 T3 题(大数乘法/五人排名)常需 20-40s 长推理,
+    /// 不能借用 APITester 的共享 session(timeoutIntervalForResource=20 是 session 级,
+    /// 请求级 timeoutInterval=40 覆盖不了,慢模型每题在 ~20s 被杀 → 误判「中端级/替换」)
+    private static func makeSession(proxy: String?, timeout: TimeInterval) -> URLSession {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = timeout
+        c.timeoutIntervalForResource = timeout + 10
+        c.httpMaximumConnectionsPerHost = 2
+        c.connectionProxyDictionary = APITester.proxyDictionary(for: proxy ?? "") ?? [:]
+        return URLSession(configuration: c)
+    }
+
     /// 对指定模型跑能力阶梯,返回评测报告
     public static func run(base: String, key: String, model: String,
                            proxy: String?, timeout: TimeInterval = 40) -> Report {
         let questions = generateLadder()
         var tierStats: [Int: (pass: Int, total: Int)] = [:]
         var lines: [String] = []
+        let session = makeSession(proxy: proxy, timeout: timeout)
+        defer { session.finishTasksAndInvalidate() }
 
         for q in questions {
-            let answer = chatContent(base: base, key: key, model: model,
-                                     prompt: q.prompt, timeout: timeout, proxy: proxy)
+            let answer = chatContent(session: session, base: base, key: key, model: model,
+                                     prompt: q.prompt, timeout: timeout)
             let ok = isCorrect(answer ?? "", question: q)
             let stat = tierStats[q.tier] ?? (0, 0)
             tierStats[q.tier] = (stat.pass + (ok ? 1 : 0), stat.total + 1)
@@ -206,10 +234,10 @@ public enum AuthenticityProbe {
 
     // MARK: - chat 调用(返回 content 文本;openai 失败回退 anthropic /messages)
 
-    static func chatContent(base: String, key: String, model: String, prompt: String,
-                            timeout: TimeInterval, proxy: String?) -> String? {
+    static func chatContent(session: URLSession, base: String, key: String, model: String,
+                            prompt: String, timeout: TimeInterval) -> String? {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
-        let s = APITester.session(for: proxy)
+        let s = session
         for path in hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"] {
             guard let u = URL(string: base + path) else { continue }
             var req = URLRequest(url: u)

@@ -133,8 +133,11 @@ public final class Core {
                 clashFile: clashFile
             )
             try history.append(entry)
-            try prefs.save()
-            return AddOutcome(entry: entry, lines: [msg], ok: true)
+            // prefs 落盘失败(磁盘满)不应让已成功的订阅导入整体报错进失败日志:
+            // 与主路径同口径,降级为警告行
+            var clashLines = [msg]
+            do { try prefs.save() } catch { clashLines.append("⚠ 偏好保存失败: \(error.localizedDescription)") }
+            return AddOutcome(entry: entry, lines: clashLines, ok: true)
         }
 
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -164,8 +167,9 @@ public final class Core {
                 clashFile: clashFile
             )
             try history.append(entry)
-            try prefs.save()
-            return AddOutcome(entry: entry, lines: [msg], ok: true)
+            var subLines = [msg]
+            do { try prefs.save() } catch { subLines.append("⚠ 偏好保存失败: \(error.localizedDescription)") }
+            return AddOutcome(entry: entry, lines: subLines, ok: true)
         }
 
         var parsed: ParsedKey
@@ -204,6 +208,12 @@ public final class Core {
                     message: "该 API key 已存在(\(d.id) · \(d.summary)),但 URL 不同(\(d.url ?? "") vs \(url))。"
                         + "如需覆盖请先删除旧记录,或 CLI 使用 --force。"
                 )
+            } else {
+                // --force 语义 = 覆盖:把旧条目当作 dup 走幂等更新链路(URL 换新、
+                // 旧 provider 清理)。不能放任 dup 为 nil —— 那样最后 appendDedupByKey
+                // 仍会按 key 命中旧条目,新 URL 被静默丢弃、刚写的 provider 被回滚
+                dup = d
+                notes.append("force 覆盖: 同 key 已存在(\(d.id.prefix(8))),URL \(d.url ?? "") → \(url)")
             }
         }
 
@@ -252,7 +262,7 @@ public final class Core {
                 status: "active"
             )
             try history.append(entry)
-            try prefs.save()
+            do { try prefs.save() } catch { multiLines.append("⚠ 偏好保存失败: \(error.localizedDescription)") }
             return AddOutcome(entry: entry, lines: multiLines, ok: true)
         }
 
@@ -1042,10 +1052,13 @@ public final class Core {
             AppLog.info("health 扫描前对账: " + synced.joined(separator: "; "))
         }
         let now = Date().timeIntervalSince1970
-        var targets: [HistoryEntry] = []
-        for e in history.snapshot() where e.status == "active" && e.url != nil && extractKey(e) != nil {
+        // extractKey 一次解析随目标携带:过滤与并发块各调一次曾是双倍开销,
+        // 且 extractKey 对 raw 是路径/zip 的条目会重新读盘
+        var targets: [(entry: HistoryEntry, key: String)] = []
+        for e in history.snapshot() where e.status == "active" && e.url != nil {
+            guard let k = extractKey(e), !k.isEmpty else { continue }
             if let at = e.healthAt, now - at < staleAfter { continue }
-            targets.append(e)
+            targets.append((e, k))
         }
         guard !targets.isEmpty else {
             completion?([])
@@ -1057,11 +1070,11 @@ public final class Core {
         let sem = DispatchSemaphore(value: 4)
         let group = DispatchGroup()
         let queue = DispatchQueue.global(qos: .userInitiated)
-        for e in targets {
+        for (e, entryKey) in targets {
             // 在进入并发闭包前解包:过滤条件已保证非 nil,但 e.url!/e.key! 是在
             // 后台线程里求值的强制解包 —— 一旦将来过滤条件放宽就是崩溃点。
             // 提前 guard 掉,让「不可能」变成安全跳过而不是 crash。
-            guard let entryURL = e.url, let entryKey = extractKey(e), !entryKey.isEmpty else { continue }
+            guard let entryURL = e.url, !entryKey.isEmpty else { continue }
             sem.wait()
             group.enter()
             queue.async {
@@ -1251,18 +1264,16 @@ public final class Core {
                 }
                 outLock.unlock()
                 // 测完立刻落盘:不攒到最后批量写。批量写会把竞态窗口拉长到整轮扫描的时长,
-                // 期间 CLI 删除的条目会被旧内存快照复活;立即写窗口只有毫秒级
-                self.historyUpdateLogged(updated)
-                // 探测点记账:对账发了真实请求,必须喂监控时间轴。曾因只更新 health
-                // 不写 probeLog,对账条目 healthAt 每轮刷新 → scanHealth 永远视为
-                // 「刚测过」而跳过 → mergeHealth 永不执行 → 监控图永久空白
-                // (真实事故 20d64797:可用区显示 ok,监控页零数据)
+                // 期间 CLI 删除的条目会被旧内存快照复活;立即写窗口只有毫秒级。
+                // 更新 + 探测点合并成一次落盘(拆开是每条 2 次全量序列化写)
                 do {
-                    try self.history.appendProbePoint(
-                        id: e.id, ok: test.ok, ms: test.ok ? test.latencyMs : nil,
-                        cpa: nil, at: updated.healthAt ?? Date().timeIntervalSince1970)
+                    try self.history.updateWithProbePoint(
+                        updated,
+                        point: ProbePoint(t: updated.healthAt ?? Date().timeIntervalSince1970,
+                                          ms: test.ok ? test.latencyMs : nil,
+                                          ok: test.ok, cpa: nil))
                 } catch {
-                    AppLog.error("对账探测点写入失败: \(error.localizedDescription)")
+                    AppLog.error("对账落盘失败: \(error.localizedDescription)")
                 }
             }
         }
@@ -1398,9 +1409,11 @@ public final class Core {
         var out: [String] = []
         var purged = 0
         var normalized = 0
-        var changed: [HistoryEntry] = []
+        var noteFixes: [HistoryEntry] = []   // 仅 note 归一(可能仍是 active)
+        var stubs: [HistoryEntry] = []       // 转审计桩(必须整条替换)
         for var e in history.snapshot() {
             var dirty = false
+            var didPurge = false
             // ① note 归一
             let n = Self.normalizedNote(e.note)
             if n != e.note { e.note = n; dirty = true; normalized += 1 }
@@ -1421,22 +1434,24 @@ public final class Core {
                     e.note = "审计桩: 超期已删除条目,明文 key/探测历史已按保留策略清除"
                     if e.deletedAt == nil { e.deletedAt = age }
                     dirty = true
+                    didPurge = true
                     purged += 1
                 }
             }
-            if dirty { changed.append(e) }
-        }
-        // 走 updateAll 整批替换:probeLog/modelProbeLog 是 store 托管字段(update 会
-        // 合并保留),审计桩必须显式清除它们 —— updateAll 是唯一的整条替换通道,
-        // 且一次落盘代替逐条写
-        if !changed.isEmpty {
-            do {
-                try history.updateAll(changed)
-                if purged > 0 { out.append("压实: \(purged) 条超期已删条目已转审计桩(明文 key/探测历史已清除)") }
-                if normalized > 0 { out.append("压实: \(normalized) 条条目的备注已去重截断") }
-            } catch {
-                out.append("⚠ 账本压实写入失败: \(error.localizedDescription)")
+            if dirty {
+                if didPurge { stubs.append(e) } else { noteFixes.append(e) }
             }
+        }
+        // note 归一走 update:probeLog/modelProbeLog 是 store 托管字段,updateAll 整条替换
+        // 会把快照之后并发追加的探测点静默回滚。审计桩恰恰需要显式清除探测历史,
+        // 必须走 updateAll(唯一的整条替换通道),两批各一次落盘
+        do {
+            for e in noteFixes { try history.update(e) }
+            if !stubs.isEmpty { try history.updateAll(stubs) }
+            if purged > 0 { out.append("压实: \(purged) 条超期已删条目已转审计桩(明文 key/探测历史已清除)") }
+            if normalized > 0 { out.append("压实: \(normalized) 条条目的备注已去重截断") }
+        } catch {
+            out.append("⚠ 账本压实写入失败: \(error.localizedDescription)")
         }
         return out
     }
@@ -1535,10 +1550,17 @@ public final class Core {
                 let localTS = local.updatedAt ?? 0
                 let remoteTS = e.updatedAt ?? 0
                 if remoteTS > localTS {
-                    if let oldPid = local.ccProviderID, let oldKey = local.key, !oldKey.isEmpty,
-                       let newKey = e.key, !newKey.isEmpty, oldKey != newKey,
-                       let cfg = prefs.resolvedCPAConfig() {
-                        try? CPAWriter(configPath: cfg).rotateKey(baseURL: local.url ?? e.url ?? "", oldKey: oldKey, newKey: newKey)
+                    // 产物同步失败绝不能静默:账本已记新 key 而 CPA 池还轮询旧 key 时,
+                    // 旧 key 会成为无账本指针的永久残留凭据。至少留痕
+                    do {
+                        if let oldPid = local.ccProviderID, let oldKey = local.key, !oldKey.isEmpty,
+                           let newKey = e.key, !newKey.isEmpty, oldKey != newKey,
+                           let cfg = prefs.resolvedCPAConfig() {
+                            let msg = try CPAWriter(configPath: cfg).rotateKey(baseURL: local.url ?? e.url ?? "", oldKey: oldKey, newKey: newKey)
+                            if !msg.isEmpty { AppLog.info("feed 同步 CPA key 轮换: \(msg)") }
+                        }
+                    } catch {
+                        AppLog.error("feed 同步 CPA key 轮换失败(\(e.id.prefix(8))): \(error.localizedDescription)")
                     }
                     if let pid = local.ccProviderID {
                         let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
@@ -1548,17 +1570,29 @@ public final class Core {
                         p.key = e.key
                         p.model = e.models?.first
                         p.name = e.name
-                        try? cc.syncModelsAfterRefresh(p, providerID: pid, appType: oldApp,
-                                                       models: e.models ?? local.models ?? [],
-                                                       proxy: proxyForHealth())
+                        do {
+                            try cc.syncModelsAfterRefresh(p, providerID: pid, appType: oldApp,
+                                                          models: e.models ?? local.models ?? [],
+                                                          proxy: proxyForHealth())
+                        } catch {
+                            AppLog.error("feed 同步 cc 行更新失败(\(pid.prefix(8))): \(error.localizedDescription)")
+                        }
                     }
                     if e.targets.contains("dsh"), let dk = e.key, !dk.isEmpty, let dURL = e.url {
-                        try? DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: e.models ?? [])
+                        do {
+                            try DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: e.models ?? [])
+                        } catch {
+                            AppLog.error("feed 同步 DSH 写入失败(\(e.id.prefix(8))): \(error.localizedDescription)")
+                        }
                     }
                     if e.targets.contains("grok"), let gp = local.grokConfigPath,
                        let gk = e.key, let gURL = e.url {
-                        try? GrokBuildWriter(configPath: gp).sync(baseURL: gURL, key: gk,
-                                                                  models: e.models ?? [], removing: [])
+                        do {
+                            try GrokBuildWriter(configPath: gp).sync(baseURL: gURL, key: gk,
+                                                                      models: e.models ?? [], removing: [])
+                        } catch {
+                            AppLog.error("feed 同步 Grok 写入失败(\(e.id.prefix(8))): \(error.localizedDescription)")
+                        }
                     }
                     var merged = e
                     merged.ccProviderID = local.ccProviderID
@@ -1749,12 +1783,13 @@ public final class Core {
             throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
         }
         let cfg = WebDAVSync.Config.resolved()!
-        let ledger = try exportLedger(passphrase: cfg.exportPass)
-        // 指纹去重:自动推送只在账本内容真实变化时触发(探测点/健康不在指纹内)
+        // 指纹去重必须先行:exportLedger 含 60 万轮 PBKDF2 + 全账本加密,自动推送
+        // 每 30 分钟一跳,账本没变时旧实现每次也白付整段 KDF
         let fp = LedgerCrypto.ledgerFingerprint(history.snapshot())
         if !force, fp == prefs.webdavLastPushFP {
             return "WebDAV: 账本无变更,跳过推送"
         }
+        let ledger = try exportLedger(passphrase: cfg.exportPass)
         let msg = try WebDAVSync.push(cfg: cfg, ledger: ledger)
         prefs.webdavLastPushFP = fp
         try? prefs.save()

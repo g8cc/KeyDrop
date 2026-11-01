@@ -58,9 +58,11 @@ final class Updater {
     /// 启动时检查:同一天只查一次,避免频繁打 GitHub API
     func checkForUpdates(force: Bool = false) {
         guard let apiURL else { return }
-        // 重入保护:正在检查/下载/安装时,「检查更新」不得把状态覆盖回 .checking
+        // 重入保护:正在检查/下载/安装时,「检查更新」不得把状态覆盖回 .checking;
+        // .ready(已下载待重启)同样受保护 —— 覆盖会让「重启完成更新」按钮消失,
+        // 用户必须重新下载整包,pendingArchive 残留 /tmp 到下次启动
         switch state {
-        case .checking, .downloading, .installing: return
+        case .checking, .downloading, .installing, .ready: return
         default: break
         }
         if !force {

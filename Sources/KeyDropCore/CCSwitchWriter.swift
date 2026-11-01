@@ -78,6 +78,11 @@ public final class CCSwitchWriter {
     public func add(_ p: ParsedKey, nameOverride: String? = nil, appType: String = "claude", models: [String] = [], proxy: String? = nil) throws -> CCAddResult {
         guard let key = p.key, !key.isEmpty else { throw WriterError.missingKey }
         guard let url = p.url, !url.isEmpty else { throw WriterError.missingURL }
+        // 家族过滤必须收敛在写入层,不能依赖调用方传对(文件头不变量①):
+        // 未知 appType 走 else 分支会按 claude 写 settings_config
+        guard Self.supportedAppTypes().contains(appType) else {
+            throw WriterError.file("不支持的 appType: \(appType)(支持: \(Self.supportedAppTypes().joined(separator: "/")))")
+        }
         try Self.ensureDB()
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -420,6 +425,9 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             var customLines: [String]? = nil
             var hadCustom = false
             var hasAuthLine = false
+            var hasBaseURL = false
+            var hasWireAPI = false
+            var hasBearer = false
             var modelSet = false
             var providerSet = false
             for ln in content.components(separatedBy: "\n") {
@@ -427,13 +435,18 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                 if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
                     if section == "model_providers.custom", let cl = customLines {
                         out.append(contentsOf: cl)
-                        if !hasAuthLine { out.append("requires_openai_auth = true") }
+                        appendMissingCodexCustomKeys(&out, hasAuth: hasAuthLine, hasURL: hasBaseURL,
+                                                     hasWire: hasWireAPI, hasBearer: hasBearer,
+                                                     url: url, wireApi: wireApi, key: p.key ?? "")
                     }
                     customLines = nil
                     section = String(trimmed.dropFirst().dropLast())
                     if section == "model_providers.custom" {
                         customLines = []
                         hasAuthLine = false
+                        hasBaseURL = false
+                        hasWireAPI = false
+                        hasBearer = false
                         hadCustom = true
                     }
                     out.append(ln)
@@ -443,23 +456,30 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                     let key = trimmed.split(separator: "=", maxSplits: 1).first.map(String.init)?
                         .trimmingCharacters(in: .whitespaces) ?? ""
                     switch key {
-                    case "base_url": customLines?.append("base_url = \(Self.tomlQuote(url))")
-                    case "wire_api": customLines?.append("wire_api = \(Self.tomlQuote(wireApi))")
+                    case "base_url": customLines?.append("base_url = \(Self.tomlQuote(url))"); hasBaseURL = true
+                    case "wire_api": customLines?.append("wire_api = \(Self.tomlQuote(wireApi))"); hasWireAPI = true
                     case "name": customLines?.append("name = \"custom\"")
                     case "env_key": break
                     case "requires_openai_auth": customLines?.append("requires_openai_auth = true"); hasAuthLine = true
-                    case "experimental_bearer_token": customLines?.append("experimental_bearer_token = \(Self.tomlQuote(p.key ?? ""))")
+                    case "experimental_bearer_token": customLines?.append("experimental_bearer_token = \(Self.tomlQuote(p.key ?? ""))"); hasBearer = true
                     default: customLines?.append(ln)
                     }
                     continue
                 }
                 if section == "" {
-                    if trimmed.hasPrefix("model_provider") {
+                    // 顶层键按等号边界匹配:model="x"(无空格,合法 TOML)也算 model 行。
+                    // 曾用 hasPrefix("model = ") 匹配,漏掉无空格写法 → 原行保留 + 下方补插,
+                    // 文件出现两个 model 键,codex 启动即解析失败
+                    let topKey = trimmed.contains("=")
+                        ? trimmed.split(separator: "=", maxSplits: 1).first.map(String.init)?
+                            .trimmingCharacters(in: .whitespaces)
+                        : nil
+                    if topKey == "model_provider" {
                         out.append("model_provider = \"custom\"")
                         providerSet = true
                         continue
                     }
-                    if trimmed.hasPrefix("model = ") {
+                    if topKey == "model" {
                         if let m = model {
                             out.append("model = \(Self.tomlQuote(m))")
                         } else {
@@ -470,7 +490,7 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
                         modelSet = true
                         continue
                     }
-                    if trimmed.hasPrefix("model_catalog_json") {
+                    if topKey == "model_catalog_json" {
                         continue
                     }
                 }
@@ -478,7 +498,9 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             }
             if section == "model_providers.custom", let cl = customLines {
                 out.append(contentsOf: cl)
-                if !hasAuthLine { out.append("requires_openai_auth = true") }
+                appendMissingCodexCustomKeys(&out, hasAuth: hasAuthLine, hasURL: hasBaseURL,
+                                             hasWire: hasWireAPI, hasBearer: hasBearer,
+                                             url: url, wireApi: wireApi, key: p.key ?? "")
             }
             if !providerSet {
                 out.insert("model_provider = \"custom\"", at: 0)
@@ -513,42 +535,59 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         return fresh.joined(separator: "\n")
     }
 
+    /// codex custom 段收尾:补写缺失的必填键。merge 只「存在才替换」,手写精简段
+    /// (如只写 env_key)缺 base_url/wire_api/bearer 时新网关 URL/key 在 live 里永不生效,
+    /// 而 DB settings_config 已是新值 —— 正是文件头不变量③要防的 DB/live 分叉
+    private func appendMissingCodexCustomKeys(_ out: inout [String], hasAuth: Bool, hasURL: Bool,
+                                              hasWire: Bool, hasBearer: Bool,
+                                              url: String, wireApi: String, key: String) {
+        if !hasAuth { out.append("requires_openai_auth = true") }
+        if !hasURL { out.append("base_url = \(Self.tomlQuote(url))") }
+        if !hasWire { out.append("wire_api = \(Self.tomlQuote(wireApi))") }
+        if !hasBearer { out.append("experimental_bearer_token = \(Self.tomlQuote(key))") }
+    }
+
     func mergeCodexConfig(_ p: ParsedKey, models: [String], wireApi: String = "responses") throws {
         let cfgPath = Self.codexConfigPath
-        if FileManager.default.fileExists(atPath: cfgPath) {
-            _ = try? FileManager.default.removeItem(atPath: cfgPath + ".bak")
-            try? FileManager.default.copyItem(atPath: cfgPath, toPath: cfgPath + ".bak")
-        }
-        let written = try codexConfigToml(p, models: models, wireApi: wireApi)
-        try writeText(written, to: cfgPath)
-        if let back = try? String(contentsOfFile: cfgPath, encoding: .utf8) {
-            // 回读比对必须用与写入一致的规范化值(codexBaseURL 补 /v1、tomlQuote 转义),
-            // 否则 URL 不带 /v1 时必然误报「回读不一致」
-            let key = p.key ?? ""
-            let url = codexBaseURL(p.url ?? "")
-            var issues: [String] = []
-            if !back.contains("base_url = \(Self.tomlQuote(url))") { issues.append("base_url 回读不一致") }
-            if !back.contains("experimental_bearer_token = \(Self.tomlQuote(key))") { issues.append("token 回读不一致") }
-            // 与 codexConfigToml 同一解析:无 gpt 系模型时 model 行被保留原样,跳过校验
-            let model = Self.resolveCodexModel(models: models, parsedModel: p.model)
-            if let m = model, !back.contains("model = \(Self.tomlQuote(m))") { issues.append("model 回读不一致") }
-            if !issues.isEmpty {
-                // 不再 throw:调用方(add)此刻 DB 事务已 COMMIT,throw 会制造
-                // 「DB 说成功、外层报失败」的分裂状态。重写一次 + warn,让结果收敛。
-                try writeText(written, to: cfgPath)
-                AppLog.warn("codex config 回读校验失败(\(issues.joined(separator: ", "))),已重写;请检查 \(cfgPath)")
+        // 全程持锁:config.toml 是「读全文→改→整体覆盖写」,writeText/writeJSON 还共用
+        // 固定临时名 <path>.keydrop-tmp,无锁下 app 与 CLI 并发导入会互相丢更新、
+        // replaceItemAt 可能拿到对方已覆盖的 tmp 内容落盘(claude/opencode 同款约定)
+        try FileLock.withLock(FileLock.lockPath(for: cfgPath)) {
+            if FileManager.default.fileExists(atPath: cfgPath) {
+                _ = try? FileManager.default.removeItem(atPath: cfgPath + ".bak")
+                try? FileManager.default.copyItem(atPath: cfgPath, toPath: cfgPath + ".bak")
             }
+            let written = try codexConfigToml(p, models: models, wireApi: wireApi)
+            try writeText(written, to: cfgPath)
+            if let back = try? String(contentsOfFile: cfgPath, encoding: .utf8) {
+                // 回读比对必须用与写入一致的规范化值(codexBaseURL 补 /v1、tomlQuote 转义),
+                // 否则 URL 不带 /v1 时必然误报「回读不一致」
+                let key = p.key ?? ""
+                let url = codexBaseURL(p.url ?? "")
+                var issues: [String] = []
+                if !back.contains("base_url = \(Self.tomlQuote(url))") { issues.append("base_url 回读不一致") }
+                if !back.contains("experimental_bearer_token = \(Self.tomlQuote(key))") { issues.append("token 回读不一致") }
+                // 与 codexConfigToml 同一解析:无 gpt 系模型时 model 行被保留原样,跳过校验
+                let model = Self.resolveCodexModel(models: models, parsedModel: p.model)
+                if let m = model, !back.contains("model = \(Self.tomlQuote(m))") { issues.append("model 回读不一致") }
+                if !issues.isEmpty {
+                    // 不再 throw:调用方(add)此刻 DB 事务已 COMMIT,throw 会制造
+                    // 「DB 说成功、外层报失败」的分裂状态。重写一次 + warn,让结果收敛。
+                    try writeText(written, to: cfgPath)
+                    AppLog.warn("codex config 回读校验失败(\(issues.joined(separator: ", "))),已重写;请检查 \(cfgPath)")
+                }
+            }
+            let authPath = Self.codexAuthPath
+            if FileManager.default.fileExists(atPath: authPath) {
+                _ = try? FileManager.default.removeItem(atPath: authPath + ".bak")
+                try? FileManager.default.copyItem(atPath: authPath, toPath: authPath + ".bak")
+            }
+            try writeJSON(["OPENAI_API_KEY": p.key ?? ""], to: authPath)
+            // auth.json 是纯凭据文件(只含 OPENAI_API_KEY),收紧到仅属主可读写。
+            // writeJSON 走 replaceItemAt,会保留原文件权限 —— 若原文件是 0644(默认 umask),
+            // 明文 key 会一直对同机其他用户可读。
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authPath)
         }
-        let authPath = Self.codexAuthPath
-        if FileManager.default.fileExists(atPath: authPath) {
-            _ = try? FileManager.default.removeItem(atPath: authPath + ".bak")
-            try? FileManager.default.copyItem(atPath: authPath, toPath: authPath + ".bak")
-        }
-        try writeJSON(["OPENAI_API_KEY": p.key ?? ""], to: authPath)
-        // auth.json 是纯凭据文件(只含 OPENAI_API_KEY),收紧到仅属主可读写。
-        // writeJSON 走 replaceItemAt,会保留原文件权限 —— 若原文件是 0644(默认 umask),
-        // 明文 key 会一直对同机其他用户可读。
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authPath)
     }
 
     /// 删除 current provider 后,把 live 恢复为回退目标 fb 自己的 DB 配置。
@@ -1129,6 +1168,9 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
 
     private static func normalizeHostForResident(_ url: String) -> String {
         var s = url.hasSuffix("/") ? String(url.dropLast()) : url
+        // 与 normalizeEndpointURL 同口径:/chat/completions 结尾也先归一成 /v1,
+        // 否则以 /chat/completions 结尾的手写行判不出「同一端点」,重复建行/误判用户手配
+        if s.hasSuffix("/chat/completions") { s = String(s.dropLast("/chat/completions".count)) + "/v1" }
         if s.hasSuffix("/v1") { s = String(s.dropLast(3)) }
         s = s.replacingOccurrences(of: "://localhost", with: "://127.0.0.1")
         return s
@@ -1555,9 +1597,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         var obj = try loadJSONForWrite(Self.claudeSettingsPath)
         var existing = (obj["env"] as? [String: Any]) ?? [:]
         let anthropicKeys = env.keys
+        // 只清理 KeyDrop 自己写入的键。ALL_PROXY/NO_PROXY 从不出自 claudeEnv,
+        // 在清理列表里等于每次导入都删掉用户手写的代理配置
         for k in Array(existing.keys)
         where k.hasPrefix("ANTHROPIC_") || k == "CLAUDE_CODE_SUBAGENT_MODEL"
-            || k == "HTTPS_PROXY" || k == "HTTP_PROXY" || k == "ALL_PROXY" || k == "NO_PROXY" {
+            || k == "HTTPS_PROXY" || k == "HTTP_PROXY" {
             if !anthropicKeys.contains(k) { existing.removeValue(forKey: k) }
         }
         for (k, v) in env { existing[k] = v }
@@ -1614,9 +1658,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         let token = ((obj["env"] as? [String: Any])?["ANTHROPIC_AUTH_TOKEN"] as? String) ?? ""
         guard token != "PROXY_MANAGED" else { return }
         var existing = (obj["env"] as? [String: Any]) ?? [:]
+        // 只清 KeyDrop 写过的键(同 mergeEnvIntoClaudeSettingsLocked:ALL_PROXY/NO_PROXY
+        // 属用户手写,清掉等于每次删除/还原都顺手清空用户的代理配置)
         for key in Array(existing.keys)
         where key.hasPrefix("ANTHROPIC_") || key == "CLAUDE_CODE_SUBAGENT_MODEL"
-            || key == "HTTPS_PROXY" || key == "HTTP_PROXY" || key == "ALL_PROXY" || key == "NO_PROXY" {
+            || key == "HTTPS_PROXY" || key == "HTTP_PROXY" {
             existing.removeValue(forKey: key)
         }
         if existing.isEmpty { obj.removeValue(forKey: "env") }
@@ -1657,6 +1703,12 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
             _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
         } else {
             try FileManager.default.moveItem(at: tmp, to: url)
+        }
+        // 凭据文件 0600(与 history/prefs/codex-auth 同级约定):claude settings 写入
+        // ANTHROPIC_AUTH_TOKEN,opencode.json 写入上游 API key。replaceItemAt 保留原文件
+        // 权限,moveItem 新建按 umask 落 0644,新建路径必须收紧
+        if path == Self.claudeSettingsPath || path == Self.opencodeConfigPath {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
         }
     }
 

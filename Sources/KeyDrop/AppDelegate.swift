@@ -458,13 +458,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        guard let data = try? Data(contentsOf: url) else {
-            self.alertOK("导入失败", "无法读取文件: \(url.path)")
-            return
-        }
         guard let pass = promptPassphrase(confirm: false, title: "导入账本:输入导出时设置的口令") else { return }
+        // 读文件(账本可达几十 MB)与解密导入都在后台:runModal 后主线程同步
+        // Data(contentsOf:) 会让菜单栏在读入期间无响应(导出路径早已后台化)
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
+                let data = try Data(contentsOf: url)
                 let msg = try Core.shared.importLedger(data, passphrase: pass)
                 let replay = Core.shared.replayArtifacts()
                 AppLog.info("账本导入: \(msg)\n" + replay.joined(separator: "\n"))
@@ -666,6 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         state.useCC = Prefs.shared.useCC
         state.useGrok = Prefs.shared.useGrok
         state.useCPA = Prefs.shared.useCPA
+        state.useDSH = Prefs.shared.useDSH
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         retryFocus()

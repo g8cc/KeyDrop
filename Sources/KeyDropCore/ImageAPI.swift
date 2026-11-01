@@ -212,6 +212,7 @@ public enum ImageAPI {
             return Probe(supported: false, models: [], detail: "URL 非法: \(b)")
         }
         var status = -1
+        var body = ""
         for probeURL in probeURLs {
             var req = URLRequest(url: probeURL)
             req.httpMethod = "POST"
@@ -221,12 +222,16 @@ public enum ImageAPI {
             req.httpBody = Data("{}".utf8)
             let o = NetSync.run(session: session(timeout: timeout, proxy: proxy), request: req, timeout: timeout + 5)
             status = o.error != nil ? -1 : NetSync.statusCode(o)
+            body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             if ![404, 405].contains(status) { break }
         }
-        let supported = [200, 400, 403, 422].contains(status)
+        // 403 需甄别 HTML 盾页(CF 挑战):盾页说明请求根本没到 API 层,
+        // 计「端点存在」会让用户配好渠道后 generate 必败(与 APITester 的 isHTMLBody 口径一致)
+        let shielded403 = status == 403 && body.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
+        let supported = [200, 400, 422].contains(status) || (status == 403 && !shielded403)
 
         var models: [String] = []
-        if supported || status == 403 {
+        if supported || (status == 403 && !shielded403) {
             models = fetchModels(baseURL: b, key: key, timeout: timeout, proxy: proxy)
         }
         let detail: String
@@ -234,7 +239,7 @@ public enum ImageAPI {
         case 200: detail = "生图端点正常"
         case 400, 422: detail = "生图端点存在(空请求被拒)"
         case 401: detail = "key 无效(401)"
-        case 403: detail = "端点存在,但当前 key 无权访问模型"
+        case 403: detail = shielded403 ? "403 来自防护盾页(HTML),请求未达 API 层" : "端点存在,但当前 key 无权访问模型"
         case 404, 405: detail = "该网关无生图端点(/images/generations)"
         case -1: detail = "网络不可达"
         default: detail = "HTTP \(status)"

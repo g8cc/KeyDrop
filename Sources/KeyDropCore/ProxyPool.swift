@@ -284,11 +284,13 @@ public enum ProxyPool {
         for b in bindings {
             guard b.action == .assigned || b.action == .replaced || b.action == .cleared,
                   let path = paths[b.fileName] else { continue }
-            try FileLock.withLock(FileLock.lockPath(for: path)) {
+            // 闭包 return 挡不住外层的 written += 1(解析失败也曾被计成已写入);
+            // 成功与否必须由闭包返回值决定
+            let ok = try FileLock.withLock(FileLock.lockPath(for: path)) { () -> Bool in
                 guard let data = fm.contents(atPath: path),
                       var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     AppLog.error("代理池: 写入失败,无法解析 \(b.fileName)")
-                    return
+                    return false
                 }
                 obj.removeValue(forKey: "proxy_url")
                 obj.removeValue(forKey: "proxy-url")
@@ -310,8 +312,9 @@ public enum ProxyPool {
                     try? FileManager.default.removeItem(at: tmp)
                     throw error
                 }
+                return true
             }
-            written += 1
+            if ok { written += 1 }
         }
         return written
     }
@@ -354,15 +357,35 @@ public enum ProxyPool {
 
     public static func probeOne(url: String, target: String, timeout: TimeInterval) -> PoolProxy {
         let t = String(format: "%.0f", timeout)
+        let fm = FileManager.default
+        // 代理凭证(socks5://user:pass@host)不能进 argv:并发 64 路、每条最长 timeout 秒的
+        // 探测窗口内,同用户进程经 ps 可见完整参数表。全部参数走 -K 配置文件(0600,用后即删),
+        // argv 只留文件路径;配置文件写不出来(磁盘满等极罕见)才回退 argv 直传
+        let quote = { (s: String) -> String in
+            "\"" + s.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }
+        let cfgURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("keydrop-probe-\(UUID().uuidString).cfg")
+        let cfgText = """
+        silent
+        show-error
+        output = "/dev/null"
+        max-time = \(t)
+        connect-timeout = \(t)
+        write-out = "%{http_code} %{time_total}"
+        proxy = \(quote(url))
+        url = \(quote(target))
+        """
+        let usingConfig = fm.createFile(atPath: cfgURL.path, contents: Data(cfgText.utf8),
+                                        attributes: [.posixPermissions: 0o600])
+        defer { if usingConfig { try? fm.removeItem(atPath: cfgURL.path) } }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-        p.arguments = [
-            "-x", url,
-            "-sS", "-o", "/dev/null",
-            "-m", t, "--connect-timeout", t,
-            "-w", "%{http_code} %{time_total}",
-            target
-        ]
+        p.arguments = usingConfig
+            ? ["-K", cfgURL.path]
+            : ["-x", url, "-sS", "-o", "/dev/null", "-m", t, "--connect-timeout", t,
+               "-w", "%{http_code} %{time_total}", target]
         let pipe = Pipe()
         p.standardOutput = pipe
         // stderr 必须导到 nullDevice 而不是新建 Pipe:不读的 Pipe 在 curl 输出

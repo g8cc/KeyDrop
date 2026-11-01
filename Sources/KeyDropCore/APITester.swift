@@ -332,6 +332,12 @@ public enum APITester {
                         if degradedModel == nil { degradedModel = (probe, st) }
                         continue
                     }
+                    if chat.networkError {
+                        // 全部 chat 路径超时/无响应:模型不可达,绝不能计入 working
+                        // (归入 degraded,与 5xx「服务不可用」同向)
+                        if degradedModel == nil { degradedModel = (probe, 0) }
+                        continue
+                    }
                     working.append(probe)
                     if firstWorkingLatency == nil { firstWorkingLatency = chat.latencyMs }
                 }
@@ -356,8 +362,9 @@ public enum APITester {
                                          modelLatencies: hasRealModels && !modelLatencies.isEmpty ? modelLatencies : nil)
                 }
                 if let (m, st) = degradedModel {
+                    let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
                     return APITestResult(ok: false, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(\(m) 服务不可用/限流)",
+                                         detail: "GET \(ep) → 200, 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)",
                                          authFailed: false)
                 }
                 if !quotaModels.isEmpty, hasRealModels {
@@ -406,14 +413,17 @@ public enum APITester {
         var importedInList: [String] = []
         if let importedModels, !importedModels.isEmpty {
             let seen = Set(importedModels)
-            importedInList = capped.filter { seen.contains($0) && $0 != pref }
+            importedInList = capped.filter { seen.contains($0) && pref?.caseInsensitiveCompare($0) != .orderedSame }
         }
+        // 激活模型在目录中的原拼写(大小写不敏感匹配):因大小写差异漏探过;
+        // 不在目录里则不置顶(站点列表为准,与 ≤4 分支及回归约定一致)
+        let pinned: String? = pref.flatMap { p in capped.first { $0.caseInsensitiveCompare(p) == .orderedSame } }
         // 轮换语义:每轮仍只测 4 个(额度/时延下限),但激活模型置顶后,其余槽位按
         // 「从未测过 > 最久未测」轮换 —— 否则第 5 个以后的模型永远轮不到,灰格永不填
         // (真实反馈:模型条一直没进度,用户以为模型坏了)。N 个模型 ≈ ⌈(N-1)/3⌉ 轮全覆盖
         if let times = modelProbeTimes, !times.isEmpty, capped.count > 4 {
             var rest = capped
-            if let pref, let pi = rest.firstIndex(of: pref) { rest.remove(at: pi) }
+            if let pinned { rest.removeAll { $0 == pinned } }
             rest = rest.filter { !importedInList.contains($0) }
             let freeFirst = rest.filter { $0.lowercased().contains("free") }
             let others = rest.filter { !$0.lowercased().contains("free") }
@@ -422,18 +432,18 @@ public enum APITester {
             let probed = pool.filter { times[$0] != nil }
                 .sorted { (times[$0] ?? 0) < (times[$1] ?? 0) }   // 最久未测优先
             var order: [String] = []
-            if let pref { order.append(pref) }
+            if let pinned { order.append(pinned) }
             order.append(contentsOf: (neverProbed + probed).prefix(4 - order.count))
             return order
         }
         // preferred 绝对置顶(free 优先规则不得覆盖它),导入模型次之,其余按 free 优先排序
-        if let pref, capped.contains(pref) {
-            let rest2 = capped.filter { $0 != pref }
+        if let pinned {
+            let rest2 = capped.filter { $0 != pinned }
             let importedRest = rest2.filter { importedInList.contains($0) }
             let others = rest2.filter { !importedInList.contains($0) }
             let freeFirst = others.filter { $0.lowercased().contains("free") }
             let rest3 = others.filter { !$0.lowercased().contains("free") }
-            return Array(([pref] + importedRest + freeFirst + rest3).prefix(4))
+            return Array(([pinned] + importedRest + freeFirst + rest3).prefix(4))
         }
         let importedOnly = capped.filter { importedInList.contains($0) }
         let rest = capped.filter { !importedInList.contains($0) }
@@ -468,15 +478,27 @@ public enum APITester {
     }
 
     /// POST chat 健康检查结果
+    private struct ChatProbeOutcome {
+        var quota: Int?
+        var degraded: Int?
+        var authStatus: Int?
+        var latencyMs: Double?
+        /// 所有 chat 路径都拿不到 HTTP 状态(超时/连接失败):chat 端点不可达。
+        /// 不得当成「模型可用」—— /models 200 但 chat 挂死的网关,旧逻辑整 key 判 ok,
+        /// 与 5xx 判 degraded(移出可用列表)方向完全相反
+        var networkError = false
+    }
+
     /// - quota: 429/402 且 body 明确额度耗尽关键词
     /// - degraded: 429 限流(无 quota 词)/402/424/5xx → 服务不可用
     /// - authStatus: 401/403(非 HTML 盾页)→ 认证失败/key 失效。/models 常是公共端点(无 key 也 200),
     ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
     ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
-    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> (quota: Int?, degraded: Int?, authStatus: Int?, latencyMs: Double?) {
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> ChatProbeOutcome {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
+        var sawNetworkError = false
         for path in chatPaths {
             guard let u = URL(string: base + path) else { continue }
             var req = URLRequest(url: u)
@@ -501,29 +523,30 @@ public enum APITester {
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
             if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
-                return (nil, nil, status, nil)
+                return ChatProbeOutcome(authStatus: status)
             }
             if status == 403 { continue }   // 盾页/地域封锁:跳过本候选,不误判 authFailed
+            if status == 0 { sawNetworkError = true; continue }
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
-                    return (status, nil, nil, nil)
+                    return ChatProbeOutcome(quota: status)
                 }
-                return (nil, status, nil, nil)
+                return ChatProbeOutcome(degraded: status)
             }
             if status == 424 || (500...599).contains(status) {
-                return (nil, status, nil, nil)
+                return ChatProbeOutcome(degraded: status)
             }
             if status == 200 {
                 // 200 + 非 HTML 响应体才计可用与延迟:流式网关回 SSE(data: 行),
                 // 普通网关回 JSON;空体/前端兜底页不算
-                if isJSONBody(body) || body.contains("data:") {
-                    return (nil, nil, nil, latencyMs)
+                if isJSONBody(body) || (!isHTMLBody(body) && body.contains("data:")) {
+                    return ChatProbeOutcome(latencyMs: latencyMs)
                 }
                 continue
             }
         }
-        return (nil, nil, nil, nil)
+        return ChatProbeOutcome(networkError: sawNetworkError)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {

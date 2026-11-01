@@ -190,15 +190,26 @@ public final class CPAWriter {
         return try? CPAAPI.readConfigText(path: cfg)
     }
 
-    /// 从配置文本解析顶层 port: 行(缩进行不算,防止误读嵌套段)
+    /// 从配置文本解析顶层 port: 行(缩进行不算,防止误读嵌套段)。
+    /// 值按空白切首个 token:`port: 8317 # 注释` 的行尾注释曾整串被当端口号,
+    /// 拼进常驻入口 baseURL 污染所有下游配置;tab 缩进的嵌套 port 同样要排除
     static func readPort(from content: String?) -> String? {
         guard let content else { return nil }
         for line in content.split(separator: "\n", omittingEmptySubsequences: false) {
             let l = String(line)
             let trimmed = l.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("port:"), !l.hasPrefix(" ") {
-                let v = trimmed.dropFirst("port:".count).trimmingCharacters(in: .whitespaces)
-                if !v.isEmpty { return v }
+            if trimmed.hasPrefix("port:"), !l.hasPrefix(" "), !l.hasPrefix("\t") {
+                let v = trimmed.dropFirst("port:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                    .split(separator: " ", omittingEmptySubsequences: true).first
+                    .map(String.init) ?? ""
+                // 引号形式剥掉引号(与 decodeYAMLScalar 口径一致)
+                let unwrapped: String = {
+                    if v.count >= 2, v.hasPrefix("\""), v.hasSuffix("\"") { return String(v.dropFirst().dropLast()) }
+                    if v.count >= 2, v.hasPrefix("'"), v.hasSuffix("'") { return String(v.dropFirst().dropLast()) }
+                    return v
+                }()
+                if !unwrapped.isEmpty { return unwrapped }
             }
         }
         return nil
@@ -230,7 +241,7 @@ public final class CPAWriter {
             let providerName = aggregatedName(for: url) + "-image"
             if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
                 // keys 合并(去重);models 交给 markImageModel 逐项处理
-                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [k], models: [])
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [k], models: [], baseURL: url)
                 for m in modelList {
                     // 每次插入都可能位移行号,逐项重新定位条目范围
                     let fresh = findAggregatedEntry(in: lines, providerName: providerName) ?? entryRange
@@ -377,7 +388,7 @@ public final class CPAWriter {
             let content = try readConfigText()
             var lines = content.components(separatedBy: "\n")
             let providerName = aggregatedName(for: baseURL)
-            guard let entryRange = findAggregatedEntry(in: lines, providerName: providerName) else {
+            guard let entryRange = findAggregatedEntry(for: baseURL, in: lines) else {
                 throw WriterError.file("CPA 聚合条目不存在: \(providerName)")
             }
             if replaceModelsSegment(&lines, entryRange: entryRange, models: uniq) {
@@ -385,7 +396,8 @@ public final class CPAWriter {
                 return "已更新 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
             }
             // 条目无 models 段(上次探测失败):补写本次列表,复用 merge 的插入逻辑
-            try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: [], models: uniq)
+            let actualName = entryName(in: lines, entryRange: entryRange) ?? providerName
+            try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName, keys: [], models: uniq, baseURL: baseURL)
             try atomicWrite(lines.joined(separator: "\n"))
             return "已补写 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
         }
@@ -514,7 +526,7 @@ public final class CPAWriter {
     private func existingCuratedModels(for baseURL: String) -> [String] {
         guard let content = try? readConfigText() else { return [] }
         let lines = content.components(separatedBy: "\n")
-        guard let range = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL))
+        guard let range = findAggregatedEntry(for: baseURL, in: lines)
         else { return [] }
         return Self.entryModels(in: lines, entryRange: range)
     }
@@ -529,29 +541,31 @@ public final class CPAWriter {
         let content = try readConfigText()
         let proxy = Self.rewriteProxyForDocker(rawProxy, configContent: content)
         var lines = content.components(separatedBy: "\n")
-        let providerName = aggregatedName(for: baseURL)
+        let providerName = aggregatedName(for: baseURL, in: lines)
         var finalModels = pickedModels ?? probedModels
         var preservedNote = ""
 
-        // 定位 openai-compatibility 段下同 name 的现有条目
-        if let entryRange = findAggregatedEntry(in: lines, providerName: providerName) {
+        // 定位 openai-compatibility 段下同上游(base-url 优先)的现有条目
+        if let entryRange = findAggregatedEntry(for: baseURL, in: lines) {
+            // merge 的重定位需要条目真实 name(可能与 aggregatedName 不同:手写名/去重后缀)
+            let actualName = entryName(in: lines, entryRange: entryRange) ?? providerName
             let existingModels = Self.entryModels(in: lines, entryRange: entryRange)
             if let pickedModels {
                 // 本次粘贴用户明确勾选过:整替为新列表(与 refreshModels 同一口径,
                 // merge 的并集语义会留下未勾选的模型),再把本次 key 合进池子
                 if replaceModelsSegment(&lines, entryRange: entryRange, models: pickedModels) {
-                    let shifted = findAggregatedEntry(in: lines, providerName: providerName) ?? entryRange
-                    try mergeIntoAggregatedEntry(&lines, range: shifted, providerName: providerName, keys: keys, models: [])
+                    let shifted = findAggregatedEntry(for: baseURL, in: lines) ?? entryRange
+                    try mergeIntoAggregatedEntry(&lines, range: shifted, providerName: actualName, keys: keys, models: [], baseURL: baseURL)
                 } else {
-                    try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: pickedModels)
+                    try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName, keys: keys, models: pickedModels, baseURL: baseURL)
                 }
                 finalModels = pickedModels
             } else if existingModels.isEmpty {
                 // 条目无模型列表(上次探测失败):补写本次探测结果
-                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: probedModels)
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName, keys: keys, models: probedModels, baseURL: baseURL)
             } else {
                 // 已有精选列表:只合 key,保留 models 原样
-                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: providerName, keys: keys, models: [])
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName, keys: keys, models: [], baseURL: baseURL)
                 finalModels = existingModels
                 preservedNote = ",保留条目现有 \(existingModels.count) 个模型"
             }
@@ -591,7 +605,7 @@ public final class CPAWriter {
         return (try? withCPASync { () -> [String] in
             guard let content = try? readConfigText() else { return [] }
             let lines = content.components(separatedBy: "\n")
-            guard let range = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL)) else { return [] }
+            guard let range = findAggregatedEntry(for: baseURL, in: lines) else { return [] }
             return Self.entryModels(in: lines, entryRange: range)
         }) ?? []
     }
@@ -606,7 +620,7 @@ public final class CPAWriter {
         return try withCPASync {
             let content = try readConfigText()
             var lines = content.components(separatedBy: "\n")
-            guard let entryRange = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL)),
+            guard let entryRange = findAggregatedEntry(for: baseURL, in: lines),
                   let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entryRange)
             else { return "" }
             var replaced = false
@@ -637,6 +651,94 @@ public final class CPAWriter {
             return host
         }
         return trimmed
+    }
+
+    /// 读取条目首行 `- name:` 的值(stripYAMLValue 剥引号),缺失返回 nil
+    private func entryName(in lines: [String], entryRange: Range<Int>) -> String? {
+        let first = lines[entryRange.lowerBound].trimmingCharacters(in: .whitespaces)
+        guard first.hasPrefix("- name:") else { return nil }
+        let v = stripYAMLValue(String(first.dropFirst("- name:".count))).trimmingCharacters(in: .whitespaces)
+        return v.isEmpty ? nil : v
+    }
+
+    /// 读取条目的 `base-url:` 值(剥引号),缺失返回 nil
+    private func entryBaseURL(in lines: [String], entryRange: Range<Int>) -> String? {
+        for i in entryRange {
+            let t = lines[i].trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("base-url:") else { continue }
+            let v = stripYAMLValue(String(t.dropFirst("base-url:".count))).trimmingCharacters(in: .whitespaces)
+            return v.isEmpty ? nil : v
+        }
+        return nil
+    }
+
+    /// 上游端点身份归一化:scheme/host 小写,保留端口与 path,去尾斜杠。
+    /// host+port 相同而 path 不同的两个 base-url 是不同上游,绝不视为同一端点
+    private func normalizeUpstreamURL(_ s: String) -> String {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        guard let u = URL(string: trimmed) ?? URL(string: "https://\(trimmed)"),
+              let host = u.host, !host.isEmpty else {
+            var t = trimmed
+            while t.hasSuffix("/") { t.removeLast() }
+            return t
+        }
+        var out = "\(u.scheme?.lowercased() ?? "https")://\(host.lowercased())"
+        if let port = u.port { out += ":\(port)" }
+        var path = u.path
+        while path.hasSuffix("/") { path.removeLast() }
+        if !path.isEmpty { out += path }
+        return out
+    }
+
+    /// 按 baseURL 定位聚合条目(所有按 URL 的条目级操作统一入口):
+    /// ① base-url 规范化精确匹配 —— 同 host[:port] 不同 path 的两个上游是不同条目,
+    ///    只按 name(host[:port])找会把第二批 key 挂到第一批的 base-url 上轮询;
+    /// ② 回落 name 匹配(存量条目兼容),但命中的条目若带「不同 base-url」,
+    ///    说明该 name 已被另一个上游占用,绝不能并入(返回 nil 让调用方新建)
+    private func findAggregatedEntry(for baseURL: String, in lines: [String]) -> Range<Int>? {
+        let target = normalizeUpstreamURL(baseURL)
+        if let section = findNamedSection(in: lines, key: "openai-compatibility:") {
+            for item in aggregatedEntries(in: lines, section: section) {
+                if let bu = entryBaseURL(in: lines, entryRange: item.range),
+                   normalizeUpstreamURL(bu) == target {
+                    return item.range
+                }
+            }
+        }
+        guard let byName = findAggregatedEntry(in: lines, providerName: aggregatedName(for: baseURL)) else { return nil }
+        if let bu = entryBaseURL(in: lines, entryRange: byName), normalizeUpstreamURL(bu) != target {
+            return nil
+        }
+        return byName
+    }
+
+    /// 新建条目用的 name:基名(host[:port])已被「不同 base-url」的条目占用时,
+    /// 用 path 尾段派生后缀(a.example.com/azure → a.example.com-azure)去重,
+    /// 避免两个上游共享一个 name、按 name 的旧操作互相顶替;
+    /// 基名未被占用、或占用者就是同 base-url 条目时,保持基名(存量口径不变)
+    private func aggregatedName(for baseURL: String, in lines: [String]) -> String {
+        let base = aggregatedName(for: baseURL)
+        guard let section = findNamedSection(in: lines, key: "openai-compatibility:") else { return base }
+        let target = normalizeUpstreamURL(baseURL)
+        var taken = false
+        for item in aggregatedEntries(in: lines, section: section) {
+            guard entryName(in: lines, entryRange: item.range) == base else { continue }
+            if let bu = entryBaseURL(in: lines, entryRange: item.range), normalizeUpstreamURL(bu) == target {
+                return base
+            }
+            taken = true
+        }
+        guard taken else { return base }
+        var slug = URL(string: baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")))?
+            .path.split(separator: "/").last.map(String.init) ?? ""
+        if ["v1", "v2", "v3", "v4", "api", "openai", "v1beta", "completions"].contains(slug) { slug = "" }
+        var n = 1
+        var candidate = slug.isEmpty ? "\(base)-2" : "\(base)-\(slug)"
+        while findAggregatedEntry(in: lines, providerName: candidate) != nil {
+            n += 1
+            candidate = slug.isEmpty ? "\(base)-\(n)" : "\(base)-\(slug)-\(n)"
+        }
+        return candidate
     }
 
     /// 找 `openai-compatibility:` 段下指定 name 的条目范围(从 `- name: X` 行到下一个同级 `- ` 行或段尾)。
@@ -683,10 +785,12 @@ public final class CPAWriter {
         let t = s.trimmingCharacters(in: .whitespaces)
         if t.count >= 2 {
             if t.hasPrefix("\"") && t.hasSuffix("\"") {
-                return String(t.dropFirst().dropLast())
+                // 复用 decodeYAMLScalar 解转义:与写入端 yamlScalar("a\"b" → "a\"b")对称,
+                // 只剥引号不解会让含引号/反斜杠的模型名在去重时失配 → 重导入重复项
+                return decodeYAMLScalar(t)
             }
             if t.hasPrefix("'") && t.hasSuffix("'") {
-                return String(t.dropFirst().dropLast())
+                return decodeYAMLScalar(t)
             }
         }
         return t
@@ -700,7 +804,7 @@ public final class CPAWriter {
     /// 第二批整体回滚),后又用「models 插入后失效的 range」扫描 api-key-entries ——
     /// 当配置里 models: 排在 api-key-entries: 之前(手写或 CPA 工具回写的合法字段序),
     /// 新 key 会被静默丢弃却报告成功。现在 models 合并完重新 findAggregatedEntry 取新 range。
-    private func mergeIntoAggregatedEntry(_ lines: inout [String], range: Range<Int>, providerName: String, keys: [String], models: [String]) throws {
+    private func mergeIntoAggregatedEntry(_ lines: inout [String], range: Range<Int>, providerName: String, keys: [String], models: [String], baseURL: String) throws {
         // models 合并(去重)
         if !models.isEmpty {
             try mergeAggregatedModels(&lines, entryRange: range, newModels: models)
@@ -741,6 +845,24 @@ public final class CPAWriter {
                 insertAt -= 1
             }
             let block = newKeys.map { "\(indent)- api-key: \(yamlScalar($0))" }
+            lines.insert(contentsOf: block, at: insertAt)
+        } else {
+            // 条目没有 api-key-entries: 段(用户手写的精简聚合条目,等着 KeyDrop 填 key):
+            // 必须在条目末尾补建该段再插入。没有 else 分支时 keys 会被静默丢弃,
+            // 却照常落盘并报告成功(账本记了 cpa tag,产物其实不存在)
+            let entryIndent = String(lines[keyRange.lowerBound].prefix(while: { $0 == " " || $0 == "\t" }))
+            let propIndent = entryIndent + "  "
+            let itemIndent = entryIndent + "    "
+            var insertAt = keyRange.upperBound
+            while insertAt > keyRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+                insertAt -= 1
+            }
+            var block: [String] = []
+            if entryBaseURL(in: lines, entryRange: keyRange) == nil {
+                block.append("\(propIndent)base-url: \(yamlScalar(baseURL))")
+            }
+            block.append("\(propIndent)api-key-entries:")
+            for k in newKeys { block.append("\(itemIndent)- api-key: \(yamlScalar(k))") }
             lines.insert(contentsOf: block, at: insertAt)
         }
     }
@@ -1113,7 +1235,8 @@ public final class CPAWriter {
 
     private func yamlScalar(_ s: String) -> String {
         if s.range(of: #"^[A-Za-z0-9_\-./]+$"#, options: .regularExpression) != nil,
-           !s.hasPrefix("-"), !s.isEmpty {
+           !s.hasPrefix("-"), !s.isEmpty,
+           !DSHWriter.ambiguouslyTypedYAMLScalar(s) {
             return s
         }
         let escaped = s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -1269,6 +1392,13 @@ public final class CPAWriter {
             Logger.warn("CPA YAML 校验器不可用(缺 PyYAML),已跳过校验")
             return
         }
-        throw WriterError.file(err.trimmingCharacters(in: .whitespacesAndNewlines))
+        // 校验失败的文件无法再过后续写入的前置校验(每次写入都先 validateYAML),
+        // KeyDrop 的 CPA 功能就此停摆 —— 必须把 .keydrop-bak 恢复通道直接告诉用户
+        var hint = ""
+        let bak = path + ".keydrop-bak"
+        if FileManager.default.fileExists(atPath: bak) {
+            hint = "\n恢复方式: cp \(bak) \(path) 后重试"
+        }
+        throw WriterError.file(err.trimmingCharacters(in: .whitespacesAndNewlines) + hint)
     }
 }

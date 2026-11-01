@@ -48,19 +48,12 @@ enum WebDAVSync {
             req.httpBody = body
             req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         }
-        var payload = Data()
-        var code = 0
-        var taskError: Error?
-        let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: req) { d, r, e in
-            defer { sem.signal() }
-            payload = d ?? Data()
-            code = (r as? HTTPURLResponse)?.statusCode ?? 0
-            taskError = e
-        }.resume()
-        sem.wait()
-        if let taskError { throw taskError }
-        return (code, payload)
+        // 走 NetSync 统一封装:超时后 cancel 并等回调收尾。手写 sem.wait() 无界等
+        // 只受 request 级 idle 超时约束,服务端慢速滴流可让 push/fetch 挂死,
+        // 自动同步定时器会因此越积越多
+        let o = NetSync.run(session: URLSession.shared, request: req, timeout: 60)
+        if let e = o.error { throw e }
+        return (NetSync.statusCode(o), o.data ?? Data())
     }
 
     /// 拉取远端快照并解密解码(GET → 信封解密 → LedgerPayload)

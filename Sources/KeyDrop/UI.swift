@@ -146,12 +146,10 @@ final class AppState: ObservableObject {
                     setStatus("检测到订阅,请确认导入", ok: true)
                     return
                 }
-                // 回退到普通 key 导入前必须先归还 busy 标志:
-                // continueAddKey 有 guard !isBusy,不复位则回退被静默吞掉,
-                // isBusy 永久卡在 true,面板按钮全部禁用只能重启
-                isBusy = false
-                busyLabel = ""
-                await self.continueAddKey(raw: raw)
+                // 回退到普通 key 导入:busy 标志不归还,直接传递给 continueAddKey。
+                // 「先复位再重取」之间是一次 main-actor 挂起点,用户此瞬间点删除/刷新
+                // 会与随后的导入并发跑(或让导入被 guard 静默吞掉)
+                await self.continueAddKey(raw: raw, assumeBusy: true)
             }
             return
         }
@@ -172,15 +170,21 @@ final class AppState: ObservableObject {
     }
 
     @MainActor
-    private func continueAddKey(raw: String) async {
+    private func continueAddKey(raw: String, assumeBusy: Bool = false) async {
         if !useCC && !useGrok && !useCPA && !useDSH {
             setStatus("请先开启 cc-switch、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
             return
         }
-        guard !isBusy else { return }
-        isBusy = true
-        busyLabel = "解析并测试中…"
-        setStatus("解析并测试中…", ok: true)
+        if assumeBusy {
+            // 订阅回退路径:busy 标志由调用方持有并直接交接,不重复置位
+            busyLabel = "解析并测试中…"
+            setStatus("解析并测试中…", ok: true)
+        } else {
+            guard !isBusy else { return }
+            isBusy = true
+            busyLabel = "解析并测试中…"
+            setStatus("解析并测试中…", ok: true)
+        }
         defer {
             isBusy = false
             busyLabel = ""
@@ -378,17 +382,20 @@ final class AppState: ObservableObject {
         verifyingID = id
         Task { @MainActor in
             defer { verifyingID = nil }
-            let report = await Task.detached(priority: .userInitiated) { () -> AuthenticityProbe.Report in
-                AuthenticityProbe.run(base: url, key: key, model: model,
-                                      proxy: Core.shared.proxyForHealthPublic(), timeout: 40)
+            // find + update(全量历史落盘,flock)在后台做:大账本下同步写会让
+            // 主线程卡几十到上百毫秒(与 doAddClashProxies 同一处理)
+            let (verdict, lines) = await Task.detached(priority: .userInitiated) { () -> (String, [String]) in
+                let report = AuthenticityProbe.run(base: url, key: key, model: model,
+                                                   proxy: Core.shared.proxyForHealthPublic(), timeout: 40)
+                if var e = self.core.history.find(idPrefix: id) {
+                    e.verifyVerdict = report.verdict
+                    try? self.core.history.update(e)
+                }
+                return (report.verdict, report.lines)
             }.value
-            verifyVerdicts[id] = report.verdict
-            verifyReports[id] = report.lines
-            // 结论持久化到条目:重启后行图标仍着色,重复鉴定有历史可对照
-            if var e = core.history.find(idPrefix: id) {
-                e.verifyVerdict = report.verdict
-                try? core.history.update(e)
-            }
+            verifyVerdicts[id] = verdict
+            verifyReports[id] = lines
+            // 结论已持久化到条目:重启后行图标仍着色,重复鉴定有历史可对照
             verifySheetShown = true
             historyVersion += 1
         }

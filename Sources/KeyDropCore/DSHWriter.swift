@@ -108,13 +108,15 @@ public enum DSHWriter {
 
         backupFile(settingsPath)
         backupFile(credentialsPath)
-        if FileManager.default.fileExists(atPath: settingsPath),
-           var settings = try? String(contentsOfFile: settingsPath, encoding: .utf8) {
+        // 读失败必须抛错(与 add 的 readExisting 同口径):吞掉失败会让调用方
+        // 照常摘掉 dsh tag,settings/creds 里的 route 与明文 key 永久残留且无账本指针
+        if FileManager.default.fileExists(atPath: settingsPath) {
+            var settings = try readExisting(settingsPath)
             removeRoute(&settings, route: route)
             try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
         }
-        if FileManager.default.fileExists(atPath: credentialsPath),
-           var creds = try? String(contentsOfFile: credentialsPath, encoding: .utf8) {
+        if FileManager.default.fileExists(atPath: credentialsPath) {
+            var creds = try readExisting(credentialsPath)
             removeCredential(&creds, env: env)
             try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
             // 原子写=临时文件+rename,新文件继承 umask(通常 0644),会把 add 时设置的
@@ -124,13 +126,17 @@ public enum DSHWriter {
     }
 
     /// YAML 标量:普通 URL/模型名/key 保持裸写(兼容既有格式与消费方),
-    /// 含空格、引号、#、冒号结尾等会破坏 YAML 解析的形态时转双引号
+    /// 含空格、引号、#、冒号结尾等会破坏 YAML 解析的形态时转双引号。
+    /// 「能被 YAML 解析成非字符串」的形态(纯数字/前导零/bool/null 词)也必须引起来:
+    /// 裸写 `1234567890` 落地成 int 节点,消费方(dsh/CPA 的 Go yaml.v3)反序列化进
+    /// string 字段直接报错拒载配置;前导零(`007`)在 YAML 1.1 还会变八进制
     public static func yamlScalar(_ s: String) -> String {
         if !s.isEmpty,
            s.range(of: #"^[A-Za-z0-9_\-./:%#=]+$"#, options: .regularExpression) != nil,
            !s.hasPrefix("-"), !s.hasPrefix("?"),
            !s.hasPrefix("#"), !s.hasPrefix("%"), !s.hasPrefix(":"),
-           !s.contains(": "), !s.hasSuffix(":") {
+           !s.contains(": "), !s.hasSuffix(":"),
+           !Self.ambiguouslyTypedYAMLScalar(s) {
             return s
         }
         let e = s.replacingOccurrences(of: "\\", with: "\\\\")
@@ -139,6 +145,20 @@ public enum DSHWriter {
             .replacingOccurrences(of: "\n", with: "\\n")
             .replacingOccurrences(of: "\t", with: "\\t")
         return "\"\(e)\""
+    }
+
+    /// 判定裸写后是否会被 YAML 解析为 int/float/bool/null(须加引号)
+    static func ambiguouslyTypedYAMLScalar(_ s: String) -> Bool {
+        let l = s.lowercased()
+        if ["true", "false", "yes", "no", "on", "off", "null", "~"].contains(l) { return true }
+        // 纯数字(含正负号):YAML int
+        if s.range(of: #"^[+-]?[0-9]+$"#, options: .regularExpression) != nil { return true }
+        // 前导零多段(007/0123):YAML 1.1 八进制
+        if s.count > 1, s.hasPrefix("0"), s.range(of: #"^0[0-9]+$"#, options: .regularExpression) != nil { return true }
+        // 浮点/科学计数(1.5 / 1e5 / .5):YAML float
+        if s.range(of: #"^[+-]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][+-]?[0-9]+)?$"#, options: .regularExpression) != nil,
+           s.contains(".") || s.lowercased().contains("e") { return true }
+        return false
     }
 
     /// 扫描 settings.yaml,返回所有指向该端点(localhost/127.0.0.1 与尾 /v1 归一)的 route 名。
