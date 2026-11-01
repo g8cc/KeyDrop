@@ -384,6 +384,11 @@ final class AppState: ObservableObject {
             }.value
             verifyVerdicts[id] = report.verdict
             verifyReports[id] = report.lines
+            // 结论持久化到条目:重启后行图标仍着色,重复鉴定有历史可对照
+            if var e = core.history.find(idPrefix: id) {
+                e.verifyVerdict = report.verdict
+                try? core.history.update(e)
+            }
             verifySheetShown = true
             historyVersion += 1
         }
@@ -515,10 +520,11 @@ final class AppState: ObservableObject {
         }
     }
 
-    func doSyncDSH(_ id: String) {
+    func doSyncTarget(_ id: String, target: String) {
         guard !isBusy else { return }
+        let label = ["ccswitch": "cc-switch", "cpa": "CPA", "dsh": "DSH", "grok": "Grok Build"][target] ?? target
         isBusy = true
-        busyLabel = "同步 DSH…"
+        busyLabel = "同步 \(label)…"
         Task { @MainActor in
             defer {
                 isBusy = false
@@ -526,13 +532,13 @@ final class AppState: ObservableObject {
             }
             do {
                 let msg = try await Task.detached(priority: .userInitiated) {
-                    try Core.shared.syncToDSH(entryIDPrefix: id)
+                    try Core.shared.syncTarget(entryIDPrefix: id, target: target)
                 }.value
                 setStatus(msg, ok: true)
                 historyVersion += 1
-                notify(summary: "DSH 同步完成", body: msg)
+                notify(summary: "\(label) 同步完成", body: msg)
             } catch {
-                setStatus("同步 DSH 失败: \(error.localizedDescription)", ok: false)
+                setStatus("同步 \(label) 失败: \(error.localizedDescription)", ok: false)
                 historyVersion += 1
             }
         }
@@ -990,7 +996,7 @@ struct HistoryRow: View {
     let onCopy: (String) -> Void
     let onCopyId: (String) -> Void
     let onRefresh: (String) -> Void
-    let onSyncDSH: () -> Void
+    let onSyncTarget: (String, String) -> Void
     let onLaunchApp: (String, String) -> Void
     let onCopyCurl: () -> Void
     let onReimport: () -> Void
@@ -1165,7 +1171,7 @@ struct HistoryRow: View {
                             .disabled(verifyRunning || busy)
                             .help(verifyVerdict == nil
                                   ? "真伪鉴定:能力阶梯实测该模型(约 6 次请求)"
-                                  : "上次鉴定: \(verifyVerdict!) · 点击重新鉴定")
+                                  : "上次鉴定: \(verifyVerdict!) · 点击重新鉴定(结论会覆盖)")
 
                             Button {
                                 onCopyCurl()
@@ -1196,14 +1202,19 @@ struct HistoryRow: View {
                             .help(refreshing ? "测试中…" : "重新测试并更新模型列表")
 
                             Menu {
-                                Section("同步目标") {
-                                    Button {
-                                        onSyncDSH()
-                                    } label: {
-                                        Label(entry.targets.contains("dsh")
-                                              ? "重新同步到 DSH" : "同步到 DSH",
-                                              systemImage: entry.targets.contains("dsh")
-                                              ? "checkmark.circle" : "arrow.down.circle")
+                                Section("同步到…") {
+                                    Button { onSyncTarget(entry.id, "ccswitch") } label: {
+                                        Label("cc-switch(编码 Agent)", systemImage: "star.fill")
+                                    }
+                                    Button { onSyncTarget(entry.id, "cpa") } label: {
+                                        Label("CPA(本地聚合池)", systemImage: "shippingbox.fill")
+                                    }
+                                    Button { onSyncTarget(entry.id, "dsh") } label: {
+                                        Label(entry.targets.contains("dsh") ? "DSH(重新同步)" : "DSH(DeepSeek Harness)",
+                                              systemImage: "arrow.down.circle")
+                                    }
+                                    Button { onSyncTarget(entry.id, "grok") } label: {
+                                        Label("Grok Build", systemImage: "sparkles")
                                     }
                                 }
                             } label: {
@@ -2416,7 +2427,7 @@ struct PanelView: View {
                                     onDelete: { state.doDelete(e.id) },
                                     onVerify: { id in state.doVerify(id) },
                                     verifyRunning: state.verifyingID == e.id,
-                                    verifyVerdict: state.verifyVerdicts[e.id],
+                                    verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
                                     onCopy: { m in
                                         let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
                                         NSPasteboard.general.clearContents()
@@ -2427,7 +2438,7 @@ struct PanelView: View {
                                         showToast("已复制 ID: \(id.prefix(8))…")
                                     },
                                     onRefresh: { id in state.doRefresh(id) },
-                                    onSyncDSH: { state.doSyncDSH(e.id) },
+                                    onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
                                     onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                     onCopyCurl: {
                                         guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
@@ -2484,7 +2495,7 @@ struct PanelView: View {
                                             onDelete: { state.doDelete(e.id) },
                                             onVerify: { id in state.doVerify(id) },
                                             verifyRunning: state.verifyingID == e.id,
-                                            verifyVerdict: state.verifyVerdicts[e.id],
+                                            verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
                                             onCopy: { m in
                                                 let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
                                                 NSPasteboard.general.clearContents()
@@ -2495,7 +2506,7 @@ struct PanelView: View {
                                                 showToast("已复制 ID: \(id.prefix(8))…")
                                             },
                                             onRefresh: { id in state.doRefresh(id) },
-                                            onSyncDSH: { state.doSyncDSH(e.id) },
+                                            onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
                                             onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                             onCopyCurl: {
                                                 guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
@@ -2574,7 +2585,7 @@ struct PanelView: View {
                                             onDelete: { state.doDelete(e.id) },
                                             onVerify: { id in state.doVerify(id) },
                                             verifyRunning: state.verifyingID == e.id,
-                                            verifyVerdict: state.verifyVerdicts[e.id],
+                                            verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
                                             onCopy: { m in
                                                 let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
                                                 NSPasteboard.general.clearContents()
@@ -2585,7 +2596,7 @@ struct PanelView: View {
                                                 showToast("已复制 ID: \(id.prefix(8))…")
                                             },
                                             onRefresh: { id in state.doRefresh(id) },
-                                            onSyncDSH: { state.doSyncDSH(e.id) },
+                                            onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
                                             onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
                                             onCopyCurl: {
                                                 guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {

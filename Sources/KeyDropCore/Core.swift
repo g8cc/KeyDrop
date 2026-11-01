@@ -2726,6 +2726,83 @@ public final class Core {
         return "✓ DeepSeek Harness: 已\(alreadyLinked ? "更新" : "添加") provider「\(route)」(\(models.count) 个模型)"
     }
 
+    /// 通用「按需同步到指定目标」:条目行的同步菜单入口(cc-switch/CPA/DSH/Grok)。
+    /// 与 replayArtifacts 的区别:单条目、单目标、用户显式触发。
+    /// - cc-switch:账本无本机 pid 或 pid 已不存在 → cc.add 建;已存在 → syncModelsAfterRefresh
+    /// - CPA:聚合条目 upsert(key 合并 + 模型整替为条目精选)
+    /// - DSH/Grok:写入器天然 upsert
+    public func syncTarget(entryIDPrefix: String, target: String) throws -> String {
+        guard var entry = history.find(idPrefix: entryIDPrefix)
+            ?? history.findActiveByRaw(entryIDPrefix)
+        else {
+            throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
+        }
+        guard entry.status == "active" else {
+            throw ParseError.io("该记录已删除,无法同步")
+        }
+        guard let url = entry.url, !url.isEmpty,
+              let key = extractKey(entry), !key.isEmpty else {
+            throw ParseError.io("该记录缺少 URL 或 key,无法同步")
+        }
+        let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !models.isEmpty else {
+            throw ParseError.io("该记录没有模型,请先编辑或刷新模型后再同步")
+        }
+        let px = proxyForHealth()
+        switch target {
+        case "ccswitch":
+            let appType = entry.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+            if let pid = entry.ccProviderID, cc.providerExists(pid, appType: appType) {
+                var p = ParsedKey()
+                p.url = url
+                p.key = key
+                p.model = models.first
+                p.name = entry.name
+                try cc.syncModelsAfterRefresh(p, providerID: pid, appType: appType,
+                                              models: models, proxy: px)
+                return "cc-switch: 已同步模型(\(models.count) 个)"
+            }
+            var p = ParsedKey()
+            p.url = url
+            p.key = key
+            p.model = models.first
+            p.name = entry.name
+            let r = try cc.add(p, nameOverride: entry.name, appType: appType, models: models, proxy: px)
+            entry.ccProviderID = r.providerID
+            let tag = appType == "claude" ? "ccswitch" : "ccswitch-\(appType)"
+            if !entry.targets.contains(tag) { entry.targets.append(tag) }
+            try history.update(entry)
+            return "cc-switch: 已新建 provider 并激活(\(tag))"
+        case "cpa":
+            guard let cfg = prefs.resolvedCPAConfig() else {
+                throw ParseError.io("本机未找到 CPA 配置(config.yaml 或管理 API)")
+            }
+            let msg = try CPAWriter(configPath: cfg)
+                .addAggregated(baseURL: url, key: key, models: models)
+            entry.cpaConfigPath = cfg
+            if !entry.targets.contains("cpa") { entry.targets.append("cpa") }
+            try history.update(entry)
+            return "CPA: \(msg)"
+        case "dsh":
+            let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
+            if !entry.targets.contains("dsh") { entry.targets.append("dsh") }
+            try history.update(entry)
+            return "DSH: \(route)"
+        case "grok":
+            let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
+            let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])
+            entry.grokConfigPath = writer.configPath
+            if !entry.targets.contains("grok") { entry.targets.append("grok") }
+            try history.update(entry)
+            return "Grok Build: \(msg)"
+        default:
+            throw ParseError.io("未知同步目标: \(target)")
+        }
+    }
+
     public func delete(entryIDPrefix: String) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix)
             ?? history.findActiveByRaw(entryIDPrefix)

@@ -22,6 +22,7 @@ public struct HistoryEntry: Codable {
         case clashFile
         case deletedAt
         case updatedAt
+        case verifyVerdict
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
@@ -58,6 +59,8 @@ public struct HistoryEntry: Codable {
     public var deletedAt: TimeInterval?
     /// 最后修改时间(HistoryStore.append/update 自动盖章):多设备同步的 LWW 依据
     public var updatedAt: TimeInterval?
+    /// 最近一次真伪鉴定的能力层级结论(旗舰级/中端级/基础级/异常);面板行图标着色与悬停展示
+    public var verifyVerdict: String?
     /// 最近一次 chat 探测的端到端延迟(毫秒)。实战监控:慢网关也显示"可用",
     /// 但延迟让用户对"用的时候行不行"有预期(真实反馈:显示可用,用起来 30s 无响应)
     public var latencyMs: Double?
@@ -127,6 +130,7 @@ public struct HistoryEntry: Codable {
         clashFile: String? = nil,
         deletedAt: TimeInterval? = nil,
         updatedAt: TimeInterval? = nil,
+        verifyVerdict: String? = nil,
         latencyMs: Double? = nil,
         failStreak: Int? = nil,
         viaCPAOk: Bool? = nil,
@@ -159,6 +163,7 @@ public struct HistoryEntry: Codable {
         self.clashFile = clashFile
         self.deletedAt = deletedAt
         self.updatedAt = updatedAt
+        self.verifyVerdict = verifyVerdict
         self.latencyMs = latencyMs
         self.failStreak = failStreak
         self.viaCPAOk = viaCPAOk
@@ -194,6 +199,7 @@ public struct HistoryEntry: Codable {
         clashFile = try c.decodeIfPresent(String.self, forKey: .clashFile)
         deletedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .deletedAt)
         updatedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .updatedAt)
+        verifyVerdict = try c.decodeIfPresent(String.self, forKey: .verifyVerdict)
         latencyMs = try c.decodeIfPresent(Double.self, forKey: .latencyMs)
         failStreak = try c.decodeIfPresent(Int.self, forKey: .failStreak)
         viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)
