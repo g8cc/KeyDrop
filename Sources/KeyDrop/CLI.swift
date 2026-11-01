@@ -349,6 +349,20 @@ enum CLI {
         case "proxy-pool":
             return runProxyPool(remaining)
 
+        case "verify":
+            guard let target = remaining.first else {
+                print("用法: KeyDrop verify <历史ID前缀>  # 能力阶梯真伪鉴定(约 6 次请求)")
+                return 2
+            }
+            do {
+                let msg = try Core.shared.verifyModelAuthenticity(entryIDPrefix: target)
+                print(msg)
+                return 0
+            } catch {
+                print("鉴定失败: \(error.localizedDescription)")
+                return 1
+            }
+
         case "webdav-push", "webdav-pull":
             let isPush = a.first == "webdav-push"
             if let u = davURL { Prefs.shared.webdavURL = u }

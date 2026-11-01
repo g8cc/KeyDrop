@@ -114,7 +114,7 @@ public enum APITester {
     /// 代理非空时创建带 connectionProxyDictionary 的 session;否则复用默认。
     /// 创建也在锁内:URLSession(configuration:) 构造很轻(不动网络),锁外 check-then-create
     /// 会让两个线程同时 miss 各建一个,被弃用的那个永不 invalidate → 常驻泄漏。
-    private static func session(for proxy: String?) -> URLSession {
+    static func session(for proxy: String?) -> URLSession {
         let p = proxy?.trimmingCharacters(in: .whitespaces) ?? ""
         guard let dict = proxyDictionary(for: p) else { return session }
         proxySessionLock.lock()
@@ -560,7 +560,7 @@ public enum APITester {
         return (false, authFailed, lastDesc)
     }
 
-    private static func isHTMLBody(_ s: String) -> Bool {
+    static func isHTMLBody(_ s: String) -> Bool {
         s.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<")
     }
 

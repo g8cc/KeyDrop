@@ -1695,6 +1695,36 @@ public final class Core {
         return lines
     }
 
+    // MARK: - 模型真伪鉴定
+
+    /// 对条目的当前模型跑能力阶梯探针(数学/计数/逻辑逐级),返回真伪鉴定报告。
+    /// 原理与局限见 docs/model-authenticity.md:实测的是"长在权重里的能力",
+    /// 中转站改响应包装规避不了;同家族版本内替换判别力有限。
+    public func verifyModelAuthenticity(entryIDPrefix: String) throws -> String {
+        guard let entry = history.find(idPrefix: entryIDPrefix)
+            ?? history.findActiveByRaw(entryIDPrefix)
+        else {
+            throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
+        }
+        guard let url = entry.url, !url.isEmpty, let key = entry.key, !key.isEmpty else {
+            throw ParseError.io("该记录缺少 URL 或 key,无法鉴定")
+        }
+        let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let model = models.first else {
+            throw ParseError.io("该记录没有模型,无法鉴定")
+        }
+        let report = AuthenticityProbe.run(base: url, key: key, model: model,
+                                           proxy: proxyForHealth(), timeout: 40)
+        var out = ["真伪鉴定: 声称模型 \(model)"]
+        out.append(contentsOf: report.lines)
+        if report.claimedTier == 3, report.verdict != "旗舰级" {
+            out.append("⚠ 实测能力低于旗舰级声称——高概率模型替换/降级(网关间歇性失败也可能,建议隔天复测)")
+        }
+        return out.joined(separator: "\n")
+    }
+
     // MARK: - WebDAV 同步(Phase 2 简化版:显式推送/拉取加密账本快照,无自建后端)
 
     /// 推送:端到端加密导出 → PUT 覆盖 WebDAV 远端快照。配置从 prefs 读取

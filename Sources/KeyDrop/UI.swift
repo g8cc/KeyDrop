@@ -1546,6 +1546,36 @@ struct HelpView: View {
 
 struct EditView: View {
     @ObservedObject var state: AppState
+    @State private var probeRunning = false
+    @State private var probeVerdict: String?
+    @State private var probeReport: [String] = []
+
+    /// 真伪鉴定:对当前条目(或新填的 key)跑能力阶梯探针
+    private func probeAuthenticity() {
+        guard let entry = state.editTarget, let url = entry.url, !url.isEmpty else { return }
+        let key = state.editKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveKey = key.isEmpty ? (entry.key ?? "") : key
+        guard !effectiveKey.isEmpty else { return }
+        let models = state.editModelsText
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let model = models.first else { return }
+        probeRunning = true
+        probeVerdict = nil
+        probeReport = []
+        let pid = entry.ccProviderID
+        Task.detached(priority: .userInitiated) {
+            let report = AuthenticityProbe.run(base: url, key: effectiveKey, model: model,
+                                               proxy: nil, timeout: 40)
+            DispatchQueue.main.async {
+                probeVerdict = report.verdict
+                probeReport = report.lines
+                probeRunning = false
+                _ = pid
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1578,6 +1608,33 @@ struct EditView: View {
                     .buttonStyle(.bordered)
                     .disabled(state.isBusy)
                     .help("探测该端点真实模型列表后勾选,不用手敲逗号")
+                }
+                HStack(spacing: 8) {
+                    Button {
+                        probeAuthenticity()
+                    } label: {
+                        if probeRunning {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Label("真伪鉴定", systemImage: "checkmark.seal")
+                        }
+                    }
+                    .buttonStyle(.bordered).controlSize(.small)
+                    .disabled(probeRunning)
+                    .help("能力阶梯探针:数学/计数/逻辑逐级实测该模型的真伪(约 6 次请求)")
+                    if let verdict = probeVerdict {
+                        Text("实测: \(verdict)")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(verdict == "旗舰级" ? Color(red: 0.22, green: 0.58, blue: 0.40) : Color.orange)
+                    }
+                }
+                if !probeReport.isEmpty {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(probeReport.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                        }
+                    }
                 }
                 TextField("新 key(留空不改动;站方轮换 key 时填这里,保存前会实测)", text: $state.editKeyText)
                     .font(.system(size: 12, design: .monospaced))
