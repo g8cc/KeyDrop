@@ -278,5 +278,62 @@ enum AuditFixTests {
             let numQ = AuthenticityProbe.Question(prompt: "p", expectedNumber: 42, tier: 1, skill: "算术")
             t.expect(AuthenticityProbe.isCorrect("答案是 42。", question: numQ), "数值题判定不变")
         }
+
+        // 用户真实事故(2026-11-04):粘贴「tokenhub.icu/v1 + key」两行,裸域名带路径
+        // 的 URL 因 /v1 不在 hostname 字符集内被漏判,Core.add 静默复用历史旧 URL,
+        // 新 key 被拿去测别的站 → 401「Invalid API key」,报错也看不出复用了谁
+        h.runSuite("Audit.裸域名带路径 URL 识别(tokenhub 事故)") { t in
+            // 与事故完全相同的输入形态(key 用同形状假值,不入库真实凭据)
+            let raw = "tokenhub.icu/v1\nsk-VaC9RcZ9dBvFyxVeFtZ1BPotpRnNjJpqpN7NDSi7OhbwHgdn"
+            let p = try! Parser.parse(raw)
+            t.equal(p.url, "https://tokenhub.icu/v1", "裸域名/路径被识别为 URL(修复前 nil → 复用旧 URL)")
+            t.equal(p.key, "sk-VaC9RcZ9dBvFyxVeFtZ1BPotpRnNjJpqpN7NDSi7OhbwHgdn", "key 不受影响")
+
+            // looksLikeURL 形态矩阵
+            t.expect(Parser.looksLikeURL("tokenhub.icu/v1"), "裸域名/路径")
+            t.expect(Parser.looksLikeURL("gw.example.com:8317/v1"), "裸域名:端口/路径")
+            t.expect(Parser.looksLikeURL("example.com"), "裸域名(回归不变)")
+            t.expect(Parser.looksLikeURL("deepseek.com/v1"), "家族词+点域名仍是 URL")
+            t.expect(!Parser.looksLikeURL("z-ai/glm-5.3-free"), "斜杠模型名(host 无点)不是 URL")
+            t.expect(!Parser.looksLikeURL("o3.5/x"), "点分版本模型+斜杠不是 URL")
+            t.expect(!Parser.looksLikeURL("qwen3.8-flash"), "带点模型名(回归不变)")
+
+            // 防呆判定:像域名的 token 被识别;key/JWT(含点)/模型名不算
+            t.equal(Parser.firstDomainLikeToken(raw), "tokenhub.icu/v1", "防呆:漏判时能找到疑似 URL token")
+            t.equal(Parser.firstDomainLikeToken("sk-abcdef123456"), nil, "纯 key 不算域名")
+            t.equal(Parser.firstDomainLikeToken("z-ai/glm-5.3-free sk-abcdef123456"), nil, "模型名不算域名")
+            let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"
+            t.equal(Parser.firstDomainLikeToken(jwt), nil, "JWT(三段含点)不算域名")
+            t.equal(Parser.firstDomainLikeToken("https://ok.example.com/v1 sk-abcdef123456"), nil, "URL 已被正常识别时不算漏判")
+        }
+
+        // Core.add 防呆:URL 漏判且输入含域名形 token 时,绝不能静默复用上次记录
+        h.runSuite("Audit.URL 漏判时禁止静默复用旧 URL") { t in
+            let env = try! TestEnv("audit-url-noreuse")
+            defer { env.cleanup() }
+            let core = Core()
+            let stale = HistoryEntry(
+                id: "noreuse-0001-1111-2222-333333333333", ts: 1,
+                raw: "https://www.xiaoshengapi.top/v1\nsk-stale-key-00000001", format: "multiline",
+                name: "old", url: "https://www.xiaoshengapi.top/v1", model: nil, models: nil,
+                key: "sk-stale-key-00000001", keyMasked: "sk-s…", targets: [],
+                ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active"
+            )
+            try! core.history.append(stale)
+            // 端口非法(99999)→ 解析器认不出 URL,但 token 明显是域名:
+            // 修复前会静默复用 xiaoshengapi.top 并拿新 key 去测(401 惑人)
+            do {
+                _ = try core.add(
+                    raw: "tokenhub.icu:99999/v1\nsk-fresh-key-000000001",
+                    ccOverride: false, grokOverride: false, cpaOverride: false,
+                    dshOverride: false, force: true)
+                t.expect(false, "应抛错而不是静默复用")
+            } catch {
+                let msg = error.localizedDescription
+                t.contains(msg, "未找到可用 URL", "明确报错而非复用: \(msg.prefix(120))")
+                t.expect(!msg.contains("xiaoshengapi"), "报错与导入不得触达旧 URL")
+            }
+        }
     }
 }

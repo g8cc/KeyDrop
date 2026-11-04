@@ -184,10 +184,21 @@ public final class Core {
         }
 
         var notes: [String] = []
+        var urlReusedNote: String? = nil   // 验证失败抛错时也必须能看到复用了谁(成功路径 notes 已含)
         if parsed.url == nil {
+            // 防呆:输入里残留「像域名」的 token(解析器没认成 URL)时,静默复用上次
+            // 记录几乎必然拿新 key 去测旧 URL(真实事故:tokenhub.icu/v1 漏判 →
+            // 测 xiaoshengapi.top → 401,报错也看不出复用了谁)。明确报错让用户修正
+            if let suspected = Parser.firstDomainLikeToken(raw) {
+                throw ParseError.io(
+                    "未找到可用 URL。输入中的「\(suspected)」疑似网址但未被识别为 URL"
+                    + "(支持形态:https://host[/path]、裸域名 host[:端口][/路径])。"
+                    + "请修正该行后重试;若确想复用上次记录,请删除该行。")
+            }
             if let last = history.lastURL() {
                 parsed.url = last
-                notes.append("URL 复用上次: \(last)")
+                urlReusedNote = "URL 复用上次: \(last)"
+                notes.append(urlReusedNote!)
             } else {
                 throw ParseError.noURL
             }
@@ -342,7 +353,7 @@ public final class Core {
                         let failText = failures.joined(separator: "; ")
                         // key 本身都不通:原测试失败原因(鉴权/网络)比模型验证更有信息量
                         if !test.ok {
-                            throw ParseError.io("测试失败,未写入。\(test.detail)\n贴入模型验证也失败: \(failText)\n(确认真实或 --force 跳过测试)")
+                            throw ParseError.io("测试失败,未写入。\(test.detail)\n贴入模型验证也失败: \(failText)\(urlReusedNote.map { "\n(\($0))" } ?? "")\n(确认真实或 --force 跳过测试)")
                         }
                         // --model 显式指定:用户明确要这些模型,全挂就不能偷换成别的;
                         // 站点也没有模型目录时同样无可回落
@@ -369,7 +380,7 @@ public final class Core {
             }
             noteProxyWorked(needsProxy: test.needsProxy || explicitNeedsProxy, used: proxyURL)
             if !test.ok && !explicitCanRescue {
-                throw ParseError.io("测试失败,未写入。\(test.detail)\n(确认真实或 --force 跳过测试)")
+                throw ParseError.io("测试失败,未写入。\(test.detail)\(urlReusedNote.map { "\n(\($0))" } ?? "")\n(确认真实或 --force 跳过测试)")
             }
             if test.ok {
                 addHealth = Self.healthFor(test)

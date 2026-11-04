@@ -1152,28 +1152,71 @@ public enum Parser {
         if l.hasPrefix("https://") || l.hasPrefix("http://") {
             return URL(string: l)?.host?.isEmpty == false
         }
-        // 裸域名(如 sub.relay-test.example.com):无协议、形如 hostname 且至少一个点。
+        // 裸域名可带端口与路径(tokenhub.icu/v1、gw.example.com:8317/v1):
+        // 取第一个 "/" 前的 host[:port] 段做裸域名判定。host 段必须本身像域名
+        // (至少一个点):z-ai/glm-5.3 这类斜杠模型名(host 无点)不能被误判成 URL;
         // 家族排除用「词+[-或数字]」:qwen3.8-flash / gpt5.2-mini 这类带点模型名
         // 形如 hostname,若只排除「词-」会被当 URL 抢走,classify 里 URL 优先于模型,
         // 手贴模型名就丢了(真实事故:s2api.top 的 qwen3.8-flash)。
         // 再用 isDottedVersionModel 兜住 o3.5/k2.5:家族词(o3/k2)已吃掉首位数字,
-        // 「词+[-\d]」不命中其后紧跟的点,靠末段全数字判回模型,否则 URL 抢占丢模型
-        guard regexMatch(l, #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#),
-              !l.contains(".."),
-              !isDottedVersionModel(l),
-              !regexMatch(l, modelFamilyPrefixPattern)
+        // 「词+[-\d]」不命中其后紧跟的点,靠末段全数字判回模型,否则 URL 抢占丢模型。
+        // (真实事故:tokenhub.icu/v1 因 /v1 路径不在 hostname 字符集内被漏判,
+        // 新 key 被拿去测历史旧 URL → 401)
+        var hostPart = l
+        if let slash = l.firstIndex(of: "/") {
+            hostPart = String(l[..<slash])
+        }
+        var host = hostPart
+        if let colon = host.firstIndex(of: ":") {
+            let port = String(host[colon...].dropFirst())
+            guard let p = Int(port), (1...65535).contains(p) else { return false }
+            host = String(host[..<colon])
+        }
+        guard !host.isEmpty,
+              regexMatch(host, #"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"#),
+              !host.contains(".."),
+              !isDottedVersionModel(host),
+              !regexMatch(host, modelFamilyPrefixPattern)
         else { return false }
         // 末段必须是字母 TLD:真域名的最后一段永远是字母(com/cn/top,以及 .technology
         // .international 这类长后缀——IANA 最长 24),而 JWT(三段 base64url,末段是
         // 43/86 位且必含数字)形状上正好过上面的 hostname 正则,会被当裸域名抢走
         // → key 永远识别不出来(真实反馈:天翼云 EAI 开放平台的 Bearer 就是 JWT)。
         // 纯数字各段放行:那是 IPv4 裸主机(1.2.2.8)
-        let labels = l.split(separator: ".")
+        let labels = host.split(separator: ".")
         if !labels.allSatisfy({ seg in seg.allSatisfy({ $0.isNumber }) }) {
             guard let last = labels.last, last.count >= 2, last.count <= 24,
                   last.allSatisfy({ $0.isLetter }) else { return false }
         }
+        // 整串(补 scheme)必须能构成合法 URL 且 host 正确:覆盖裸域名、
+        // 裸域名:端口、裸域名/路径 三种形态
         return URL(string: "https://" + l)?.host?.isEmpty == false
+    }
+
+    /// 宽松的「这个 token 像是想给 URL」判定,专用于 Core.add 的兜底防呆:
+    /// 解析器没认出 URL、输入里却残留带点 host 段的 token 时,静默复用上次记录
+    /// 会把新 key 拿去测旧 URL。比 looksLikeURL 松(无家族词/点分版本排除),
+    /// 靠「host 含点 + TLD 纯字母」区分模型名:glm-5.3-free / qwen3.8-flash 的
+    /// 末段带 -数字、o3.5 的末段纯数字,都不满足;key/JWT(含点)显式排除
+    public static func firstDomainLikeToken(_ raw: String) -> String? {
+        for token in raw.split(whereSeparator: { $0.isNewline || $0 == " " || $0 == "\t" }) {
+            let t = stripCJK(String(token))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'[],;()"))
+                .trimmingCharacters(in: .whitespaces)
+            guard t.contains("."), !looksLikeKey(t) else { continue }
+            let host = t.split(separator: "/").first.map(String.init) ?? t
+            let hostNoPort = host.split(separator: ":").first.map(String.init) ?? host
+            guard hostNoPort.contains("."),
+                  hostNoPort.range(of: #"^[a-z0-9][a-z0-9.-]*[a-z0-9]$"#,
+                                   options: [.regularExpression, .caseInsensitive]) != nil
+            else { continue }
+            let labels = hostNoPort.split(separator: ".")
+            if let last = labels.last, last.count >= 2, last.count <= 24,
+               last.allSatisfy({ $0.isLetter }) {
+                return t
+            }
+        }
+        return nil
     }
 
     static func normalizeURL(_ raw: String) -> String? {
