@@ -46,20 +46,6 @@ final class AppState: ObservableObject {
     @Published var cpaAPIOk = false
     /// 监控图 sheet 当前展示的条目 ID(nil=关闭)
 
-    /// status banner 计数:只统计可用区(health=ok/proxy-ok 的 active 条目)。
-    /// 额度区(quota)与待删除区(dead/err)不进横幅 —— 用户只关注当前可用网关的
-    /// 健康度,死 key/无额度是已知状态,各自分区里可见即可(统计口径由用户确认)。
-    /// 配置模型全红的条目已挬入无额度区,同样不算可用(口径与分区一致)
-    func statusCounts() -> (ok: Int, warn: Int, dead: Int) {
-        var ok = 0, warn = 0
-        for e in core.history.snapshot()
-        where e.status == "active" && e.healthAt != nil
-              && (e.health == "ok" || e.health == "proxy-ok")
-              && !e.allConfiguredModelsLimited {
-            if e.viaCPAOk == false { warn += 1 } else { ok += 1 }
-        }
-        return (ok, warn, 0)
-    }
     @Published var updateState: Updater.State = .idle
     @Published var updateSheetShown = false
     @Published var settingsShown = false
@@ -170,8 +156,9 @@ final class AppState: ObservableObject {
     }
 
     @MainActor
-    private func continueAddKey(raw: String, assumeBusy: Bool = false) async {
+    func continueAddKey(raw: String, assumeBusy: Bool = false) async {
         if !useCC && !useGrok && !useCPA && !useDSH {
+            if assumeBusy { isBusy = false; busyLabel = "" }
             setStatus("请先开启 cc-switch、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
             return
         }
@@ -744,22 +731,29 @@ final class AppState: ObservableObject {
         let autoPull = p.webdavAutoPull
         let autoPush = p.webdavAutoPush
         guard autoPull || autoPush else { return }
-        Task.detached(priority: .utility) { [weak self] in
-            do {
-                if autoPull {
-                    let msg = try Core.shared.webdavPull(replay: true, onlyIfNewer: true)
-                    if !msg.contains("无更新") {
-                        AppLog.info("WebDAV 自动拉取: \(msg)")
-                        self?.notify(summary: "WebDAV 已同步", body: msg)
-                    }
-                }
-                if autoPush {
-                    let msg = try Core.shared.webdavPush(force: false)
-                    if !msg.contains("无变更") { AppLog.info("WebDAV 自动推送: \(msg)") }
-                }
-            } catch {
-                AppLog.error("WebDAV 自动同步失败: \(error.localizedDescription)")
+        syncing = true
+        Task { @MainActor [weak self] in
+            defer {
+                self?.syncing = false
+                self?.historyVersion += 1
             }
+            await Task.detached(priority: .utility) { [weak self] in
+                do {
+                    if autoPull {
+                        let msg = try Core.shared.webdavPull(replay: true, onlyIfNewer: true)
+                        if !msg.contains("无更新") {
+                            AppLog.info("WebDAV 自动拉取: \(msg)")
+                            self?.notify(summary: "WebDAV 已同步", body: msg)
+                        }
+                    }
+                    if autoPush {
+                        let msg = try Core.shared.webdavPush(force: false)
+                        if !msg.contains("无变更") { AppLog.info("WebDAV 自动推送: \(msg)") }
+                    }
+                } catch {
+                    AppLog.error("WebDAV 自动同步失败: \(error.localizedDescription)")
+                }
+            }.value
         }
     }
 
@@ -1935,46 +1929,6 @@ struct PanelView: View {
         }
     }
 
-    /// 搜索过滤:模型名 / 条目名 / URL / key 掩码,大小写不敏感,多词 AND
-    private func matches(_ e: HistoryEntry) -> Bool {
-        let q = searchText.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return true }
-        let hay = ([e.name, e.url, e.keyMasked, e.model] + (e.models ?? []))
-            .compactMap { $0 }.joined(separator: " ").lowercased()
-        return q.lowercased().split(separator: " ").allSatisfy { hay.contains($0) }
-    }
-
-    private var historyItems: [HistoryEntry] {
-        _ = state.historyVersion
-        return state.core.history.snapshot()
-            .filter { $0.status == "active" && $0.health != "dead" && $0.health != "err" && $0.health != "quota"
-                     && !$0.allConfiguredModelsLimited }   // 配置的模型全红(key 还活着)→ 无额度区
-            .filter(matches)
-            .sorted { $0.ts > $1.ts }
-            .prefix(60)
-            .map { $0 }
-    }
-
-    private var quotaItems: [HistoryEntry] {
-        _ = state.historyVersion
-        return state.core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "quota" || $0.allConfiguredModelsLimited) }
-            .filter(matches)
-            .sorted { $0.ts > $1.ts }
-            .prefix(60)
-            .map { $0 }
-    }
-
-    private var deadItems: [HistoryEntry] {
-        _ = state.historyVersion
-        return state.core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err") }
-            .filter(matches)
-            .sorted { $0.ts > $1.ts }
-            .prefix(60)
-            .map { $0 }
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -1988,7 +1942,7 @@ struct PanelView: View {
             .padding(14)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .frame(width: 600, height: 520)
+        .frame(minWidth: 600, maxWidth: .infinity, minHeight: 520, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             DispatchQueue.main.async { inputFocused = true }
@@ -2340,7 +2294,8 @@ struct PanelView: View {
 
     private var historyBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
-            let sc = state.statusCounts()
+            let sections = HistorySections(state.core.history.snapshot(), query: searchText)
+            let sc = (ok: sections.okCount, warn: sections.warnCount, dead: 0)
             // 横幅只保留「零可用」一种(灰色,真正需要行动的状态)。CPA 链路异常
             // 横幅已移除(用户确认:无用信息纯打扰;签名制收起也挡不住异常集合
             // 每轮变动导致的重复弹出)—— 行内 CPA 徽章 + 行内模型监控格条承载
@@ -2351,9 +2306,9 @@ struct PanelView: View {
             // (通过与否 × 延迟快慢),不标注的话「全黄/全紫也 100%」看起来像算错
             StatusLegend(showUptimeNote: false)
             Divider().opacity(0.3)
-            let items = historyItems
-            let deads = deadItems
-            let quotas = quotaItems
+            let items = sections.available
+            let deads = sections.dead
+            let quotas = sections.quota
             HStack(spacing: 6) {
                 HStack(spacing: 4) {
                     Image(systemName: "magnifyingglass")
@@ -2630,13 +2585,13 @@ struct PanelView: View {
                             }
                         }
                     }
-                    .frame(maxHeight: 240)
+                    .frame(maxHeight: .infinity)
                     .onChange(of: state.highlightPulse) { _, _ in
                         guard let id = state.highlightID else { return }
-                        if deadItems.contains(where: { $0.id == id }) {
+                        if deads.contains(where: { $0.id == id }) {
                             showDeadArea = true
                         }
-                        if quotaItems.contains(where: { $0.id == id }) {
+                        if quotas.contains(where: { $0.id == id }) {
                             showQuotaArea = true
                         }
                         withAnimation(.easeOut(duration: 0.25)) {

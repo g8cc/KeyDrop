@@ -308,7 +308,6 @@ public final class HistoryStore {
     private func refreshIfExternalChangeLocked() {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
               let mtime = attrs[.modificationDate] as? Date else { return }
-        if lastMtime == nil { lastMtime = mtime; return }
         if mtime != lastMtime {
             loadLocked()
         }
@@ -322,6 +321,8 @@ public final class HistoryStore {
     private func loadLocked() {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
               let mtime = attrs[.modificationDate] as? Date else { return }
+        // 退避必须发生在读盘/解码之前,否则每次 UI 刷新仍会重做昂贵的失败解码。
+        if let failed = lastParseFailureAt, Date().timeIntervalSince1970 - failed < 5 { return }
         // 记录进入时的 mtime:仅当本轮真正消费了文件内容才更新 lastMtime,
         // 否则解析失败后外部把文件修好,也会因 mtime 未变而被跳过、永远读不进来
         let currentMtime = mtime
@@ -451,17 +452,17 @@ public final class HistoryStore {
     /// (宁可软超限也不制造孤儿)。结果保持 ts desc,不改变 list/snapshot 顺序
     public static func applyCap(_ items: [HistoryEntry]) -> [HistoryEntry] {
         guard items.count > 500 else { return items }
-        var keep = items
-        // 从最旧(尾部)开始,丢弃可回收条目直到不超限
-        var idx = keep.count - 1
-        while keep.count > 500, idx >= 0 {
-            let e = keep[idx]
-            let reclaimable = e.status != "active" || e.targets.isEmpty
-            if reclaimable { keep.remove(at: idx) }
-            idx -= 1
+        var toRemove = items.count - 500
+        var kept: [HistoryEntry] = []
+        kept.reserveCapacity(items.count)
+        for e in items.reversed() {
+            if toRemove > 0, e.status != "active" || e.targets.isEmpty {
+                toRemove -= 1
+            } else {
+                kept.append(e)
+            }
         }
-        // 全部是 active 仍超限时:接受超限而非丢 active(软上限)
-        return keep
+        return Array(kept.reversed())
     }
 
     public func update(_ e: HistoryEntry) throws {
@@ -496,79 +497,81 @@ public final class HistoryStore {
         try saveLocked(dirtyIDs: [e.id])
     }
 
-    /// 刷新条目最后修改时间(探测点追加也算修改;多设备同步的 LWW 依据)。
-    /// 条目不存在时静默跳过(调用方各自处理自身的报错口径)
-    private func touchUpdatedAt(id: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
-        _items[i].updatedAt = Date().timeIntervalSince1970
-    }
-
     /// 批量健康更新:只合并 health/healthDetail/healthAt 三个字段,其余字段以内存现状为准。
     /// scanHealth 持有旧快照做网络测试,测试期间条目可能被本进程或 CLI 改过(note/targets/status),
     /// 整条覆盖会把并发修改静默回滚 —— 所以这里按字段合并而不是整条替换。
     public func mergeHealth(_ entries: [HistoryEntry], at: TimeInterval) throws {
         lock.lock()
         defer { lock.unlock() }
-        for e in entries {
-            guard let i = _items.firstIndex(where: { $0.id == e.id }) else { continue }
-            _items[i].health = e.health
-            _items[i].healthDetail = e.healthDetail
-            _items[i].healthAt = at
-            // 实战监控字段随健康扫描一并合并(延迟/防抖/CPA 链路)
-            _items[i].latencyMs = e.latencyMs
-            _items[i].failStreak = e.failStreak
-            _items[i].viaCPAOk = e.viaCPAOk
-            _items[i].viaCPAAt = e.viaCPAAt
-            _items[i].updatedAt = at
-            // 探测历史滚动追加(监控图数据源)
-            let pt = ProbePoint(t: at, ms: e.latencyMs,
-                                ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
-            var log = (_items[i].probeLog ?? []) + [pt]
-            if log.count > 30 { log = Array(log.suffix(30)) }
-            _items[i].probeLog = log
-            // 模型级追加:e.modelProbeLog 携带本轮各模型新点,与 store 现状合并截 30
-            if let newPoints = e.modelProbeLog, !newPoints.isEmpty {
-                var merged = _items[i].modelProbeLog ?? [:]
-                for (m, pts) in newPoints {
-                    var arr = (merged[m] ?? []) + pts
-                    if arr.count > 30 { arr = Array(arr.suffix(30)) }
-                    merged[m] = arr
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            let indices = Dictionary(_items.enumerated().map { ($0.element.id, $0.offset) },
+                                     uniquingKeysWith: { first, _ in first })
+            for e in entries {
+                guard let i = indices[e.id], _items[i].status == "active" else { continue }
+                _items[i].health = e.health
+                _items[i].healthDetail = e.healthDetail
+                _items[i].healthAt = at
+                // 实战监控字段随健康扫描一并合并(延迟/防抖/CPA 链路)
+                _items[i].latencyMs = e.latencyMs
+                _items[i].failStreak = e.failStreak
+                _items[i].viaCPAOk = e.viaCPAOk
+                _items[i].viaCPAAt = e.viaCPAAt
+                _items[i].updatedAt = at
+                // 探测历史滚动追加(监控图数据源)
+                let pt = ProbePoint(t: at, ms: e.latencyMs,
+                                    ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
+                var log = (_items[i].probeLog ?? []) + [pt]
+                if log.count > 30 { log = Array(log.suffix(30)) }
+                _items[i].probeLog = log
+                // 模型级追加:e.modelProbeLog 携带本轮各模型新点,与 store 现状合并截 30
+                if let newPoints = e.modelProbeLog, !newPoints.isEmpty {
+                    var merged = _items[i].modelProbeLog ?? [:]
+                    for (m, pts) in newPoints {
+                        var arr = (merged[m] ?? []) + pts
+                        if arr.count > 30 { arr = Array(arr.suffix(30)) }
+                        merged[m] = arr
+                    }
+                    _items[i].modelProbeLog = merged
                 }
-                _items[i].modelProbeLog = merged
             }
+            try saveLockedNoFlock(dirtyIDs: Set(entries.map { $0.id }))
         }
-        try saveLocked(dirtyIDs: Set(entries.map { $0.id }))
     }
 
     /// 手动重测(refreshModels)路径追加单个探测点(监控图数据源)
     public func appendProbePoint(id: String, ok: Bool, ms: Double?, cpa: Bool?, at: TimeInterval) throws {
-        defer { touchUpdatedAt(id: id) }
         lock.lock()
         defer { lock.unlock() }
-        guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
-        var log = (_items[i].probeLog ?? []) + [ProbePoint(t: at, ms: ms, ok: ok, cpa: cpa)]
-        if log.count > 30 { log = Array(log.suffix(30)) }
-        _items[i].probeLog = log
-        try saveLocked(dirtyIDs: [id])
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+            var log = (_items[i].probeLog ?? []) + [ProbePoint(t: at, ms: ms, ok: ok, cpa: cpa)]
+            if log.count > 30 { log = Array(log.suffix(30)) }
+            _items[i].probeLog = log
+            _items[i].updatedAt = Date().timeIntervalSince1970
+            try saveLockedNoFlock(dirtyIDs: [id])
+        }
     }
 
     /// 模型级探测点追加(手动重测/扫描共用)
     public func appendModelProbePoints(id: String, points: [String: ProbePoint]) throws {
-        defer { touchUpdatedAt(id: id) }
         guard !points.isEmpty else { return }
         lock.lock()
         defer { lock.unlock() }
-        guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
-        var merged = _items[i].modelProbeLog ?? [:]
-        for (m, pt) in points {
-            var arr = (merged[m] ?? []) + [pt]
-            if arr.count > 30 { arr = Array(arr.suffix(30)) }
-            merged[m] = arr
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+            var merged = _items[i].modelProbeLog ?? [:]
+            for (m, pt) in points {
+                var arr = (merged[m] ?? []) + [pt]
+                if arr.count > 30 { arr = Array(arr.suffix(30)) }
+                merged[m] = arr
+            }
+            _items[i].modelProbeLog = merged
+            _items[i].updatedAt = Date().timeIntervalSince1970
+            try saveLockedNoFlock(dirtyIDs: [id])
         }
-        _items[i].modelProbeLog = merged
-        try saveLocked(dirtyIDs: [id])
     }
 
     /// 批量更新后只落盘一次。健康扫描等高频小更新的场景用这个,

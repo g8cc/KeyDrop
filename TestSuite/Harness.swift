@@ -35,6 +35,8 @@ final class Harness {
     }
 
     func runSuite(_ name: String, _ body: (Harness) throws -> Void) {
+        if let filter = ProcessInfo.processInfo.environment["KEYDROP_TEST_FILTER"],
+           !filter.isEmpty, !name.localizedCaseInsensitiveContains(filter) { return }
         let h = Harness()
         h.suiteName = name
         do {

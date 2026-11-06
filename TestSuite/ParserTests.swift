@@ -20,6 +20,15 @@ enum ParserTests {
             } catch {
                 t.expect(false, "京东云样式解析失败: \(error)")
             }
+            // 协议说明是元数据，不能成为模型 Claude。
+            let nativePaste = try! Parser.parse("""
+                接口地址：https://kiro.example.com/v1/messages
+                API Key：c2stRkFLRWFiY2RlZjAxMjM0NTY3ODlBQkNERQ==（b64 解码后使用）
+                Anthropic / Claude 原生协议
+                """)
+            t.equal(nativePaste.key, "sk-FAKEabcdef0123456789ABCDE", "原生协议粘贴解码 key")
+            t.equal(nativePaste.url, "https://kiro.example.com/v1", "messages URL 归一化")
+            t.expect(nativePaste.model == nil && (nativePaste.models ?? []).isEmpty, "协议说明不得推断为 Claude 模型")
             // 纯 key
             t.equal(try! Parser.parseWithFallback("sk-abc123def456ghi789jkl").key, "sk-abc123def456ghi789jkl", "纯 key 解析")
 

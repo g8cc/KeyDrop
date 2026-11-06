@@ -772,7 +772,13 @@ public enum Parser {
         p.format = cands.count > 1 ? "multiline" : "single"
 
         if keys.count == 1 {
-            let vals = rest.map { $0.0 }
+            let vals = rest.filter { value, label in
+                if let label, label.contains("model") || label.contains("模型") { return true }
+                let lower = value.lowercased()
+                // 协议说明中的 Claude/OpenAI 是协议家族，不是可请求的模型 ID。
+                return !((lower.contains("协议") || lower.contains("protocol")) &&
+                         (lower.contains("anthropic") || lower.contains("claude") || lower.contains("openai")))
+            }.map { $0.0 }
             if let m = rest.first(where: { ($0.1 ?? "").contains("model") || ($0.1 ?? "").contains("模型") }) {
                 // 逗号分隔的多模型列表("Models: a, b, c")只取第一个作激活模型,
                 // 整串当模型名探测必然失败

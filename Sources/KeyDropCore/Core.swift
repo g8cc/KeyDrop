@@ -331,7 +331,7 @@ public final class Core {
                         // 其余情况先直连:验证端点拿到代理就只走代理(无直连回退),
                         // 本机代理对回环 mock/内网目标会返 502,反而把验证搞挂(真实回归事故)
                         if !(test.needsProxy && hasProxy) {
-                            let direct = APITester.testModelChat(base: url, key: key, model: model)
+                            let direct = APITester.testModelChat(base: url, key: key, model: model, styleHint: test.style)
                             if direct.ok {
                                 verified.append(model)
                                 continue
@@ -341,7 +341,7 @@ public final class Core {
                                 continue
                             }
                         }
-                        let viaProxy = APITester.testModelChat(base: url, key: key, model: model, proxy: proxyURL)
+                        let viaProxy = APITester.testModelChat(base: url, key: key, model: model, proxy: proxyURL, styleHint: test.style)
                         if viaProxy.ok {
                             verified.append(model)
                             explicitNeedsProxy = true
@@ -410,7 +410,7 @@ public final class Core {
                     var verified: [String] = []
                     var failures: [String] = []
                     for m in picked {
-                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy)
+                        let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy, styleHint: test.style)
                         if check.ok {
                             verified.append(m)
                         } else {

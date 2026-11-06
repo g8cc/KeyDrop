@@ -22,12 +22,14 @@ if [ -d "$OTHER_INSTALL" ]; then
 fi
 
 echo "[1/4] release 构建..."
-swift build -c release
+swift build -c release --product KeyDrop
 
 echo "[2/4] 组装 bundle..."
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 cp Info.plist "$APP_BUNDLE/Contents/Info.plist"
+mkdir -p "$APP_BUNDLE/Contents/Resources"
+cp Resources/KeyDrop.icns "$APP_BUNDLE/Contents/Resources/KeyDrop.icns"
 cp .build/release/KeyDrop "$APP_BUNDLE/Contents/MacOS/KeyDrop"
 
 echo "[3/4] 签名..."
@@ -50,6 +52,17 @@ if [ "${KEYDROP_SKIP_INSTALL:-0}" = "1" ]; then
 fi
 rm -rf "$INSTALL"
 cp -R "$APP_BUNDLE" "$INSTALL"
+
+# 原地替换资源后通知 LaunchServices，避免继续使用安装前的图标元数据。
+touch "$INSTALL"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -f "$INSTALL"
+fi
+if [ "${KEYDROP_SKIP_LAUNCH:-0}" = "1" ]; then
+    echo "完成: $INSTALL (跳过重启)"
+    exit 0
+fi
 
 # 记录旧 pid:重启验证必须确认「旧进程消失 + 新进程出现」,
 # 否则 pkill 失效时旧进程会被 pgrep 误判成"新版本已启动"(真实事故 2026-09-24)

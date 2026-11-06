@@ -10,12 +10,14 @@ VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Info.pl
 OUT="$DIST/$APP-$VERSION.zip"
 
 echo "[1/4] release 构建..."
-swift build -c release
+swift build -c release --product KeyDrop
 
 echo "[2/4] 组装 bundle..."
 rm -rf "$APP_BUNDLE" "$DIST/K.app"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 cp Info.plist "$APP_BUNDLE/Contents/Info.plist"
+mkdir -p "$APP_BUNDLE/Contents/Resources"
+cp Resources/KeyDrop.icns "$APP_BUNDLE/Contents/Resources/KeyDrop.icns"
 cp .build/release/KeyDrop "$APP_BUNDLE/Contents/MacOS/KeyDrop"
 
 echo "[3/4] ad-hoc 签名..."

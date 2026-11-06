@@ -13,6 +13,103 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.sections mutually exclusive") { t in
+            var dead = entry("dead", ts: 3)
+            dead.health = "dead"
+            dead.models = ["m"]
+            dead.modelProbeLog = ["m": [ProbePoint(t: 1, ms: nil, ok: false)]]
+            var quota = dead
+            quota.id = "quota"; quota.health = "ok"; quota.ts = 2
+            var good = entry("good", ts: 1)
+            good.healthAt = 1
+            let sections = HistorySections([good, quota, dead])
+            t.equal(sections.dead.map(\.id), ["dead"], "死 key 归待删除区")
+            t.equal(sections.quota.map(\.id), ["quota"], "全红模型仅进额度区")
+            t.equal(sections.available.map(\.id), ["good"], "可用区互斥")
+            t.equal(sections.okCount, 1, "横幅统计一致")
+            let searched = HistorySections([good, quota, dead], query: "P-GOOD\tx.com")
+            t.equal(searched.available.map(\.id), ["good"], "大小写与空白分词")
+            t.equal(searched.okCount, 1, "全局统计不受搜索影响")
+            t.expect(HistorySections([good], limit: 0).available.isEmpty, "零限制")
+        }
+
+        h.runSuite("History.first external creation") { t in
+            let env = try TestEnv("hist-first-create")
+            defer { env.cleanup() }
+            let reader = HistoryStore()
+            let writer = HistoryStore()
+            try writer.append(entry("first-external", ts: 1))
+            t.equal(reader.snapshot().first?.id, "first-external", "读取首次由 CLI 创建的文件")
+        }
+
+        h.runSuite("History.probe append preserves external changes") { t in
+            let env = try TestEnv("hist-probe-external")
+            defer { env.cleanup() }
+            let app = HistoryStore()
+            try app.append(entry("external-probe", ts: 1))
+            let cli = HistoryStore()
+            var edited = cli.snapshot()[0]
+            edited.note = "CLI note"
+            edited.models = ["new-model"]
+            try cli.update(edited)
+            try cli.appendProbePoint(id: edited.id, ok: true, ms: 10, cpa: nil, at: 10)
+            try app.appendProbePoint(id: edited.id, ok: false, ms: nil, cpa: nil, at: 11)
+            let saved = HistoryStore().snapshot()[0]
+            t.equal(saved.note, "CLI note", "追加 key 探测保留外部备注")
+            t.equal(saved.models, ["new-model"], "追加 key 探测保留外部模型")
+            t.equal(saved.probeLog?.map(\.t), [10, 11], "合并两个实例追加的 key 探测点")
+            try cli.appendModelProbePoints(id: edited.id, points: ["m": ProbePoint(t: 12, ms: 1, ok: true)])
+            try app.appendModelProbePoints(id: edited.id, points: ["m": ProbePoint(t: 13, ms: 1, ok: false)])
+            let modelSaved = HistoryStore().snapshot()[0]
+            t.equal(modelSaved.modelProbeLog?["m"]?.map(\.t), [12, 13], "合并两个实例追加的模型探测点")
+            t.equal(modelSaved.note, "CLI note", "追加模型探测保留外部备注")
+        }
+
+        h.runSuite("History.probe timestamps persist") { t in
+            let env = try TestEnv("hist-probe-time")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            var e = entry("probe", ts: 1)
+            try store.append(e)
+            e = store.snapshot()[0]
+            e.updatedAt = 1
+            try store.updateAll([e])
+            try store.appendProbePoint(id: e.id, ok: true, ms: 1, cpa: nil, at: 100)
+            t.expect((HistoryStore().snapshot()[0].updatedAt ?? 0) > 1, "探测时间在落盘前更新")
+            e = store.snapshot()[0]
+            e.updatedAt = 1
+            try store.updateAll([e])
+            try store.appendModelProbePoints(id: e.id, points: ["m": ProbePoint(t: 101, ms: 2, ok: true)])
+            t.expect((HistoryStore().snapshot()[0].updatedAt ?? 0) > 1, "模型探测时间在落盘前更新")
+        }
+
+        h.runSuite("History.health preserves external edits") { t in
+            let env = try TestEnv("hist-health-external")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            try store.append(entry("health-external", ts: 1))
+            var pending = store.snapshot()[0]
+            let cli = HistoryStore()
+            var edited = cli.snapshot()[0]
+            edited.note = "CLI 新备注"
+            edited.models = ["new-model"]
+            edited.status = "deleted"
+            try cli.update(edited)
+            pending.health = "dead"
+            try store.mergeHealth([pending], at: 200)
+            let saved = HistoryStore().snapshot()[0]
+            t.equal(saved.note, "CLI 新备注", "扫描不得回滚外部备注")
+            t.equal(saved.models, ["new-model"], "扫描不得回滚外部模型")
+            t.equal(saved.status, "deleted", "扫描不得复活已删除条目")
+            edited.status = "active"
+            try cli.update(edited)
+            try store.mergeHealth([pending], at: 201)
+            let active = HistoryStore().snapshot()[0]
+            t.equal(active.note, "CLI 新备注", "活跃条目也保留外部备注")
+            t.equal(active.models, ["new-model"], "活跃条目也保留外部模型")
+            t.equal(active.health, "dead", "合并新的探测结果")
+        }
+
         h.runSuite("History") { t in
             let env = try! TestEnv("hist")
             defer { env.cleanup() }

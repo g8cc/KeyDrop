@@ -264,13 +264,14 @@ public enum APITester {
             req.httpMethod = "GET"
             req.timeoutInterval = timeout
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            req.setValue(key, forHTTPHeaderField: "x-api-key")
+            req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
 
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
             let data = o.data
             let body = String(data: data ?? Data(), encoding: .utf8) ?? ""
             let isJSON = isJSONBody(body)
-            let bodyHead = String(body.prefix(200))
             var models: [String] = []
             if status == 200, isJSON,
                let obj = try? JSONSerialization.jsonObject(with: data ?? Data()) as? [String: Any],
@@ -316,7 +317,8 @@ public enum APITester {
                 var firstWorkingLatency: Double? = nil
                 var modelLatencies: [String: Double] = [:]
                 for probe in probeOrder {
-                    let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe)
+                    let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe, native: style == "anthropic")
+                    if let detectedStyle = chat.style { style = detectedStyle }
                     if let st = chat.authStatus {
                         // 401/403 曾经一律判「key 失效」短路。真实事故(vyceai, 2026-09-23):
                         // 站点按模型限权 —— 同一把 key,deepseek-v4.1 chat 200,而
@@ -351,8 +353,9 @@ public enum APITester {
                 if !working.isEmpty {
                     let q = quotaModels.isEmpty ? "" : ",其中 \(quotaModels.count) 个模型限流(\(quotaModels.prefix(3).joined(separator: "、"))\(quotaModels.count > 3 ? " 等" : ""))"
                     let g = gatedModels.isEmpty ? "" : ",\(gatedModels.count) 个模型本 key 无权限(\(gatedModels.prefix(2).joined(separator: "、"))\(gatedModels.count > 2 ? " 等" : ""))"
+                    let probedModels = Set(working + quotaModels)
                     let reordered = hasRealModels
-                        ? (working + models.filter { !Set(working + quotaModels).contains($0) } + quotaModels)
+                        ? (working + models.filter { !probedModels.contains($0) } + quotaModels)
                         : models
                     return APITestResult(ok: true, style: style, models: reordered,
                                          detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q + g,
@@ -479,6 +482,7 @@ public enum APITester {
 
     /// POST chat 健康检查结果
     private struct ChatProbeOutcome {
+        var style: String?
         var quota: Int?
         var degraded: Int?
         var authStatus: Int?
@@ -494,9 +498,9 @@ public enum APITester {
     /// - authStatus: 401/403(非 HTML 盾页)→ 认证失败/key 失效。/models 常是公共端点(无 key 也 200),
     ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
     ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
-    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String) -> ChatProbeOutcome {
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String, native: Bool = false) -> ChatProbeOutcome {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
-        let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
+        let chatPaths = native ? (hasV1 ? ["/messages"] : ["/messages", "/v1/messages"]) : (hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"])
         let s = session(for: proxy)
         var sawNetworkError = false
         for path in chatPaths {
@@ -506,6 +510,10 @@ public enum APITester {
             req.timeoutInterval = timeout
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            if native {
+                req.setValue(key, forHTTPHeaderField: "x-api-key")
+                req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            }
             // stream:true 按真实使用形态探测:非流式 OK 但流式转换坏的中转站会被识别。
             // 判定兼容两种响应:SSE(data: 行)与普通 JSON —— 宽松以兼容各网关形态
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
@@ -523,30 +531,36 @@ public enum APITester {
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
             if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
-                return ChatProbeOutcome(authStatus: status)
+                return ChatProbeOutcome(style: native ? "anthropic" : nil, authStatus: status)
             }
+            if native, status == 400 { return ChatProbeOutcome(style: "anthropic", degraded: status) }
+            if status == 404 || status == 405 { continue }
             if status == 403 { continue }   // 盾页/地域封锁:跳过本候选,不误判 authFailed
             if status == 0 { sawNetworkError = true; continue }
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
-                    return ChatProbeOutcome(quota: status)
+                    return ChatProbeOutcome(style: native ? "anthropic" : nil, quota: status)
                 }
-                return ChatProbeOutcome(degraded: status)
+                return ChatProbeOutcome(style: native ? "anthropic" : nil, degraded: status)
             }
             if status == 424 || (500...599).contains(status) {
-                return ChatProbeOutcome(degraded: status)
+                return ChatProbeOutcome(style: native ? "anthropic" : nil, degraded: status)
             }
             if status == 200 {
                 // 200 + 非 HTML 响应体才计可用与延迟:流式网关回 SSE(data: 行),
                 // 普通网关回 JSON;空体/前端兜底页不算
-                if isJSONBody(body) || (!isHTMLBody(body) && body.contains("data:")) {
-                    return ChatProbeOutcome(latencyMs: latencyMs)
+                if isSuccessfulChatBody(body) {
+                    return ChatProbeOutcome(style: native ? "anthropic" : nil, latencyMs: latencyMs)
                 }
                 continue
             }
         }
-        return ChatProbeOutcome(networkError: sawNetworkError)
+        // Claude 原生网关也可能返回 OpenAI 形状的 /models；目录形状不能决定聊天协议。
+        if !native, !sawNetworkError, model.lowercased().hasPrefix("claude-") {
+            return chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model, native: true)
+        }
+        return ChatProbeOutcome(style: native ? "anthropic" : nil, networkError: sawNetworkError || native)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {
@@ -598,6 +612,21 @@ public enum APITester {
         ) != nil
     }
 
+    /// HTTP 成功码仍可能携带空体、错误 JSON 或前端兜底页。
+    private static func isSuccessfulChatBody(_ body: String) -> Bool {
+        if let data = body.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            return !object.isEmpty && object["error"] == nil && (object["type"] as? String) != "error"
+        }
+        // SSE 至少包含一个非错误 JSON 数据事件，单独的 [DONE] 不算成功。
+        return body.components(separatedBy: .newlines).contains { line in
+            guard line.hasPrefix("data:"),
+                  let data = String(line.dropFirst(5)).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            return !object.isEmpty && object["error"] == nil && (object["type"] as? String) != "error"
+        }
+    }
+
     private static func isJSONBody(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.hasPrefix("{") || t.hasPrefix("[")
@@ -640,7 +669,7 @@ public enum APITester {
         let o = NetSync.run(session: s, request: req, timeout: timeout)
         let status = NetSync.statusCode(o)
         let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
-        let ok = status == 400 || (status == 200 && isJSONBody(body))
+        let ok = status == 200 && isJSONBody(body)
         // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败
         let authFail = status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body))
         return (ok, authFail,
@@ -694,9 +723,10 @@ public enum APITester {
         ].joined(separator: "\n")
     }
 
-    public static func testModelChat(base: String, key: String, model: String, timeout: TimeInterval = 12, proxy: String? = nil) -> (ok: Bool, detail: String) {
+    public static func testModelChat(base: String, key: String, model: String, timeout: TimeInterval = 12, proxy: String? = nil, styleHint: String? = nil) -> (ok: Bool, detail: String) {
+        let native = styleHint == "anthropic"
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
-        let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
+        let chatPaths = native ? (hasV1 ? ["/messages"] : ["/messages", "/v1/messages"]) : (hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"])
         let s = session(for: proxy)
         for path in chatPaths {
             guard let u = URL(string: base + path) else { continue }
@@ -705,6 +735,10 @@ public enum APITester {
             req.timeoutInterval = timeout
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            if native {
+                req.setValue(key, forHTTPHeaderField: "x-api-key")
+                req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            }
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
                 "model": model,
                 "max_tokens": 1,
@@ -715,7 +749,7 @@ public enum APITester {
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             // 200 + HTML 是前端兜底页(SPA 对任意路径都回 200),不是模型可用的证据;
             // 与 chatHealthCheck/testOnce 的「200 必须非 HTML」口径一致
-            if status == 200, !isHTMLBody(body) {
+            if status == 200, isSuccessfulChatBody(body) {
                 return (true, "POST \(base)\(path) → 200")
             }
             if status == 200 || status == 404 || status == 405 {
@@ -725,7 +759,10 @@ public enum APITester {
                 return (false, "POST \(base)\(path) → HTTP \(status)" + (body.isEmpty ? "" : " \(body.prefix(80))"))
             }
         }
-        return (false, "模型验证请求超时/无响应")
+        if styleHint == nil, model.lowercased().hasPrefix("claude-") {
+            return testModelChat(base: base, key: key, model: model, timeout: timeout, proxy: proxy, styleHint: "anthropic")
+        }
+        return (false, "模型验证失败：端点不支持或请求超时/无响应")
     }
 
     /// 探测网关是否支持 OpenAI Responses API(供 codex wire_api 选择)

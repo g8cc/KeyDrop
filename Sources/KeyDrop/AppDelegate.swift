@@ -5,35 +5,9 @@ import ServiceManagement
 import Carbon
 import Darwin
 
-class KeyDropPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-
-    override func cancelOperation(_ sender: Any?) {
-        orderOut(nil)
-    }
-
-    override func close() {
-        orderOut(nil)
-    }
-
-    override func performClose(_ sender: Any?) {
-        orderOut(nil)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if flags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "w" {
-            orderOut(nil)
-            return true
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     var statusItem: NSStatusItem!
-    var panel: KeyDropPanel?
+    var panel: NSWindow?
     let state = AppState()
     private var eventMonitor: Any?
     private var hotKeyRef: EventHotKeyRef?
@@ -53,7 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.info("KeyDrop 启动 v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
-        NSApp.setActivationPolicy(.accessory)
+        // 更新包原地替换时，Dock 可能仍持有旧图标；直接使用本次 bundle 的资源。
+        if let iconURL = Bundle.main.url(forResource: "KeyDrop", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL), icon.isValid {
+            icon.isTemplate = false
+            NSApp.applicationIconImage = icon
+        }
+        NSApp.setActivationPolicy(.regular)
 
         setupMainMenu()
 
@@ -104,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         nc.addObserver(self, selector: #selector(appActivationChanged(_:)),
                        name: NSApplication.didResignActiveNotification, object: nil)
         logPasteEvent("应用启动")
+        showPanel()
     }
 
     @objc private func appActivationChanged(_ n: Notification) {
@@ -116,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         main.addItem(appItem)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "打开面板", action: #selector(showPanelAction), keyEquivalent: "o")
+        appMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 KeyDrop", action: #selector(quitApp), keyEquivalent: "q")
         appItem.submenu = appMenu
@@ -135,7 +117,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "前置全部窗口", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        windowItem.submenu = windowMenu
+        main.addItem(windowItem)
         NSApp.mainMenu = main
+        NSApp.windowsMenu = windowMenu
     }
 
     @objc func undoTextEdit(_ sender: Any?) {
@@ -227,7 +218,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard flags.contains(.command),
               !flags.contains(.option),
               event.charactersIgnoringModifiers?.lowercased() == "v",
-              panel?.isVisible == true
+              panel?.isVisible == true,
+              NSApp.keyWindow === panel,
+              panel?.attachedSheet == nil
         else { return event }
         let isEditable = (panel?.firstResponder as? NSTextView)?.isEditable == true
         let hasPB = !(NSPasteboard.general.string(forType: .string) ?? "").isEmpty
@@ -629,56 +622,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if panel == nil {
             let hosting = NSHostingView(rootView: PanelView(state: state))
             hosting.wantsLayer = true
-            let p = KeyDropPanel(
-                contentRect: NSRect(x: 0, y: 0, width: 580, height: 520),
-                styleMask: [.titled, .closable, .utilityWindow],
-                backing: .buffered,
-                defer: false
-            )
-            p.title = "KeyDrop"
-            p.contentView = hosting
+            let p = MainWindow.make(contentView: hosting)
             p.delegate = self
-            p.level = .normal
-            p.isFloatingPanel = false
-            p.hidesOnDeactivate = false
-            p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            p.isReleasedWhenClosed = false
-            p.hasShadow = true
-            p.isOpaque = true
-            p.backgroundColor = NSColor.windowBackgroundColor
-            // 换名避开之前被压矮后保存的错误尺寸
-            p.setFrameAutosaveName("KeyDropPanel.v4")
-            p.contentMinSize = NSSize(width: 520, height: 420)
-            p.contentMaxSize = NSSize(width: 720, height: 780)
-            p.setContentSize(NSSize(width: 580, height: 520))
-            if let screen = NSScreen.main {
-                let f = screen.visibleFrame
-                p.setFrameOrigin(NSPoint(x: f.maxX - 600, y: f.maxY - 560))
-            }
-            if let closeBtn = p.standardWindowButton(.closeButton) {
-                closeBtn.isEnabled = true
-                closeBtn.target = self
-                closeBtn.action = #selector(hidePanelFromButton(_:))
-            }
             panel = p
         }
         state.useCC = Prefs.shared.useCC
         state.useGrok = Prefs.shared.useGrok
         state.useCPA = Prefs.shared.useCPA
         state.useDSH = Prefs.shared.useDSH
+        if panel?.isMiniaturized == true { panel?.deminiaturize(nil) }
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         retryFocus()
     }
 
-    @objc private func hidePanelFromButton(_ sender: Any?) {
-        panel?.orderOut(nil)
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPanel()
+        return true
     }
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        sender.orderOut(nil)
-        return false
-    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     private func retryFocus() {
         focusInput(in: panel?.contentView)

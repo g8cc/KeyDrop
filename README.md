@@ -1,6 +1,6 @@
 # KeyDrop
 
-贴 key 即用的 AI API 配置分发工具(macOS 菜单栏应用)。
+贴 key 即用的 AI API 配置分发工具(macOS 应用,保留菜单栏快捷入口)。
 
 粘贴任意来源的 API key 内容,自动解析、测试、并写入各 AI 工具的配置,让中转站 / 共享 key 开箱即用。
 
@@ -73,7 +73,7 @@ dmg 即标准的拖动安装:打开后把 KeyDrop.app 拖进旁边的 Applicatio
 
 ## 使用
 
-启动后出现在菜单栏,粘贴 key 内容点击导入即可。也可用命令行:
+启动后打开普通 macOS 窗口,支持 Dock / ⌘Tab、最小化、缩放与全屏,并记住窗口位置和大小。关闭窗口后应用继续运行,点击 Dock 图标、菜单栏 K 或按 ⌘⇧K 可再次打开。粘贴 key 内容点击导入即可。也可用命令行:
 
 ```bash
 # 导入(自动测试)
@@ -135,6 +135,15 @@ KeyDrop image "一只赛博朋克猫" --size 1024x1024
 | `KEYDROP_DSH_SETTINGS` / `KEYDROP_DSH_CREDENTIALS` | DeepSeek Harness 配置路径 |
 | `KEYDROP_GROK_CONFIG` / `GROK_HOME` | Grok Build 配置路径覆盖 / 配置目录 |
 | `KEYDROP_PROXY` | 默认代理 |
+
+## 开发验证
+
+```bash
+make test                         # 全量核心回归,使用隔离临时目录与本机 HTTP mock
+bash Scripts/test-app.sh           # AppKit 窗口与 UI 状态回归
+bash Scripts/benchmark.sh          # release 模式历史裁剪基准,校验前后结果一致
+KEYDROP_TEST_FILTER=History .build/debug/KeyDropTestRunner  # 按套件名筛选
+```
 
 ## 隐私
 

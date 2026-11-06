@@ -16,6 +16,22 @@ enum ImportPipelineTests {
 
     static func run(_ h: Harness) {
 
+        h.runSuite("导入管线.Anthropic 原生协议") { t in
+            let (env, core) = makeEnv("pipe-native-anthropic")
+            defer { env.cleanup() }
+            let server = try! MockHTTPServer(mode: .nativeAnthropic)
+            do {
+                let result = try core.add(raw: """
+                    接口地址：http://127.0.0.1:\(server.port)/v1/messages
+                    API Key：sk-native0000000001
+                    Anthropic / Claude 原生协议
+                    """, ccOverride: true, cpaOverride: false, dshOverride: false, force: false)
+                t.expect(result.ok, "原生协议说明可正常导入")
+                t.equal(result.entry.models, ["claude-sonnet-4-6"], "使用真实目录模型")
+                t.equal(result.entry.targets, ["ccswitch"], "路由到 Claude 配置")
+            } catch { t.expect(false, "原生协议导入失败: \(error.localizedDescription)") }
+        }
+
         // MARK: - 路由矩阵:模型家族 → 目标 app → 落点文件
 
         h.runSuite("导入管线.路由矩阵") { t in

@@ -10,6 +10,8 @@
 	<string>com.keydrop.app</string>
 	<key>CFBundleName</key>
 	<string>KeyDrop</string>
+	<key>CFBundleIconFile</key>
+	<string>KeyDrop</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -19,7 +21,7 @@
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
-	<true/>
+	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>

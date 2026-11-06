@@ -7,6 +7,7 @@ final class MockHTTPServer {
     var port: Int { listener.port }
 
     enum Mode {
+        case nativeAnthropic, nativeLimited, nativeInvalid, nativeBadModel, nativeMultiple, emptyChat, errorChat
         case openAI    // 200 {"data":[{id}]}
         case notFound  // 404 空
         case gateway404 // GET 全 404;POST /chat/completions → 404 + JSON error(网关可达,模型校验)
@@ -34,6 +35,11 @@ final class MockHTTPServer {
     }
     // cpaMgmt 状态:跨线程访问,统一走锁
     let mgmtLock = NSLock()
+    private var requestCounts: [String: Int] = [:]
+    func countRequests(_ path: String) -> Int {
+        mgmtLock.lock(); defer { mgmtLock.unlock() }
+        return requestCounts[path] ?? 0
+    }
     var cpaYAML = "# cpa-mgmt-sentinel\nport: 8317\n"
     var cpaPutBody = ""
     var cpaPatchBody = ""
@@ -71,11 +77,36 @@ final class MockHTTPServer {
         guard parts.count >= 2 else { return }
         let method = parts[0]
         let target = parts[1]
+        mgmtLock.lock()
+        requestCounts[target, default: 0] += 1
+        mgmtLock.unlock()
+        if mode == .emptyChat || mode == .errorChat {
+            respond(client, 200, "OK", mode == .emptyChat ? "" : #"{"error":{"message":"upstream failed"}}"#)
+            return
+        }
         // 仅 selectiveModelQuota 的 chat POST 需要 body 里的 model 字段来区分响应。
         // 其它模式一律不读 body → 行为与旧 mock 完全一致,不会因等待 body 而死锁。
         // readUntil 收满 \r\n\r\n 即返回,但 URLSession 常把 header+body 一并送达,
         // 所以先判断分隔符之后是否已有 >= content-length 的字节,已有就不再 recv
         // (否则 readBody 会对着已发完的流死等满 SO_RCVTIMEO,4 模型 × 3s 拖死测试)。
+        if [.nativeAnthropic, .nativeLimited, .nativeInvalid, .nativeBadModel, .nativeMultiple].contains(mode) {
+            if method == "GET", target.hasSuffix("/models") {
+                respond(client, 200, "OK", mode == .nativeMultiple ? #"{"data":[{"id":"claude-sonnet-4-6"},{"id":"claude-opus-4-6"},{"id":"claude-haiku-4-5"}]}"# : #"{"data":[{"id":"claude-sonnet-4-6"}]}"#)
+            } else if method == "POST", target.hasSuffix("/messages") {
+                if mode == .nativeInvalid || !req.lowercased().contains("x-api-key: sk-native") || !req.lowercased().contains("anthropic-version: 2023-06-01") {
+                    respond(client, 401, "Unauthorized", #"{"type":"error","error":{"type":"authentication_error"}}"#)
+                } else if mode == .nativeLimited {
+                    respond(client, 429, "Too Many Requests", #"{"type":"error","error":{"type":"rate_limit_error","message":"AWS queue busy"}}"#)
+                } else if mode == .nativeBadModel {
+                    respond(client, 400, "Bad Request", #"{"type":"error","error":{"type":"invalid_request_error","message":"unsupported model"}}"#)
+                } else {
+                    respond(client, 200, "OK", #"{"type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}"#)
+                }
+            } else {
+                respond(client, 404, "Not Found", #"{"error":{"message":"route not found"}}"#)
+            }
+            return
+        }
         if mode == .cpaMgmt {
             handleCPAMgmt(client, req, method, target)
             return
@@ -485,6 +516,34 @@ final class SocketClient {
 
 enum APITesterTests {
     static func run(_ h: Harness) {
+        h.runSuite("APITester.验证与请求去重") { t in
+            for mode in [MockHTTPServer.Mode.emptyChat, .errorChat] {
+                let server = try! MockHTTPServer(mode: mode)
+                let result = APITester.testModelChat(base: "http://127.0.0.1:\(server.port)/v1", key: "sk-fake", model: "gpt-test", timeout: 2)
+                t.expect(!result.ok, "200 空体/错误体不得验证成功: \(mode)")
+            }
+            let server = try! MockHTTPServer(mode: .nativeMultiple)
+            let result = APITester.test(url: "http://127.0.0.1:\(server.port)/v1", key: "sk-native0000000001", timeout: 2)
+            t.expect(result.ok, "多个原生模型可用")
+            t.equal(result.workingModels.count, 3, "保留每个模型的探测结果")
+            t.equal(server.countRequests("/v1/chat/completions"), 1, "协议已确认后不重复探测 OpenAI 路由")
+            t.equal(server.countRequests("/v1/messages"), 3, "每个模型只发一次原生请求")
+        }
+        h.runSuite("APITester.Anthropic native") { t in
+            for mode in [MockHTTPServer.Mode.nativeAnthropic, .nativeLimited, .nativeInvalid, .nativeBadModel] {
+                let server = try! MockHTTPServer(mode: mode)
+                let base = "http://127.0.0.1:\(server.port)/v1"
+                let result = APITester.test(url: base, key: "sk-native0000000001", timeout: 2)
+                t.equal(result.ok, mode == .nativeAnthropic, "native availability \(mode)")
+                t.equal(result.authFailed, mode == .nativeInvalid, "native auth vs throttle/model error \(mode)")
+                t.equal(result.style, "anthropic", "native detected despite OpenAI-shaped catalog \(mode)")
+                if mode == .nativeAnthropic {
+                    t.equal(result.workingModels, ["claude-sonnet-4-6"], "native verified models retained")
+                    t.expect(APITester.testModelChat(base: base, key: "sk-native0000000001", model: "claude-sonnet-4-6", timeout: 2).ok, "explicit native model validation")
+                }
+                if mode == .nativeLimited { t.contains(result.detail, "429", "throttle status retained") }
+            }
+        }
         h.runSuite("APITester.探测轮换") { t in
             // 轮换语义:激活模型置顶,从未测过 > 最久未测,每轮仍只 4 个
             let models = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"]
