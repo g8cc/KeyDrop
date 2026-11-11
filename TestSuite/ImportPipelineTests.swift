@@ -27,6 +27,7 @@ enum ImportPipelineTests {
                     Anthropic / Claude 原生协议
                     """, ccOverride: true, cpaOverride: false, dshOverride: false, force: false)
                 t.expect(result.ok, "原生协议说明可正常导入")
+                t.equal(HistoryStore().snapshot().first?.apiStyle, "anthropic", "导入保存协议")
                 t.equal(result.entry.models, ["claude-sonnet-4-6"], "使用真实目录模型")
                 t.equal(result.entry.targets, ["ccswitch"], "路由到 Claude 配置")
             } catch { t.expect(false, "原生协议导入失败: \(error.localizedDescription)") }

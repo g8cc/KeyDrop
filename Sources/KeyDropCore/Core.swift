@@ -561,6 +561,7 @@ public final class Core {
             healthAt: addHealth == nil ? nil : Date().timeIntervalSince1970
         )
 
+        entry.apiStyle = probedTest?.ok == true ? probedTest?.style : dup?.apiStyle
         var lines: [String] = []
         lines.append("解析: \(parsed.format) → key=\(parsed.keyMasked)" + (parsed.model.map { " model=\($0)" } ?? ""))
         if selectedModels.count > 1 {
@@ -1101,10 +1102,11 @@ public final class Core {
                                           modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t },
                                           importedModels: e.models,
                                           probePool: probePool.isEmpty ? nil : probePool,
-                                          knownNeedsProxy: e.health == "proxy-ok")
+                                          knownNeedsProxy: e.health == "proxy-ok", styleHint: e.apiStyle)
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 let (h, d) = Self.healthFor(test)
                 var updated = e
+                if test.ok { updated.apiStyle = test.style }
                 // 失败防抖:单次失败(网络抖动/瞬时 5xx)保留 ok 判定,只记 streak;
                 // 连续 ≥2 次失败才真正降级。成功即清零。真实反馈:显示可用但用不了,
                 // 反向问题同样存在 —— 一次抖动就把可用 key 踢进异常区造成误杀
@@ -1406,6 +1408,60 @@ public final class Core {
     public func selfHeal() -> [String] {
         var out = compactLedger()
         out.append(contentsOf: reconcileWithCCSwitch())
+        out.append(contentsOf: reconcileDSH())
+        return out
+    }
+
+    /// DSH 全生命周期对账(与 reconcileWithCCSwitch 同级的成熟度):
+    /// ① 孤儿路由清理 —— 账本不再认领的 keydrop-*(连同凭据)移除
+    /// ② 认领路由漂移修复 —— baseURL/models 与账本不一致 → 重写;凭据缺失 → 自愈
+    /// ③ 认领路由缺失 —— 只报告不自动重建:用户在 DSH 界面手删的意图必须尊重,
+    ///    重建走显式「同步到 DSH」(与 cc-switch 的 ccMissing 同一哲学)
+    /// ④ Cordis 补丁层检测(只读)—— 第三方私有层里的残留 keydrop-* 点名警告
+    /// 纯文件操作无网络;启动 selfHeal、每次同步到 DSH 时都会执行
+    public func reconcileDSH() -> [String] {
+        guard DSHWriter.installed() else { return [] }
+        var out: [String] = []
+        let claimed = history.snapshot().filter { $0.status == "active" && $0.targets.contains("dsh") }
+        var valid = Set(claimed.map { DSHWriter.routeKey(providerID: $0.id) })
+        // CPA 常驻路由的生命周期归 syncCPAResidentEntries/removeCPAResident 管理,对账不碰
+        valid.insert(DSHWriter.routeKey(providerID: "cparesident"))
+
+        do {
+            let pruned = try DSHWriter.pruneOrphanRoutes(validRouteKeys: valid)
+            if !pruned.isEmpty {
+                out.append("DSH 对账: 清理 \(pruned.count) 个孤儿路由(\(pruned.joined(separator: ", ")))")
+            }
+            let byName = Dictionary(uniqueKeysWithValues: try DSHWriter.managedRoutes().map { ($0.name, $0) })
+            var updated: [String] = []
+            var missing: [String] = []
+            for e in claimed {
+                let rk = DSHWriter.routeKey(providerID: e.id)
+                guard let url = e.url, let key = extractKey(e), !key.isEmpty else { continue }
+                let models = (e.models ?? (e.model.map { [$0] } ?? [])).filter { !$0.isEmpty }
+                guard !models.isEmpty else { continue }
+                guard let r = byName[rk] else {
+                    missing.append(rk)
+                    continue
+                }
+                // 与写入同源归一(sync 时 baseURL 过 normalizeBaseURL),否则必然误报漂移
+                if r.baseURL == DSHWriter.normalizeBaseURL(url), r.models == models,
+                   DSHWriter.hasCredential(env: r.env) { continue }
+                _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
+                updated.append(rk)
+            }
+            if !updated.isEmpty {
+                out.append("DSH 对账: \(updated.count) 个路由与账本漂移,已重写(\(updated.joined(separator: ", ")))")
+            }
+            if !missing.isEmpty {
+                out.append("DSH 对账: \(missing.count) 个已同步路由在 settings.yaml 缺失,未自动重建(\(missing.prefix(3).joined(separator: ", "))\(missing.count > 3 ? " 等" : ""))——行内「同步到 DSH」可恢复")
+            }
+        } catch {
+            out.append("⚠ DSH 对账失败: \(error.localizedDescription)")
+        }
+        for (file, stale) in DSHWriter.patchLayerStaleRoutes(validKeys: valid) {
+            out.append("⚠ DSH 补丁层残留: \(file) 里有 \(stale.count) 个账本不再认领的 keydrop-* 路由(\(stale.prefix(3).joined(separator: ", "))\(stale.count > 3 ? " 等" : ""))——Cordis 私有层,KeyDrop 不自动改写,请在 Cordis 中删除或手动清理")
+        }
         return out
     }
 
@@ -1834,12 +1890,13 @@ public final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
         let px = proxyForHealth()
-        let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model, importedModels: entry.models)
+        let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
         noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
         if test.ok {
             if var found = history.find(idPrefix: entryIDPrefix) {
                 found.health = h.health
+                found.apiStyle = test.style
                 found.healthDetail = h.detail
                 found.healthAt = Date().timeIntervalSince1970
                 historyUpdateLogged(found)
@@ -2035,7 +2092,8 @@ public final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
         let test = APITester.test(url: url, key: key, proxy: effProxy,
-                                  preferredModel: entry.model, importedModels: entry.models)
+                                  preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
+        if test.ok { entry.apiStyle = test.style }
         // 端点报错但 /models 拿到了清单 ≠ 不能改选:恰恰是勾选的那个模型 503/429 才最需要
         // 换掉它。以前一报错就 throw,弹窗永远出不来(真实卡死 c30beaa0:模型改不了,
         // 又因 cc-switch 在跑删不掉 → 两头堵)。放行到弹窗,选完按新模型重探。
@@ -2317,7 +2375,8 @@ public final class Core {
         var retestNote: String? = nil
         if repickAfterFail {
             let retest = APITester.test(url: url, key: key, proxy: effProxy,
-                                        preferredModel: filtered.first, importedModels: filtered)
+                                        preferredModel: filtered.first, importedModels: filtered, styleHint: entry.apiStyle)
+            if retest.ok { entry.apiStyle = retest.style }
             let h = Self.healthFor(retest)
             entry.health = h.health
             entry.healthDetail = h.detail
@@ -2392,7 +2451,7 @@ public final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法探测模型")
         }
         let test = APITester.test(url: url, key: key, proxy: proxyForHealth(),
-                                  preferredModel: entry.model, importedModels: entry.models)
+                                  preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
         guard test.ok else { throw ParseError.io("探测失败: \(test.detail)") }
         return test.models
     }
@@ -2426,10 +2485,11 @@ public final class Core {
         var previousKey = key
         var keyRotated = false
         if let newKey, !newKey.isEmpty, newKey != key {
-            let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth())
+            let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth(), styleHint: entry.apiStyle)
             guard test.ok else {
                 throw ParseError.io("新 key 验证失败,未做任何修改: \(test.detail)")
             }
+            entry.apiStyle = test.style
             effectiveKey = newKey
             keyRotated = true
             entry.key = newKey
@@ -2769,7 +2829,12 @@ public final class Core {
             if !alreadyLinked { try? DSHWriter.remove(providerID: entry.id) }
             throw ParseError.io("DSH 已写入,但 KeyDrop 记录保存失败: \(error.localizedDescription)")
         }
-        return "✓ DeepSeek Harness: 已\(alreadyLinked ? "更新" : "添加") provider「\(route)」(\(models.count) 个模型)"
+        // 全量对账必须在 history.update 之后:先认领再对账,否则刚写入的路由
+        // (账本还没记 dsh 目标)会被当成孤儿删掉
+        let reconcileLines = reconcileDSH()
+        var msg = "✓ DeepSeek Harness: 已\(alreadyLinked ? "更新" : "添加") provider「\(route)」(\(models.count) 个模型)"
+        msg += reconcileLines.map { "\n✓ " + $0 }.joined()
+        return msg
     }
 
     /// 通用「按需同步到指定目标」:条目行的同步菜单入口(cc-switch/CPA/DSH/Grok)。
@@ -2836,7 +2901,11 @@ public final class Core {
             let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
             if !entry.targets.contains("dsh") { entry.targets.append("dsh") }
             try history.update(entry)
-            return "DSH: \(route)"
+            // 先认领(history.update)再全量对账,顺序同理见 syncToDSH
+            let reconcileLines = reconcileDSH()
+            var msg = "DSH: \(route)"
+            msg += reconcileLines.map { "; " + $0 }.joined()
+            return msg
         case "grok":
             let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
             let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])

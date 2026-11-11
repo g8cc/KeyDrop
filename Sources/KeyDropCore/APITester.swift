@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct APITestResult {
     public let ok: Bool
@@ -203,10 +204,10 @@ public enum APITester {
     ///   (监控传用户勾选的模型,站点目录里的其它模型与本次监控无关)
     /// - Parameter knownNeedsProxy: 上轮已判定「直连必被地域/合规封锁、经代理可用」。
     ///   为 true 时本轮先走代理,不再白打一次注定 403 的直连;代理侧仍不通才回退直连复核
-    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, knownNeedsProxy: Bool = false) -> APITestResult {
+    public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, knownNeedsProxy: Bool = false, styleHint: String? = nil) -> APITestResult {
         let p = proxy?.trimmingCharacters(in: .whitespaces)
         if knownNeedsProxy, let p, !p.isEmpty {
-            let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+            let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
             if via.ok {
                 return APITestResult(ok: true, style: via.style, models: via.models,
                                      detail: via.detail + " | 需代理(本轮跳过直连)",
@@ -217,13 +218,13 @@ public enum APITester {
             }
             // 代理侧也不通才回退直连一次:可能是本机代理挂了,也可能是地区限制解除
             // (或 key 真失效)。直连恢复可用就不再标 needsProxy,下轮回到常规路径
-            let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+            let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
             if direct.ok { return direct }
             if direct.authFailed, !via.authFailed { return direct }
             return via
         }
         // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
-        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
         if direct.ok { return direct }
         if p == nil || p!.isEmpty {
             return direct
@@ -232,7 +233,7 @@ public enum APITester {
         // 但区域/合规封锁返回的正是 JSON 403(真实事故:tokenharbor
         // 「API access from your region is not available」),key 有效、经代理 200,
         // 短路把这类 key 直接判死,用户配好的代理一次都没用上
-        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool)
+        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
         if via.ok {
             // 必须透传探测明细:只拷 ok/models/detail 会把 workingModels/quotaModels/延迟/
             // quotaExhausted 全部丢掉 → 需代理的 key 导入时限流模型不被排除、监控图无延迟、
@@ -250,7 +251,7 @@ public enum APITester {
         return via
     }
 
-    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil) -> APITestResult {
+    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, styleHint: String? = nil) -> APITestResult {
         let base = url.hasSuffix("/") ? String(url.dropLast()) : url
         let candidates = endpointCandidates(base)
         let s = session(for: proxy)
@@ -293,7 +294,7 @@ public enum APITester {
                     lastErr = "GET \(ep) → 200 但非 JSON(疑似前端兜底页)"
                     continue
                 }
-                style = "openai"
+                style = styleHint == "anthropic" ? "anthropic" : "openai"
                 // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
                 // chat 探测多模型(上限 4,free 字样模型优先):单个模型 429 不代表整 key 无额度。
                 // 任一模型 200/400/404 → key 可用;探测过的模型全部 quota → 才判无额度;
@@ -332,6 +333,7 @@ public enum APITester {
                     if chat.quota != nil { quotaModels.append(probe); continue }
                     if let st = chat.degraded {
                         if degradedModel == nil { degradedModel = (probe, st) }
+                        if let detail = chat.detail { lastErr = detail }
                         continue
                     }
                     if chat.networkError {
@@ -367,7 +369,7 @@ public enum APITester {
                 if let (m, st) = degradedModel {
                     let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
                     return APITestResult(ok: false, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)",
+                                         detail: "GET \(ep) → 200, 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)" + (lastErr == "无" ? "" : " | \(lastErr)"),
                                          authFailed: false)
                 }
                 if !quotaModels.isEmpty, hasRealModels {
@@ -483,6 +485,7 @@ public enum APITester {
     /// POST chat 健康检查结果
     private struct ChatProbeOutcome {
         var style: String?
+        var detail: String?
         var quota: Int?
         var degraded: Int?
         var authStatus: Int?
@@ -493,12 +496,38 @@ public enum APITester {
         var networkError = false
     }
 
+    private static let cooldownLock = NSLock()
+    private static var cooldowns: [String: (until: Date, outcome: ChatProbeOutcome)] = [:]
+
+    // 使用摘要做索引，不在缓存中保留凭据；按模型、代理隔离，避免一个限流模型阻止其他模型。
+    private static func cooldownID(base: String, key: String, proxy: String?, model: String) -> String {
+        let data = (try? JSONEncoder().encode([base, key, proxy ?? "", model])) ?? Data()
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func retryDelay(_ response: URLResponse?) -> TimeInterval? {
+        guard let value = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After") else { return nil }
+        if let seconds = Double(value), seconds.isFinite, seconds > 0 { return min(seconds, 86400) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: value), date > Date() else { return nil }
+        return min(date.timeIntervalSinceNow, 86400)
+    }
+
     /// - quota: 429/402 且 body 明确额度耗尽关键词
     /// - degraded: 429 限流(无 quota 词)/402/424/5xx → 服务不可用
     /// - authStatus: 401/403(非 HTML 盾页)→ 认证失败/key 失效。/models 常是公共端点(无 key 也 200),
     ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
     ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
-    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String, native: Bool = false) -> ChatProbeOutcome {
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String, native: Bool = false, canFallback: Bool = true) -> ChatProbeOutcome {
+        let cooldownKey = cooldownID(base: base, key: key, proxy: proxy, model: model)
+        cooldownLock.lock()
+        let cached = cooldowns[cooldownKey]
+        if let cached, cached.until <= Date() { cooldowns.removeValue(forKey: cooldownKey) }
+        cooldownLock.unlock()
+        if let cached, cached.until > Date() { return cached.outcome }
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = native ? (hasV1 ? ["/messages"] : ["/messages", "/v1/messages"]) : (hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"])
         let s = session(for: proxy)
@@ -531,7 +560,7 @@ public enum APITester {
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
             if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
-                return ChatProbeOutcome(style: native ? "anthropic" : nil, authStatus: status)
+                return ChatProbeOutcome(style: native ? "anthropic" : "openai", authStatus: status)
             }
             if native, status == 400 { return ChatProbeOutcome(style: "anthropic", degraded: status) }
             if status == 404 || status == 405 { continue }
@@ -540,27 +569,37 @@ public enum APITester {
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
-                    return ChatProbeOutcome(style: native ? "anthropic" : nil, quota: status)
+                    return ChatProbeOutcome(style: native ? "anthropic" : "openai", quota: status)
                 }
-                return ChatProbeOutcome(style: native ? "anthropic" : nil, degraded: status)
+                let delay = retryDelay(o.response)
+                let result = ChatProbeOutcome(style: native ? "anthropic" : "openai",
+                                              detail: delay.map { "服务端限流，暂停重复探测约 \(Int(ceil($0))) 秒" }, degraded: status)
+                if let delay {
+                    cooldownLock.lock()
+                    cooldowns = cooldowns.filter { $0.value.until > Date() }
+                    if cooldowns.count >= 512 { cooldowns.removeAll(keepingCapacity: true) }
+                    cooldowns[cooldownKey] = (Date().addingTimeInterval(delay), result)
+                    cooldownLock.unlock()
+                }
+                return result
             }
             if status == 424 || (500...599).contains(status) {
-                return ChatProbeOutcome(style: native ? "anthropic" : nil, degraded: status)
+                return ChatProbeOutcome(style: native ? "anthropic" : "openai", degraded: status)
             }
             if status == 200 {
                 // 200 + 非 HTML 响应体才计可用与延迟:流式网关回 SSE(data: 行),
                 // 普通网关回 JSON;空体/前端兜底页不算
                 if isSuccessfulChatBody(body) {
-                    return ChatProbeOutcome(style: native ? "anthropic" : nil, latencyMs: latencyMs)
+                    return ChatProbeOutcome(style: native ? "anthropic" : "openai", latencyMs: latencyMs)
                 }
                 continue
             }
         }
         // Claude 原生网关也可能返回 OpenAI 形状的 /models；目录形状不能决定聊天协议。
-        if !native, !sawNetworkError, model.lowercased().hasPrefix("claude-") {
-            return chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model, native: true)
+        if canFallback, !sawNetworkError, native || model.lowercased().hasPrefix("claude-") {
+            return chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model, native: !native, canFallback: false)
         }
-        return ChatProbeOutcome(style: native ? "anthropic" : nil, networkError: sawNetworkError || native)
+        return ChatProbeOutcome(style: native ? "anthropic" : "openai", networkError: sawNetworkError || native)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {

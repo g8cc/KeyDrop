@@ -26,6 +26,7 @@ public struct HistoryEntry: Codable {
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
+        case apiStyle
     }
 
     public var id: String
@@ -76,6 +77,7 @@ public struct HistoryEntry: Codable {
     public var probeLog: [ProbePoint]?
     /// 模型级探测历史(模型级监控):模型名 → 各自的 30 点轨迹。
     /// key 级 probeLog 回答"这把 key 整体好不好",这里回答"每个模型分别好不好"
+    public var apiStyle: String? = nil
     public var modelProbeLog: [String: [ProbePoint]]?
 
     /// uptime 百分比(status page 行业指标):已采集周期中通过的占比。
@@ -205,11 +207,13 @@ public struct HistoryEntry: Codable {
         viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)
         viaCPAAt = try c.decodeIfPresent(TimeInterval.self, forKey: .viaCPAAt)
         probeLog = try c.decodeIfPresent([ProbePoint].self, forKey: .probeLog)
+        apiStyle = try c.decodeIfPresent(String.self, forKey: .apiStyle)
         modelProbeLog = try c.decodeIfPresent([String: [ProbePoint]].self, forKey: .modelProbeLog)
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(apiStyle, forKey: .apiStyle)
         try c.encode(id, forKey: .id)
         try c.encode(ts, forKey: .ts)
         try c.encode(raw, forKey: .raw)
@@ -509,6 +513,7 @@ public final class HistoryStore {
                                      uniquingKeysWith: { first, _ in first })
             for e in entries {
                 guard let i = indices[e.id], _items[i].status == "active" else { continue }
+                if let style = e.apiStyle { _items[i].apiStyle = style }
                 _items[i].health = e.health
                 _items[i].healthDetail = e.healthDetail
                 _items[i].healthAt = at

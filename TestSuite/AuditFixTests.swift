@@ -335,5 +335,184 @@ enum AuditFixTests {
                 t.expect(!msg.contains("xiaoshengapi"), "报错与导入不得触达旧 URL")
             }
         }
+        // 用户反馈(2026-11-10):DSH 里堆积一堆 keydrop-* 旧路由(每个历史导入
+        // 条目一个,删除/迁移后残留),且部分凭据已丢失 → DSH 搜不到模型。
+        // 修复:同步到 DSH 时对账清理账本不再认领的 keydrop-* 孤儿路由
+        h.runSuite("Audit.DSH 孤儿路由对账清理") { t in
+            let env = try! TestEnv("audit-dsh-prune")
+            defer { env.cleanup() }
+            let core = Core()
+            // 账本两条 active:entryA 将被同步(同步后其路由合法);
+            // entryB 已带 dsh 目标(路由合法)
+            let entryA = HistoryEntry(
+                id: "aaaa1111-1111-1111-111111111111", ts: 1,
+                raw: "https://a.example.com/v1\nsk-entrya-key-000001", format: "multiline",
+                name: "a", url: "https://a.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-entrya-key-000001", keyMasked: "sk-a…",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            let entryB = HistoryEntry(
+                id: "bbbb2222-2222-2222-222222222222", ts: 1,
+                raw: "https://b.example.com/v1\nsk-entryb-key-000002", format: "multiline",
+                name: "b", url: "https://b.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-entryb-key-000002", keyMasked: "sk-b…",
+                targets: ["dsh"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! core.history.append(entryA)
+            try! core.history.append(entryB)
+            // settings.yaml 预置:孤儿路由(无账本条目)+ 用户手配路由 + cparesid 常驻路由
+            env.write("dsh.yaml",
+            """
+            llm-pi-ai:
+              providers:
+                keydrop-stale99:
+                  apiKeyEnv: KEYDROP_STALE99_API_KEY
+                  api: openai-completions
+                  baseURL: https://dead.example.com/v1
+                  models:
+                    - id: old-model
+                      name: old-model
+                user-own-route:
+                  apiKeyEnv: MY_OWN_KEY
+                  api: openai-completions
+                  baseURL: https://mine.example.com/v1
+                  models:
+                    - id: my-model
+                      name: my-model
+                keydrop-cparesid:
+                  apiKeyEnv: KEYDROP_CPARESID_API_KEY
+                  api: openai-completions
+                  baseURL: http://127.0.0.1:8317/v1
+                  models:
+                    - id: deepseek-v4.1
+                      name: deepseek-v4.1
+            """)
+            env.write("dsh-creds.yaml",
+            """
+            version: 1
+            refs:
+              KEYDROP_STALE99_API_KEY: sk-stale-orphan-0000001
+              MY_OWN_KEY: sk-user-own-00000000001
+              KEYDROP_CPARESID_API_KEY: sk-cpa-resident-00001
+            """)
+            let msg = try! core.syncToDSH(entryIDPrefix: "aaaa1111")
+            let cfg = env.read("dsh.yaml")
+            t.contains(cfg, "keydrop-aaaa1111", "本次同步的路由已写入")
+            t.contains(cfg, "user-own-route", "用户手配路由不动")
+            t.contains(cfg, "keydrop-cparesid", "CPA 常驻路由不动")
+            t.expect(!cfg.contains("keydrop-stale99"), "孤儿路由被清理")
+            t.contains(msg, "清理 1 个", "播报清理: \(msg)")
+            let creds = env.read("dsh-creds.yaml")
+            t.expect(!creds.contains("KEYDROP_STALE99_API_KEY"), "孤儿凭据一并清除")
+            t.contains(creds, "MY_OWN_KEY", "用户凭据不动")
+            t.contains(creds, "KEYDROP_CPARESID_API_KEY", "常驻凭据不动")
+            let y = Process()
+            y.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            y.arguments = ["-c", "import yaml; yaml.safe_load(open('\(env.dir)/dsh.yaml')); yaml.safe_load(open('\(env.dir)/dsh-creds.yaml'))"]
+            try? y.run(); y.waitUntilExit()
+            t.expect(y.terminationStatus == 0, "清理后 YAML 合法")
+        }
+
+        // DSH 全生命周期对账(与 cc-switch 同级):守恒/漂移修复/凭据自愈/缺失报告/补丁层检测
+        h.runSuite("Audit.DSH 全生命周期对账") { t in
+            let env = try! TestEnv("audit-dsh-full")
+            defer { env.cleanup() }
+            // installed()/补丁层扫描基于 DSH_HOME;套件结束恢复,不污染后续套件
+            let oldDSHHome = getenv("DSH_HOME").map { String(cString: $0) }
+            setenv("DSH_HOME", env.dir + "/dshhome", 1)
+            try! FileManager.default.createDirectory(atPath: env.dir + "/dshhome/profiles/headless", withIntermediateDirectories: true)
+            defer {
+                if let old = oldDSHHome { setenv("DSH_HOME", old, 1) } else { unsetenv("DSH_HOME") }
+            }
+            let core = Core()
+            let entryA = HistoryEntry(
+                id: "dddd4444-4444-4444-444444444444", ts: 1,
+                raw: "https://a.example.com/v1\nsk-entrya-key-000001", format: "multiline",
+                name: "a", url: "https://a.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-entrya-key-000001", keyMasked: "sk-a…",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            let entryB = HistoryEntry(
+                id: "eeee5555-5555-5555-555555555555", ts: 1,
+                raw: "https://b.example.com/v1\nsk-entryb-key-000002", format: "multiline",
+                name: "b", url: "https://b.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-entryb-key-000002", keyMasked: "sk-b…",
+                targets: ["dsh"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            let entryC = HistoryEntry(
+                id: "ffff6666-6666-6666-666666666666", ts: 1,
+                raw: "https://c.example.com/v1\nsk-entryc-key-000003", format: "multiline",
+                name: "c", url: "https://c.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-entryc-key-000003", keyMasked: "sk-c…",
+                targets: ["dsh"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! core.history.append(entryA)
+            try! core.history.append(entryB)
+            try! core.history.append(entryC)
+            // 预置:entryB 路由漂移(baseURL/models 都是旧值)+ 凭据缺失;
+            // cparesid 与用户手配路由正常
+            env.write("dsh.yaml",
+            """
+            llm-pi-ai:
+              providers:
+                keydrop-eeee5555:
+                  apiKeyEnv: KEYDROP_EEEE5555_API_KEY
+                  api: openai-completions
+                  baseURL: https://stale.example.com/v1
+                  models:
+                    - id: stale-model
+                      name: stale-model
+                keydrop-cparesid:
+                  apiKeyEnv: KEYDROP_CPARESID_API_KEY
+                  api: openai-completions
+                  baseURL: http://127.0.0.1:8317/v1
+                  models:
+                    - id: deepseek-v4.1
+                      name: deepseek-v4.1
+                user-own-route:
+                  apiKeyEnv: MY_OWN_KEY
+                  api: openai-completions
+                  baseURL: https://mine.example.com/v1
+                  models:
+                    - id: my-model
+                      name: my-model
+            """)
+            env.write("dsh-creds.yaml",
+            """
+            version: 1
+            refs:
+              MY_OWN_KEY: sk-user-own-00000000001
+              KEYDROP_CPARESID_API_KEY: sk-cpa-resident-00001
+            """)
+
+            // ①②③ 漂移修复 + 凭据自愈 + 缺失报告(不自动重建)
+            let lines = core.reconcileDSH().joined(separator: "\n")
+            t.contains(lines, "漂移,已重写", "漂移被识别: \(lines.prefix(200))")
+            let cfg = env.read("dsh.yaml")
+            t.contains(cfg, "baseURL: https://b.example.com/v1", "漂移 baseURL 重写为账本值")
+            t.expect(!cfg.contains("stale.example.com"), "旧 baseURL 清除")
+            t.contains(cfg, "- id: deepseek-v4.1\n          name: deepseek-v4.1", "漂移 models 重写为账本值")
+            t.expect(!cfg.contains("stale-model"), "旧模型清除")
+            let creds = env.read("dsh-creds.yaml")
+            t.contains(creds, "KEYDROP_EEEE5555_API_KEY: sk-entryb-key-000002", "缺失凭据自愈")
+            t.contains(lines, "keydrop-ffff6666", "缺失路由被报告")
+            t.expect(!cfg.contains("keydrop-ffff6666"), "缺失路由不自动重建(尊重用户手删)")
+
+            // ④ 守恒:同步两次,路由数 == 账本认领数,不增长
+            _ = try! core.syncToDSH(entryIDPrefix: "dddd4444")
+            _ = try! core.syncToDSH(entryIDPrefix: "dddd4444")
+            let cfg2 = env.read("dsh.yaml")
+            let routeCount = cfg2.components(separatedBy: "\n").filter { $0.hasPrefix("    keydrop-") }.count
+            t.equal(routeCount, 3, "同步两次后 keydrop 路由数 = 账本认领数(a/b/cparesid),实际 \(routeCount)")
+
+            // ⑤ 补丁层只读检测:残留被点名,文件不被改写
+            let patchPath = env.dir + "/dshhome/profiles/headless/x.patch.yml"
+            try! "x:\n  providers:\n      keydrop-deadbeef:\n        apiKeyEnv: KEYDROP_DEADBEEF_API_KEY\n".write(
+                toFile: patchPath, atomically: true, encoding: .utf8)
+            let lines2 = core.reconcileDSH().joined(separator: "\n")
+            t.contains(lines2, "补丁层残留", "补丁层残留被点名")
+            t.contains(lines2, "keydrop-deadbeef", "残留路由具名")
+            t.contains(env.read("dshhome/profiles/headless/x.patch.yml"), "keydrop-deadbeef", "补丁层文件未被改写")
+        }
     }
 }

@@ -13,6 +13,20 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.protocol compatibility") { t in
+            let env = try TestEnv("hist-protocol")
+            defer { env.cleanup() }
+            var e = entry("protocol", ts: 1)
+            let legacy = try JSONDecoder().decode(HistoryEntry.self, from: JSONEncoder().encode(e))
+            t.expect(legacy.apiStyle == nil, "旧账本缺少协议字段仍可读取")
+            e.apiStyle = "anthropic"
+            let store = HistoryStore()
+            try store.append(e)
+            t.equal(HistoryStore().snapshot().first?.apiStyle, "anthropic", "协议跨实例保存")
+            e.apiStyle = "openai"
+            try store.mergeHealth([e], at: 2)
+            t.equal(HistoryStore().snapshot().first?.apiStyle, "openai", "巡检更新协议")
+        }
         h.runSuite("History.sections mutually exclusive") { t in
             var dead = entry("dead", ts: 3)
             dead.health = "dead"

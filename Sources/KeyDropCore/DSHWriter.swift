@@ -102,6 +102,52 @@ public enum DSHWriter {
         }
     }
 
+    /// 对账清理 KeyDrop 托管域(keydrop- 前缀)的孤儿路由:不在 validRouteKeys 里的
+    /// 路由连同其凭据一并移除。孤儿来源:条目已删除但路由残留、账本合并/多代配置
+    /// 迁移留下的无主路由 —— DSH 设置页会堆积一堆「自定义」provider 且搜不到模型
+    /// (凭据已缺失)。非 keydrop- 前缀的路由是用户手配,永不触碰
+    /// (与 routesForEndpoint 的约定一致)。返回清理掉的路由名。
+    public static func pruneOrphanRoutes(validRouteKeys: Set<String>) throws -> [String] {
+        guard FileManager.default.fileExists(atPath: settingsPath) else { return [] }
+        return try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
+            var settings = try readExisting(settingsPath)
+            var creds = try readExisting(credentialsPath)
+            // 单遍扫描:路由名行 = 恰好 4 空格缩进;其块内 6 空格缩进的 apiKeyEnv 行
+            var routeEnvs: [String: String] = [:]
+            var current: String? = nil
+            for line in settings.components(separatedBy: "\n") {
+                if line.hasPrefix("    "), !line.hasPrefix("      ") {
+                    let t = line.trimmingCharacters(in: .whitespaces)
+                    current = t.hasSuffix(":") ? String(t.dropLast()) : nil
+                    continue
+                }
+                if let r = current, line.hasPrefix("      ") {
+                    let t = line.trimmingCharacters(in: .whitespaces)
+                    if t.hasPrefix("apiKeyEnv:") {
+                        routeEnvs[r] = String(t.dropFirst("apiKeyEnv:".count))
+                            .trimmingCharacters(in: .whitespaces)
+                    }
+                }
+            }
+            let orphans = routeEnvs.keys
+                .filter { $0.hasPrefix("keydrop-") && !validRouteKeys.contains($0) }
+                .sorted()
+            guard !orphans.isEmpty else { return [] }
+            backupFile(settingsPath)
+            backupFile(credentialsPath)
+            for r in orphans {
+                removeRoute(&settings, route: r)
+                if let env = routeEnvs[r], !env.isEmpty {
+                    removeCredential(&creds, env: env)
+                }
+            }
+            try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
+            try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
+            return orphans
+        }
+    }
+
     private static func removeLocked(providerID: String) throws {
         let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
@@ -194,6 +240,90 @@ public enum DSHWriter {
 
     public static func installed() -> Bool {
         FileManager.default.fileExists(atPath: dshHome)
+    }
+
+    // MARK: - 生命周期对账(reconcile)
+
+    /// settings.yaml 里一个 KeyDrop 托管路由的内容快照
+    public struct ManagedRoute {
+        public let name: String
+        public let env: String
+        public let baseURL: String
+        public let models: [String]
+    }
+
+    /// 枚举 settings.yaml 里 KeyDrop 托管域(keydrop- 前缀)的路由及内容。
+    /// 路由行 = 恰好 4 空格缩进;块内字段 6 空格,模型项 8 空格 `- id:`
+    public static func managedRoutes() throws -> [ManagedRoute] {
+        guard FileManager.default.fileExists(atPath: settingsPath) else { return [] }
+        let text = try readExisting(settingsPath)
+        var routes: [ManagedRoute] = []
+        var name: String? = nil
+        var env = ""
+        var baseURL = ""
+        var models: [String] = []
+        func flush() {
+            if let n = name, n.hasPrefix("keydrop-") {
+                routes.append(ManagedRoute(name: n, env: env, baseURL: baseURL, models: models))
+            }
+            name = nil; env = ""; baseURL = ""; models = []
+        }
+        for line in text.components(separatedBy: "\n") {
+            if line.hasPrefix("    "), !line.hasPrefix("      ") {
+                flush()
+                let t = line.trimmingCharacters(in: .whitespaces)
+                name = t.hasSuffix(":") ? String(t.dropLast()) : nil
+                continue
+            }
+            guard name != nil, line.hasPrefix("      ") else { continue }
+            let t = line.trimmingCharacters(in: .whitespaces)
+            let unquote = { (s: String) -> String in
+                if s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") { return String(s.dropFirst().dropLast()) }
+                if s.count >= 2, s.hasPrefix("'"), s.hasSuffix("'") { return String(s.dropFirst().dropLast()) }
+                return s
+            }
+            if t.hasPrefix("apiKeyEnv:") {
+                env = unquote(String(t.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces))
+            } else if t.hasPrefix("baseURL:") {
+                baseURL = unquote(String(t.dropFirst("baseURL:".count)).trimmingCharacters(in: .whitespaces))
+            } else if t.hasPrefix("- id:") {
+                let m = unquote(String(t.dropFirst("- id:".count)).trimmingCharacters(in: .whitespaces))
+                if !m.isEmpty { models.append(m) }
+            }
+        }
+        flush()
+        return routes
+    }
+
+    /// 凭据文件里是否存在该 env 条目(路由漂移对账的凭据自愈判定)
+    static func hasCredential(env: String) -> Bool {
+        guard !env.isEmpty, FileManager.default.fileExists(atPath: credentialsPath),
+              let text = try? String(contentsOfFile: credentialsPath, encoding: .utf8) else { return false }
+        return text.components(separatedBy: "\n").contains { $0.hasPrefix("  \(env):") || $0.hasPrefix("\(env):") }
+    }
+
+    /// 只读扫描 profile 补丁层(*.patch.yml):返回包含「账本不再认领的 keydrop-*
+    /// 路由」的文件与路由名。补丁层是 Cordis 的私有持久层(每次 bundle 层之后叠加
+    /// 生效,支持 !!js 表达式),KeyDrop 绝不自动改写 —— 只点名报告,
+    /// 清理由用户在 Cordis 界面或显式人工操作完成(真实事故 2026-11-10:11-07
+    /// 导入时固化的 10 个路由里 7 个凭据已丢,settings.yaml 清干净了界面照样堆积)
+    static func patchLayerStaleRoutes(validKeys: Set<String>) -> [(file: String, stale: [String])] {
+        let base = dshHome + "/profiles"
+        guard let en = FileManager.default.enumerator(atPath: base) else { return [] }
+        var out: [(String, [String])] = []
+        for case let rel as String in en where rel.hasSuffix(".patch.yml") {
+            let p = base + "/" + rel
+            guard let text = try? String(contentsOfFile: p, encoding: .utf8) else { continue }
+            var stale: [String] = []
+            for line in text.components(separatedBy: "\n") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                guard t.hasSuffix(":"), t.hasPrefix("keydrop-") else { continue }
+                let r = String(t.dropLast())
+                if !validKeys.contains(r), !stale.contains(r) { stale.append(r) }
+            }
+            if !stale.isEmpty { out.append((p, stale)) }
+        }
+        return out
     }
 
     // MARK: - settings.yaml

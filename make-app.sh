@@ -52,6 +52,9 @@ if [ "${KEYDROP_SKIP_INSTALL:-0}" = "1" ]; then
 fi
 rm -rf "$INSTALL"
 cp -R "$APP_BUNDLE" "$INSTALL"
+# dist 里的构建产物 bundle 必须清掉:它会被 Spotlight 索引,⌘⌴ 搜 "KeyDrop"
+# 会搜出两个 app(2026-11-10 反馈),而且容易误启动旧版本
+rm -rf "$APP_BUNDLE"
 
 # 原地替换资源后通知 LaunchServices，避免继续使用安装前的图标元数据。
 touch "$INSTALL"

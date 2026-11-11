@@ -304,6 +304,15 @@ enum CLI {
             if msgs.isEmpty { print("无需修复") } else { print(msgs.joined(separator: "\n")) }
             return 0
 
+        case "dsh-reconcile":
+            let lines = Core.shared.reconcileDSH()
+            if lines.isEmpty {
+                print("DSH 对账: 无差异,settings.yaml 与账本一致")
+            } else {
+                print(lines.joined(separator: "\n"))
+            }
+            return 0
+
         case "status":
             print("cc-switch DB:  \(CCSwitchWriter.dbPath)")
             print("switch 设置:   \(CCSwitchWriter.switchSettingsPath)")
@@ -737,6 +746,7 @@ enum CLI {
       KeyDrop --refresh <ID前缀>     重新测试并更新模型列表
       KeyDrop --status               查看当前状态
       KeyDrop --self-heal            检查并重建丢失的 cc-switch provider
+      KeyDrop dsh-reconcile          DSH 全量对账:清孤儿路由/修漂移/自愈凭据/检测补丁层残留
       KeyDrop --image-add <key> <url> 导入生图渠道(探测 /v1/images/generations)
                                        [--model 名称] [--no-cpa 强制直连] → 自动注册 claude/codex/opencode MCP
                                        检测到 CPA 配置时:key+模型写入 CPA 独立生图条目

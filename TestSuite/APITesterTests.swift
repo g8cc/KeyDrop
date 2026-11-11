@@ -7,7 +7,7 @@ final class MockHTTPServer {
     var port: Int { listener.port }
 
     enum Mode {
-        case nativeAnthropic, nativeLimited, nativeInvalid, nativeBadModel, nativeMultiple, emptyChat, errorChat
+        case nativeAnthropic, nativeLimited, nativeInvalid, nativeBadModel, nativeMultiple, nativeRetry, emptyChat, errorChat
         case openAI    // 200 {"data":[{id}]}
         case notFound  // 404 空
         case gateway404 // GET 全 404;POST /chat/completions → 404 + JSON error(网关可达,模型校验)
@@ -89,12 +89,16 @@ final class MockHTTPServer {
         // readUntil 收满 \r\n\r\n 即返回,但 URLSession 常把 header+body 一并送达,
         // 所以先判断分隔符之后是否已有 >= content-length 的字节,已有就不再 recv
         // (否则 readBody 会对着已发完的流死等满 SO_RCVTIMEO,4 模型 × 3s 拖死测试)。
-        if [.nativeAnthropic, .nativeLimited, .nativeInvalid, .nativeBadModel, .nativeMultiple].contains(mode) {
+        if [.nativeAnthropic, .nativeLimited, .nativeInvalid, .nativeBadModel, .nativeMultiple, .nativeRetry].contains(mode) {
             if method == "GET", target.hasSuffix("/models") {
                 respond(client, 200, "OK", mode == .nativeMultiple ? #"{"data":[{"id":"claude-sonnet-4-6"},{"id":"claude-opus-4-6"},{"id":"claude-haiku-4-5"}]}"# : #"{"data":[{"id":"claude-sonnet-4-6"}]}"#)
             } else if method == "POST", target.hasSuffix("/messages") {
                 if mode == .nativeInvalid || !req.lowercased().contains("x-api-key: sk-native") || !req.lowercased().contains("anthropic-version: 2023-06-01") {
                     respond(client, 401, "Unauthorized", #"{"type":"error","error":{"type":"authentication_error"}}"#)
+                } else if mode == .nativeRetry {
+                    let body = #"{"error":{"type":"rate_limit_error"}}"#
+                    client.write("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)")
+                    client.close()
                 } else if mode == .nativeLimited {
                     respond(client, 429, "Too Many Requests", #"{"type":"error","error":{"type":"rate_limit_error","message":"AWS queue busy"}}"#)
                 } else if mode == .nativeBadModel {
@@ -516,6 +520,28 @@ final class SocketClient {
 
 enum APITesterTests {
     static func run(_ h: Harness) {
+        h.runSuite("APITester.协议提示与冷却") { t in
+            let native = try! MockHTTPServer(mode: .nativeAnthropic)
+            let base = "http://127.0.0.1:\(native.port)/v1"
+            t.expect(APITester.test(url: base, key: "sk-native0000000001", timeout: 2, styleHint: "anthropic").ok, "直接使用已保存协议")
+            t.equal(native.countRequests("/v1/chat/completions"), 0, "跨轮探测不再试错")
+            let changed = try! MockHTTPServer(mode: .dottedModels)
+            let fallback = APITester.test(url: "http://127.0.0.1:\(changed.port)/v1", key: "sk-test", timeout: 2, styleHint: "anthropic")
+            t.expect(fallback.ok, "保存的协议失效后回退识别")
+            t.equal(fallback.style, "openai", "更新为实际协议")
+            let limited = try! MockHTTPServer(mode: .nativeRetry)
+            let limitedBase = "http://127.0.0.1:\(limited.port)/v1"
+            let first = APITester.test(url: limitedBase, key: "sk-native0000000001", timeout: 2)
+            let second = APITester.test(url: limitedBase, key: "sk-native0000000001", timeout: 2)
+            t.expect(!first.ok && !second.ok && !second.authFailed, "冷却期间保持限流结果")
+            t.equal(limited.countRequests("/v1/messages"), 1, "冷却期间跳过重复聊天请求")
+            t.contains(second.detail, "暂停重复探测", "解释冷却原因")
+            _ = APITester.test(url: limitedBase, key: "sk-native0000000002", timeout: 2)
+            t.equal(limited.countRequests("/v1/messages"), 2, "不同凭据单独冷却")
+            Thread.sleep(forTimeInterval: 1.1)
+            _ = APITester.test(url: limitedBase, key: "sk-native0000000001", timeout: 2)
+            t.equal(limited.countRequests("/v1/messages"), 3, "冷却到期恢复探测")
+        }
         h.runSuite("APITester.验证与请求去重") { t in
             for mode in [MockHTTPServer.Mode.emptyChat, .errorChat] {
                 let server = try! MockHTTPServer(mode: mode)
