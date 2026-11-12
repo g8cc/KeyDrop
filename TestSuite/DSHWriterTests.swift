@@ -43,9 +43,11 @@ enum DSHWriterTests {
                 url: "https://relay-test.example.com",
                 models: ["deepseek-v4-flash-free"]
             )
-            t.equal(route, "keydrop-0219dfa3", "返回 route")
+            t.expect(route.hasPrefix("keydrop-0219dfa3-"), "返回 route 前缀: \(route)")
+            t.contains(route, "relay-test.example.com", "route 含站点")
+            t.contains(route, "deepseek-v4-flash-free", "route 含首选模型")
             let settings = env.read("dsh.yaml")
-            t.contains(settings, "keydrop-0219dfa3:", "provider 块写入")
+            t.contains(settings, "keydrop-0219dfa3-relay-test.example.com-deepseek-v4-flash-free:", "装饰 provider 块写入")
             t.contains(settings, "baseURL: https://relay-test.example.com/v1", "baseURL 规范化写入")
             t.contains(settings, "apiKeyEnv: KEYDROP_0219DFA3_API_KEY", "env 引用")
             t.contains(settings, "- id: deepseek-v4-flash-free", "模型写入")
@@ -63,7 +65,7 @@ enum DSHWriterTests {
                 models: ["deepseek-v4-flash-free", "deepseek-v4-pro-free"]
             )
             let again = env.read("dsh.yaml")
-            let count = again.components(separatedBy: "keydrop-0219dfa3:").count - 1
+            let count = again.components(separatedBy: "\n").filter { $0.hasPrefix("    keydrop-0219dfa3") }.count
             t.equal(count, 1, "幂等:同 provider 单块")
             t.contains(again, "- id: deepseek-v4-pro-free", "新模型合并")
 
@@ -83,7 +85,7 @@ enum DSHWriterTests {
             )
             let coexist = env.read("dsh.yaml")
             t.contains(coexist, "cpa:", "原块保留")
-            t.contains(coexist, "keydrop-ab12cd34:", "新块追加")
+            t.contains(coexist, "keydrop-ab12cd34-api.deepseek.com-deepseek-v4-flash:", "新块追加(装饰名)")
 
             // 读失败(非 UTF-8)必须抛错,绝不能当空文件整体覆盖 → 清空其它 provider
             let env2 = try! TestEnv("dsh-readfail")

@@ -20,6 +20,32 @@ public enum DSHWriter {
     public static func routeKey(providerID: String) -> String {
         "keydrop-" + String(providerID.prefix(8))
     }
+
+    /// 面板可见的装饰路由名:keydrop-<id8>-<host>-<首选模型>。
+    /// 唯一键仍是 id8 —— 删除/对账按「keydrop-<id8> 前缀家族」认领;
+    /// url/models 变化时写入端先摘旧装饰名再挂新名(改名而非残留)。
+    /// 用户反馈(2026-11-12):DSH 里一排 keydrop-xxxx 得逐个点开才知道是什么
+    public static func displayRouteKey(providerID: String, url: String?, models: [String]) -> String {
+        let base = routeKey(providerID: providerID)
+        let host = (URL(string: url ?? "")?.host ?? "unknown").lowercased()
+        let model = models.first { !$0.isEmpty } ?? ""
+        var slug = model.isEmpty ? host : "\(host)-\(model)"
+        slug = String(slug.map { ch -> Character in
+            let s = String(ch)
+            return s.range(of: "[A-Za-z0-9._-]", options: .regularExpression) != nil ? ch : "-"
+        })
+        while slug.contains("--") { slug = slug.replacingOccurrences(of: "--", with: "-") }
+        while slug.hasPrefix("-") { slug.removeFirst() }
+        while slug.hasSuffix("-") { slug.removeLast() }
+        if slug.count > 72 { slug = String(slug.prefix(72)) }
+        return slug.isEmpty ? base : base + "-" + slug
+    }
+
+    /// 该 provider 的路由家族:基础名或任一装饰名
+    static func isOwnedRoute(_ name: String, providerID: String) -> Bool {
+        let base = routeKey(providerID: providerID)
+        return name == base || name.hasPrefix(base + "-")
+    }
     public static func envName(providerID: String) -> String {
         "KEYDROP_" + String(providerID.prefix(8)).uppercased() + "_API_KEY"
     }
@@ -70,7 +96,7 @@ public enum DSHWriter {
     }
 
     private static func addLocked(providerID: String, key: String, url: String, models: [String]) throws -> String {
-        let route = routeKey(providerID: providerID)
+        let route = displayRouteKey(providerID: providerID, url: url, models: models)
         let env = envName(providerID: providerID)
 
         backupFile(settingsPath)
@@ -78,7 +104,7 @@ public enum DSHWriter {
         var settings = try readExisting(settingsPath)
         var creds = try readExisting(credentialsPath)
 
-        removeRoute(&settings, route: route)
+        removeRoutesForID(&settings, providerID: providerID)
         removeCredential(&creds, env: env)
         try upsertSettings(&settings, route: route, env: env, url: url, models: models)
         try upsertCredential(&creds, env: env, value: key)
@@ -107,7 +133,9 @@ public enum DSHWriter {
     /// 迁移留下的无主路由 —— DSH 设置页会堆积一堆「自定义」provider 且搜不到模型
     /// (凭据已缺失)。非 keydrop- 前缀的路由是用户手配,永不触碰
     /// (与 routesForEndpoint 的约定一致)。返回清理掉的路由名。
-    public static func pruneOrphanRoutes(validRouteKeys: Set<String>) throws -> [String] {
+    /// - Parameter claimedBases: 账本认领的 id8 基名(不含 "keydrop-" 前缀,
+    ///   含 "cparesid");路由名等于 keydrop-<base> 或以 keydrop-<base>- 开头即视为认领
+    public static func pruneOrphanRoutes(claimedBases: Set<String>) throws -> [String] {
         guard FileManager.default.fileExists(atPath: settingsPath) else { return [] }
         return try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
             var settings = try readExisting(settingsPath)
@@ -130,7 +158,12 @@ public enum DSHWriter {
                 }
             }
             let orphans = routeEnvs.keys
-                .filter { $0.hasPrefix("keydrop-") && !validRouteKeys.contains($0) }
+                .filter { name in
+                    guard name.hasPrefix("keydrop-") else { return false }
+                    let base = String(name.dropFirst("keydrop-".count))
+                    let bare = base.contains("-") ? String(base[..<base.firstIndex(of: "-")!]) : base
+                    return !claimedBases.contains(base) && !claimedBases.contains(bare)
+                }
                 .sorted()
             guard !orphans.isEmpty else { return [] }
             backupFile(settingsPath)
@@ -149,7 +182,6 @@ public enum DSHWriter {
     }
 
     private static func removeLocked(providerID: String) throws {
-        let route = routeKey(providerID: providerID)
         let env = envName(providerID: providerID)
 
         backupFile(settingsPath)
@@ -158,7 +190,7 @@ public enum DSHWriter {
         // 照常摘掉 dsh tag,settings/creds 里的 route 与明文 key 永久残留且无账本指针
         if FileManager.default.fileExists(atPath: settingsPath) {
             var settings = try readExisting(settingsPath)
-            removeRoute(&settings, route: route)
+            removeRoutesForID(&settings, providerID: providerID)
             try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
         }
         if FileManager.default.fileExists(atPath: credentialsPath) {
@@ -169,6 +201,19 @@ public enum DSHWriter {
             // 0600 重置成全员可读 —— 凭证文件里还有其他 provider 的明文 key,必须重设权限
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
         }
+    }
+
+    /// 摘除该 provider 的全部路由块(含历史装饰名):id8 前缀家族匹配
+    private static func removeRoutesForID(_ text: inout String, providerID: String) {
+        let lines = text.components(separatedBy: "\n")
+        let names = Set(lines.compactMap { line -> String? in
+            guard line.hasPrefix("    "), !line.hasPrefix("      ") else { return nil }
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.hasSuffix(":") else { return nil }
+            let name = String(t.dropLast())
+            return isOwnedRoute(name, providerID: providerID) ? name : nil
+        })
+        for n in names.sorted() { removeRoute(&text, route: n) }
     }
 
     /// YAML 标量:普通 URL/模型名/key 保持裸写(兼容既有格式与消费方),
@@ -307,7 +352,7 @@ public enum DSHWriter {
     /// 生效,支持 !!js 表达式),KeyDrop 绝不自动改写 —— 只点名报告,
     /// 清理由用户在 Cordis 界面或显式人工操作完成(真实事故 2026-11-10:11-07
     /// 导入时固化的 10 个路由里 7 个凭据已丢,settings.yaml 清干净了界面照样堆积)
-    static func patchLayerStaleRoutes(validKeys: Set<String>) -> [(file: String, stale: [String])] {
+    static func patchLayerStaleRoutes(claimedBases: Set<String>) -> [(file: String, stale: [String])] {
         let base = dshHome + "/profiles"
         guard let en = FileManager.default.enumerator(atPath: base) else { return [] }
         var out: [(String, [String])] = []
@@ -319,7 +364,12 @@ public enum DSHWriter {
                 let t = line.trimmingCharacters(in: .whitespaces)
                 guard t.hasSuffix(":"), t.hasPrefix("keydrop-") else { continue }
                 let r = String(t.dropLast())
-                if !validKeys.contains(r), !stale.contains(r) { stale.append(r) }
+                guard r.hasPrefix("keydrop-") else { continue }
+                let base = String(r.dropFirst("keydrop-".count))
+                let bare = base.contains("-") ? String(base[..<base.firstIndex(of: "-")!]) : base
+                if !claimedBases.contains(base) && !claimedBases.contains(bare), !stale.contains(r) {
+                    stale.append(r)
+                }
             }
             if !stale.isEmpty { out.append((p, stale)) }
         }

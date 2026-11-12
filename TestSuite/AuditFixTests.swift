@@ -413,6 +413,180 @@ enum AuditFixTests {
             t.expect(y.terminationStatus == 0, "清理后 YAML 合法")
         }
 
+        // 账本外部变更通知:CLI/另一进程写入 → 目录监听触发回调并重载。
+        // 此前面板只在「本进程操作后」刷新,外部写入要手动点什么才可见
+        h.runSuite("Audit.账本外部变更通知") { t in
+            let env = try! TestEnv("audit-extwatch")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            let sem = DispatchSemaphore(value: 0)
+            store.onExternalChange = { sem.signal() }
+            let e1 = HistoryEntry(
+                id: "watch1111-1111-1111-111111111111", ts: 1,
+                raw: "https://w.example.com/v1\nsk-watch-key-0000001", format: "multiline",
+                name: "w1", url: "https://w.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-watch-key-0000001", keyMasked: "sk-w…",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! store.append(e1)
+            // 第二个实例模拟另一进程(CLI/另一端)的完整保存管线(replaceItemAt 换 inode)
+            let other = HistoryStore()
+            let e2 = HistoryEntry(
+                id: "watch2222-2222-2222-222222222222", ts: 2,
+                raw: "https://w2.example.com/v1\nsk-watch-key-0000002", format: "multiline",
+                name: "w2", url: "https://w2.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-watch-key-0000002", keyMasked: "sk-w…",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! other.append(e2)
+            let fired = sem.wait(timeout: .now() + 6) == .success
+            t.expect(fired, "外部写入触发通知")
+            t.equal(store.snapshot().count, 2, "通知后已重载外部条目")
+        }
+
+        // 装饰路由名:keydrop-<id8>-<host>-<模型>,一眼可见;改模型即改名且总量守恒
+        h.runSuite("Audit.DSH 装饰路由名") { t in
+            let env = try! TestEnv("audit-dsh-decor")
+            defer { env.cleanup() }
+            let core = Core()
+            var e = HistoryEntry(
+                id: "decor1111-1111-1111-111111111111", ts: 1,
+                raw: "https://abc.example.com/v1\nsk-decor-key-0000001", format: "multiline",
+                name: "d", url: "https://abc.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-decor-key-0000001", keyMasked: "sk-d…",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! core.history.append(e)
+            _ = try! core.syncToDSH(entryIDPrefix: "decor1111")
+            var cfg = env.read("dsh.yaml")
+            t.contains(cfg, "keydrop-decor111-abc.example.com-deepseek-v4.1:", "装饰名含站点与模型")
+            // 改模型再同步:旧装饰名摘除、新名挂上,路由总量守恒
+            e.models = ["deepseek-v4.1-flash-1017"]
+            e.targets = ["dsh"]
+            try! core.history.update(e)
+            _ = try! core.syncToDSH(entryIDPrefix: "decor1111")
+            cfg = env.read("dsh.yaml")
+            t.expect(!cfg.contains("keydrop-decor111-abc.example.com-deepseek-v4.1:"), "旧装饰名摘除")
+            t.contains(cfg, "keydrop-decor111-abc.example.com-deepseek-v4.1-flash-1017:", "新装饰名挂上")
+            let n = cfg.components(separatedBy: "\n").filter { $0.hasPrefix("    keydrop-") }.count
+            t.equal(n, 1, "改名后仍单块,实际 \(n)")
+        }
+
+        // 行 hover 提示:信息密度(界面行保持紧凑,信息全在悬浮层)
+        h.runSuite("Audit.行 hover 提示") { t in
+            var e = HistoryEntry(
+                id: "tip111111-1111-1111-111111111111", ts: 1_760_000_000,
+                raw: "https://x.example.com/v1\nsk-tip-key-00000001", format: "multiline",
+                name: "tip", url: "https://x.example.com/v1", model: nil,
+                models: ["deepseek-v4.1", "glm-5.3-flash"], key: "sk-tip-key-00000001",
+                keyMasked: "sk-t…4321", targets: ["ccswitch", "cpa", "dsh"],
+                ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active",
+                health: "ok", healthDetail: "GET → 200, 2 个模型", healthAt: 1_760_000_500,
+                latencyMs: 850, failStreak: 2, viaCPAOk: false, viaCPAAt: 1_760_000_600,
+                probeLog: [ProbePoint(t: 1_760_000_000, ms: 900, ok: true),
+                           ProbePoint(t: 1_760_000_300, ms: nil, ok: true)])
+            e.verifyVerdict = "中端级"
+            e.note = "备注内容"
+            let tip = e.richTooltip
+            t.contains(tip, "https://x.example.com/v1")
+            t.contains(tip, "模型: deepseek-v4.1 / glm-5.3-flash")
+            t.contains(tip, "key: sk-t…4321")
+            t.contains(tip, "状态: 可用 · GET → 200, 2 个模型")
+            t.contains(tip, "延迟 850ms")
+            t.contains(tip, "uptime 100%")
+            t.contains(tip, "连续失败 2 次")
+            t.contains(tip, "CPA 链路: ✗ 异常")
+            t.contains(tip, "真伪鉴定: 中端级")
+            t.contains(tip, "cc-switch(Claude) · CPA · DeepSeek Harness")
+        }
+
+        // CPA 生命周期守恒:账本 cpa 认领与 config.yaml 的 key 一一对应,删除即回收
+        h.runSuite("Audit.CPA 生命周期守恒") { t in
+            let env = try! TestEnv("audit-cpa-invariant")
+            defer { env.cleanup() }
+            let core = Core()
+            let cfgPath = env.dir + "/cpa-config.yaml"
+            env.write("cpa-config.yaml", "port: 18317\n")
+            let e1 = HistoryEntry(
+                id: "inv1aaaa-1111-1111-111111111111", ts: 1,
+                raw: "https://inv1.example.com/v1\nsk-inv1-key-00000001", format: "multiline",
+                name: "i1", url: "https://inv1.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-inv1-key-00000001", keyMasked: "sk-i1…",
+                targets: ["cpa"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: cfgPath, status: "active")
+            let e2 = HistoryEntry(
+                id: "inv2bbbb-2222-2222-222222222222", ts: 2,
+                raw: "https://inv2.example.com/v1\nsk-inv2-key-00000002", format: "multiline",
+                name: "i2", url: "https://inv2.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-inv2-key-00000002", keyMasked: "sk-i2…",
+                targets: ["cpa"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: cfgPath, status: "active")
+            try! core.history.append(e1)
+            try! core.history.append(e2)
+            // 直接播种 KeyDrop 写入格式的聚合条目(addAggregated 是 internal,
+            // 测试目标不可见;守恒断言关注删除侧的回收,与谁写入无关)
+            env.write("cpa-config.yaml", """
+            port: 18317
+
+            openai-compatibility:
+              - name: inv1.example.com
+                base-url: "https://inv1.example.com/v1"
+                api-key-entries:
+                  - api-key: sk-inv1-key-00000001
+                models:
+                  - name: deepseek-v4.1
+                    alias: ""
+              - name: inv2.example.com
+                base-url: "https://inv2.example.com/v1"
+                api-key-entries:
+                  - api-key: sk-inv2-key-00000002
+                models:
+                  - name: deepseek-v4.1
+                    alias: ""
+            """)
+            var cfg = env.read("cpa-config.yaml")
+            t.contains(cfg, "sk-inv1-key-00000001", "基线:key1 在配置")
+            t.contains(cfg, "sk-inv2-key-00000002", "基线:key2 在配置")
+
+            let msg = try! core.delete(entryIDPrefix: "inv1aaaa")
+            cfg = env.read("cpa-config.yaml")
+            t.expect(!cfg.contains("sk-inv1-key-00000001"), "删除后 key1 回收: \(msg.prefix(80))")
+            t.contains(cfg, "sk-inv2-key-00000002", "未删条目的 key 保留")
+            t.equal(core.history.find(idPrefix: "inv1aaaa")?.status, "deleted", "账本同步标记删除")
+            let y = Process()
+            y.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            y.arguments = ["-c", "import yaml; yaml.safe_load(open('\(env.dir)/cpa-config.yaml'))"]
+            try? y.run(); y.waitUntilExit()
+            t.expect(y.terminationStatus == 0, "删除后 YAML 合法")
+        }
+
+        // Grok 生命周期守恒:两个 provider 共存,删除其一带走自己的路由
+        h.runSuite("Audit.Grok 生命周期守恒") { t in
+            let env = try! TestEnv("audit-grok-invariant")
+            defer { env.cleanup() }
+            let core = Core()
+            let cfgPath = env.dir + "/grok-config.toml"
+            let w = GrokBuildWriter(configPath: cfgPath)
+            _ = try! w.add(baseURL: "https://g1.example.com/v1", key: "sk-grok1-key-0000001", models: ["grok-4-fast"])
+            _ = try! w.add(baseURL: "https://g2.example.com/v1", key: "sk-grok2-key-0000002", models: ["grok-4-fast"])
+            var cfg = env.read("grok-config.toml")
+            t.contains(cfg, "g1.example.com", "基线:provider1 在配置")
+            t.contains(cfg, "g2.example.com", "基线:provider2 在配置")
+            let e1 = HistoryEntry(
+                id: "groc1aaa-1111-1111-111111111111", ts: 1,
+                raw: "https://g1.example.com/v1\nsk-grok1-key-0000001", format: "multiline",
+                name: "g1", url: "https://g1.example.com/v1", model: nil,
+                models: ["grok-4-fast"], key: "sk-grok1-key-0000001", keyMasked: "sk-g1…",
+                targets: ["grok"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, grokConfigPath: cfgPath, status: "active")
+            try! core.history.append(e1)
+            _ = try! core.delete(entryIDPrefix: "groc1aaa")
+            cfg = env.read("grok-config.toml")
+            t.expect(!cfg.contains("g1.example.com"), "删除后 provider1 路由回收")
+            t.contains(cfg, "g2.example.com", "provider2 保留")
+        }
+
         // DSH 全生命周期对账(与 cc-switch 同级):守恒/漂移修复/凭据自愈/缺失报告/补丁层检测
         h.runSuite("Audit.DSH 全生命周期对账") { t in
             let env = try! TestEnv("audit-dsh-full")

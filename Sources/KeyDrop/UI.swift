@@ -3,6 +3,19 @@ import AppKit
 import SwiftUI
 import UserNotifications
 
+/// 把可能长时间阻塞的同步调用挪出 Swift 协作线程池。协作池宽度 ≈ CPU 核数,
+/// pickModels 等待用户(最长 120s)/健康扫描(数分钟)/真伪鉴定(7×40s)各占死
+/// 一个就会饿死其它 detached 任务;GCD 工作线程按需创建,可安全阻塞。
+/// 取消语义:外层 Task 取消后 GCD 闭包仍会跑完(与 Task.detached 相同的取舍)。
+func runOffPool<T>(qos: DispatchQoS.QoSClass = .userInitiated, _ work: @escaping () throws -> T) async throws -> T {
+    try await withCheckedThrowingContinuation { cont in
+        DispatchQueue.global(qos: qos).async {
+            do { cont.resume(returning: try work()) }
+            catch { cont.resume(throwing: error) }
+        }
+    }
+}
+
 final class AppState: ObservableObject {
     deinit {
         // 卫生清理:timer 不 invalidate 会留在 runloop 空转;task 不 cancel 会延迟触发 weak no-op
@@ -118,9 +131,9 @@ final class AppState: ObservableObject {
                 // 它(否则回退路径会被静默吞掉,用户粘贴普通链接点导入毫无反应)
                 var proxies: [ClashProxy]? = nil
                 do {
-                    proxies = try await Task.detached(priority: .userInitiated) {
+                    proxies = try await runOffPool {
                         try Core.fetchSubscriptionProxies(url: trimmed)
-                    }.value
+                    }
                 } catch {
                     proxies = []
                 }
@@ -177,7 +190,7 @@ final class AppState: ObservableObject {
             busyLabel = ""
         }
         do {
-            let outcome = try await Task.detached(priority: .userInitiated) { () throws -> AddOutcome in
+            let outcome = try await runOffPool { () throws -> AddOutcome in
                 try Core.shared.add(
                     raw: raw,
                     ccOverride: Prefs.shared.useCC,
@@ -187,7 +200,7 @@ final class AppState: ObservableObject {
                 ) { options in
                     self.pickModelsSync(options)
                 }
-            }.value
+            }
             input = ""
             highlightID = nil
             setStatus(outcome.lines.joined(separator: "\n"), ok: outcome.ok)
@@ -287,9 +300,9 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) {
+                let msg = try await runOffPool {
                     try Core.shared.delete(entryIDPrefix: id)
-                }.value
+                }
                 setStatus(msg, ok: true)
                 historyVersion += 1
                 highlightID = nil
@@ -325,7 +338,7 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let r = try await Task.detached(priority: .userInitiated) {
+                let r = try await runOffPool {
                     let r = try Core.addClashProxies(valid)
                     let entry = HistoryEntry(
                         id: UUID().uuidString.lowercased(),
@@ -345,7 +358,7 @@ final class AppState: ObservableObject {
                     try Core.shared.history.append(entry)
                     try Core.shared.prefs.save()
                     return r
-                }.value
+                }
                 setStatus(r.message, ok: true)
                 historyVersion += 1
             } catch {
@@ -371,7 +384,7 @@ final class AppState: ObservableObject {
             defer { verifyingID = nil }
             // find + update(全量历史落盘,flock)在后台做:大账本下同步写会让
             // 主线程卡几十到上百毫秒(与 doAddClashProxies 同一处理)
-            let (verdict, lines) = await Task.detached(priority: .userInitiated) { () -> (String, [String]) in
+            let (verdict, lines) = try await runOffPool { () -> (String, [String]) in
                 let report = AuthenticityProbe.run(base: url, key: key, model: model,
                                                    proxy: Core.shared.proxyForHealthPublic(), timeout: 40)
                 if var e = self.core.history.find(idPrefix: id) {
@@ -379,7 +392,7 @@ final class AppState: ObservableObject {
                     try? self.core.history.update(e)
                 }
                 return (report.verdict, report.lines)
-            }.value
+            }
             verifyVerdicts[id] = verdict
             verifyReports[id] = lines
             // 结论已持久化到条目:重启后行图标仍着色,重复鉴定有历史可对照
@@ -400,11 +413,11 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) { () throws -> String in
+                let msg = try await runOffPool { () throws -> String in
                     try Core.shared.refreshModels(entryIDPrefix: id) { options in
                         self.pickModelsSync(options)
                     }
-                }.value
+                }
                 setStatus(msg, ok: true)
                 historyVersion += 1
                 notify(summary: "KeyDrop 刷新完成", body: msg)
@@ -438,12 +451,12 @@ final class AppState: ObservableObject {
         let prevBase = Prefs.shared.cpaAPIBase
         Task { @MainActor in
             defer { busyLabel = "" }
-            let ok: Bool = await Task.detached(priority: .userInitiated) { () -> Bool in
+            let ok: Bool = try await runOffPool { () -> Bool in
                 Prefs.shared.cpaManagementKey = key
                 Prefs.shared.cpaAPIBase = base.isEmpty ? nil : base
                 guard let (_, data) = try? CPAAPI.request("GET", "v0/management/config.yaml") else { return false }
                 return data.count > 0
-            }.value
+            }
             cpaAPIOk = ok
             if ok {
                 // 真实事故(2026-09-22):此前漏调 Prefs.save(),密钥只存在内存,
@@ -479,9 +492,9 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) { () throws -> String in
+                let msg = try await runOffPool { () throws -> String in
                     try Core.shared.activateCPA(entryIDPrefix: id)
-                }.value
+                }
                 setStatus(msg, ok: true)
                 historyVersion += 1
                 notify(summary: "CPA 已激活", body: msg)
@@ -501,9 +514,9 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) { () throws -> String in
+                let msg = try await runOffPool { () throws -> String in
                     try Core.shared.reimportToCC(entryIDPrefix: id)
-                }.value
+                }
                 setStatus(msg, ok: true)
                 historyVersion += 1
                 notify(summary: "已重新导入", body: msg)
@@ -525,9 +538,9 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) {
+                let msg = try await runOffPool {
                     try Core.shared.syncTarget(entryIDPrefix: id, target: target)
-                }.value
+                }
                 setStatus(msg, ok: true)
                 historyVersion += 1
                 notify(summary: "\(label) 同步完成", body: msg)
@@ -562,14 +575,14 @@ final class AppState: ObservableObject {
                 editShown = true
             }
             do {
-                let picked = try await Task.detached(priority: .userInitiated) { () throws -> [String] in
+                let picked = try await runOffPool { () throws -> [String] in
                     let options = try Core.shared.probeModels(entryIDPrefix: entry.id)
                     guard !options.isEmpty else {
                         throw NSError(domain: "KeyDrop", code: 1,
                                       userInfo: [NSLocalizedDescriptionKey: "该端点未返回模型列表,请手输模型名"])
                     }
                     return self.pickModelsSync(options)
-                }.value
+                }
                 if picked.isEmpty {
                     setStatus("已取消勾选,模型未改动", ok: true)
                 } else {
@@ -605,7 +618,7 @@ final class AppState: ObservableObject {
                 busyLabel = ""
             }
             do {
-                let msg = try await Task.detached(priority: .userInitiated) { () throws -> String in
+                let msg = try await runOffPool { () throws -> String in
                     try Core.shared.editEntry(
                         entryIDPrefix: entry.id,
                         models: models.isEmpty ? nil : models,
@@ -613,7 +626,7 @@ final class AppState: ObservableObject {
                         key: newKey.isEmpty ? nil : newKey,
                         note: note.isEmpty ? nil : note
                     )
-                }.value
+                }
                 setStatus(msg, ok: true)
                 historyVersion += 1
                 notify(summary: "已保存编辑", body: msg)
@@ -640,9 +653,9 @@ final class AppState: ObservableObject {
                     busyLabel = ""
                 }
                 do {
-                    let msg = try await Task.detached(priority: .userInitiated) {
+                    let msg = try await runOffPool {
                         try Core.shared.activateCPA(entryIDPrefix: entryID)
-                    }.value
+                    }
                     setStatus(msg, ok: true)
                     historyVersion += 1
                     Self.openTerminal(cmd)
@@ -737,7 +750,7 @@ final class AppState: ObservableObject {
                 self?.syncing = false
                 self?.historyVersion += 1
             }
-            await Task.detached(priority: .utility) { [weak self] in
+            try await runOffPool(qos: .utility) { [weak self] in
                 do {
                     if autoPull {
                         let msg = try Core.shared.webdavPull(replay: true, onlyIfNewer: true)
@@ -753,7 +766,7 @@ final class AppState: ObservableObject {
                 } catch {
                     AppLog.error("WebDAV 自动同步失败: \(error.localizedDescription)")
                 }
-            }.value
+            }
         }
     }
 
@@ -762,7 +775,7 @@ final class AppState: ObservableObject {
         guard !healthScanRunning else { return }
         healthScanRunning = true
         lastHealthScanAt = Date()
-        Task.detached(priority: .userInitiated) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // OAuth 账号代理绑定提醒:只数数 + 落日志,绝不自动改 auth 文件
             // (批量写另一个应用的凭证必须显式触发;粘性设计保证手动重跑永远安全)。
             // 放在 UI 层巡检而非 Core.scanHealth:测试套件跑得到 Core,碰不到 AppState,
@@ -815,9 +828,9 @@ final class AppState: ObservableObject {
             var failed: [String] = []
             for id in ids {
                 do {
-                    let msg = try await Task.detached(priority: .userInitiated) {
+                    let msg = try await runOffPool {
                         try Core.shared.delete(entryIDPrefix: id)
-                    }.value
+                    }
                     AppLog.info("清除失效: \(msg)")
                 } catch {
                     failed.append("\(id.prefix(8)) \(error.localizedDescription)")
@@ -1296,6 +1309,9 @@ struct HistoryRow: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
+        // 行 hover:URL/模型/key 掩码/健康详情/延迟/uptime/CPA 链路/鉴定/写入目标
+        // (行本身保持紧凑,信息全放悬浮层)
+        .help(entry.richTooltip)
         .opacity(highlighted ? flashOpacity : 1)
         .background(
             RoundedRectangle(cornerRadius: 8)
@@ -1634,7 +1650,7 @@ struct EditView: View {
         probeVerdict = nil
         probeReport = []
         let pid = entry.ccProviderID
-        Task.detached(priority: .userInitiated) {
+        DispatchQueue.global(qos: .userInitiated).async {
             let report = AuthenticityProbe.run(base: url, key: effectiveKey, model: model,
                                                proxy: nil, timeout: 40)
             DispatchQueue.main.async {
@@ -2639,7 +2655,7 @@ struct PanelView: View {
             // (面板无响应,进度条也不动)。读完后回主线程赋值并触发导入。
             let urls = pendingURLs
             Task { @MainActor in
-                let (contents, skipped) = await Task.detached(priority: .userInitiated) { () -> ([String], Int) in
+                let (contents, skipped) = try await runOffPool { () -> ([String], Int) in
                     var contents: [String] = []
                     var skipped = 0
                     let maxBytes = 8_000_000
@@ -2654,7 +2670,7 @@ struct PanelView: View {
                         contents.append(s)
                     }
                     return (contents, skipped)
-                }.value
+                }
                 guard !state.isBusy else { return }
                 if skipped > 0 {
                     state.setStatus("部分拖入文件无法按文本读取(\(skipped) 个,二进制或超过 8MB),已导入其余文件", ok: false)
@@ -3137,7 +3153,7 @@ struct SettingsSheet: View {
         saveWebDAV()
         syncing = true
         davStatus = push ? "推送中…" : "拉取中…"
-        Task.detached(priority: .userInitiated) {
+        DispatchQueue.global(qos: .userInitiated).async {
             let msg: String
             do {
                 msg = push ? try Core.shared.webdavPush() : try Core.shared.webdavPull()

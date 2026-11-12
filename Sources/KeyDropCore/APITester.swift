@@ -270,6 +270,8 @@ public enum APITester {
 
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
+            // 不可达(DNS/拒连/离线/TLS)→ 备用候选必同败,不再等满第二个超时
+            if status == 0, NetSync.isUnreachable(o) { break }
             let data = o.data
             let body = String(data: data ?? Data(), encoding: .utf8) ?? ""
             let isJSON = isJSONBody(body)
@@ -565,7 +567,11 @@ public enum APITester {
             if native, status == 400 { return ChatProbeOutcome(style: "anthropic", degraded: status) }
             if status == 404 || status == 405 { continue }
             if status == 403 { continue }   // 盾页/地域封锁:跳过本候选,不误判 authFailed
-            if status == 0 { sawNetworkError = true; continue }
+            if status == 0 {
+                if NetSync.isUnreachable(o) { return ChatProbeOutcome(networkError: true) }
+                sawNetworkError = true
+                continue
+            }
             if status == 429 || status == 402 {
                 let low = body.lowercased()
                 if low.contains("quota") || low.contains("exhausted") || low.contains("balance") || low.contains("insufficient") {
@@ -623,6 +629,10 @@ public enum APITester {
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
+            if status == 0, NetSync.isUnreachable(o) {
+                lastDesc = "POST \(base)\(path) → 连接不可达"
+                break
+            }
             let ok = status == 400
                 || (status == 200 && isJSONBody(body))
                 || (status == 404 && isGatewayErrorBody(body))
@@ -796,6 +806,10 @@ public enum APITester {
             }
             if status != 0 {
                 return (false, "POST \(base)\(path) → HTTP \(status)" + (body.isEmpty ? "" : " \(body.prefix(80))"))
+            }
+            // 不可达:同 host 的备用路径与 anthropic 回退都必同败
+            if NetSync.isUnreachable(o) {
+                return (false, "POST \(base)\(path) → 连接不可达")
             }
         }
         if styleHint == nil, model.lowercased().hasPrefix("claude-") {

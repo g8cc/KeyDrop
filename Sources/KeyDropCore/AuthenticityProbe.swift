@@ -252,6 +252,8 @@ public enum AuthenticityProbe {
             ])
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
+            // 同 host 的备用协议路径必同败:不可达直接放弃本次鉴定,不再等满剩余超时
+            if status == 0, NetSync.isUnreachable(o) { return nil }
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             guard status == 200, !APITester.isHTMLBody(body) else { continue }
             guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],
@@ -277,6 +279,8 @@ public enum AuthenticityProbe {
             ])
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
+            // 同 host 的备用协议路径必同败:不可达直接放弃本次鉴定,不再等满剩余超时
+            if status == 0, NetSync.isUnreachable(o) { return nil }
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             guard status == 200, !APITester.isHTMLBody(body) else { continue }
             guard let obj = try? JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any],

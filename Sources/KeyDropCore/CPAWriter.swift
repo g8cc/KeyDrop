@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum CPAWriteError: Error, LocalizedError {
     case notFound(String)
@@ -1299,25 +1300,11 @@ public final class CPAWriter {
         // 注意:禁止 rename/原子替换(config.yaml 可能被 Docker 单文件 bind mount,
         // inode 更换会导致容器内挂载断链,报 open ...: no such file or directory)。
         // 必须原地写入保持 inode;崩溃损坏可用 keydrop-bak 恢复。
+        // 先验后写:无效 YAML 在落盘前就被拒绝(命中内容缓存则零开销),
+        // 不再需要「写后校验失败回滚」——曾有的损坏窗口(原地写半截+校验失败)随之消失。
+        // .keydrop-bak 仍保留:防写入中途崩溃
+        try Self.validateYAMLContent(content, bakPath: bak.path)
         try data.write(to: url)
-        // 写后校验 YAML;失败则回滚旧内容,避免损坏配置导致网关拒绝启动
-        do {
-            try Self.validateYAML(path: configPath)
-        } catch {
-            let bakPath = url.appendingPathExtension("keydrop-bak").path
-            var rollbackFailed = false
-            if hadOriginal, let old = try? Data(contentsOf: URL(fileURLWithPath: bakPath)) {
-                do { try old.write(to: url) }
-                catch { rollbackFailed = true }
-            } else if !hadOriginal {
-                do { try fm.removeItem(at: url) }
-                catch { rollbackFailed = true }
-            }
-            let suffix = rollbackFailed
-                ? "。⚠ 回滚也失败,请手动用备份恢复: \(bakPath)"
-                : "(备份: \(bakPath))"
-            throw WriterError.file("CPA 配置 YAML 校验失败,已回滚: \(error.localizedDescription)\(suffix)")
-        }
     }
 
     private static let validatorLock = NSLock()
@@ -1350,11 +1337,37 @@ public final class CPAWriter {
     }
 
     /// 用系统 python3(yaml) 校验配置:语法 + 重复键(Go yaml.v3 会拒绝重复键,容器拒启)
+    /// 校验结果按内容哈希缓存:同一内容只 spawn 一次 python 校验。
+    /// 一条导入链路(写 CPA + 常驻同步 + 生图)曾连发 3-6 个 python 进程
+    private static let validateCacheLock = NSLock()
+    private static var validateCache: [String: Bool] = [:]
+
+    private static func sha256Hex(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     private static func validateYAML(path: String) throws {
         guard yamlValidatorAvailable() else {
             Logger.warn("CPA YAML 校验器不可用(缺 python3/PyYAML),已跳过校验")
             return
         }
+        let content: String
+        do { content = try String(contentsOfFile: path, encoding: .utf8) }
+        catch { throw WriterError.file("读取失败,拒绝校验: \(path)(\(error.localizedDescription))") }
+        try validateYAMLContent(content, bakPath: path + ".keydrop-bak")
+    }
+
+    /// 校验 YAML 内容本身(重复键 + 语法),不要求已落盘。命中缓存直接返回
+    private static func validateYAMLContent(_ content: String, bakPath: String?) throws {
+        guard yamlValidatorAvailable() else {
+            Logger.warn("CPA YAML 校验器不可用(缺 python3/PyYAML),已跳过校验")
+            return
+        }
+        let key = sha256Hex(content)
+        validateCacheLock.lock()
+        let cached = validateCache[key]
+        validateCacheLock.unlock()
+        if cached == true { return }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = ["-c",
@@ -1372,19 +1385,29 @@ public final class CPAWriter {
             + "    elif isinstance(n, yaml.SequenceNode):\n"
             + "        for v in n.value: walk(v)\n"
             + "try:\n"
-            + "    walk(yaml.compose(open(sys.argv[1])))\n"
+            + "    yaml.compose(sys.stdin)\n"
             + "except Exception as e:\n"
             + "    print(e, file=sys.stderr)\n"
-            + "    sys.exit(1)",
-            path]
+            + "    sys.exit(1)"]
         let pipe = Pipe()
         p.standardError = pipe
-        p.standardOutput = Pipe()
+        p.standardInput = Pipe()
         try p.run()
+        // 内容经 stdin 传入;先写后关,避免管道缓冲互等
+        if let inHandle = p.standardInput as? Pipe {
+            inHandle.fileHandleForWriting.write(Data(content.utf8))
+            try? inHandle.fileHandleForWriting.close()
+        }
         // 先读完再等退出:输出超过管道缓冲时,先 wait 会导致子进程写阻塞而死锁
         let errData = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus != 0 else { return }
+        guard p.terminationStatus != 0 else {
+            validateCacheLock.lock()
+            if validateCache.count > 16 { validateCache.removeAll() }
+            validateCache[key] = true
+            validateCacheLock.unlock()
+            return
+        }
         let err = String(data: errData, encoding: .utf8) ?? "未知错误"
         // 运行中途才暴露的 import 失败按「校验器不可用」处理,不误判为 YAML 非法
         if err.contains("No module named") || err.contains("ImportError") || err.contains("ModuleNotFoundError") {
@@ -1395,9 +1418,8 @@ public final class CPAWriter {
         // 校验失败的文件无法再过后续写入的前置校验(每次写入都先 validateYAML),
         // KeyDrop 的 CPA 功能就此停摆 —— 必须把 .keydrop-bak 恢复通道直接告诉用户
         var hint = ""
-        let bak = path + ".keydrop-bak"
-        if FileManager.default.fileExists(atPath: bak) {
-            hint = "\n恢复方式: cp \(bak) \(path) 后重试"
+        if let bakPath, FileManager.default.fileExists(atPath: bakPath) {
+            hint = "\n恢复方式: cp \(bakPath) 对应文件 后重试"
         }
         throw WriterError.file(err.trimmingCharacters(in: .whitespacesAndNewlines) + hint)
     }

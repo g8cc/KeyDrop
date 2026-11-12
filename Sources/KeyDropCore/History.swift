@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// 单次探测结果点(监控图数据源)。每条目滚动保留最近 30 个点
 public struct ProbePoint: Codable, Equatable {
@@ -96,6 +97,70 @@ public struct HistoryEntry: Codable {
             out[m] = Int((Double(ok) / Double(log.count) * 100).rounded())
         }
         return out
+    }
+
+    /// 面板行 hover 提示:信息密度优先的多行摘要(界面行本身保持紧凑)。
+    /// 纯逻辑便于测试;时间统一 MM-dd HH:mm
+    public var richTooltip: String {
+        var lines: [String] = []
+        var head = url ?? "(无 URL)"
+        let ms = models ?? (model.map { [$0] }) ?? []
+        if !ms.isEmpty {
+            let shown = ms.prefix(8).joined(separator: " / ")
+            head += "\n模型: \(shown)" + (ms.count > 8 ? " 等 \(ms.count) 个" : "")
+        }
+        lines.append(head)
+        lines.append("key: \(keyMasked)\(key == nil ? "(多 key 条目,凭据从原文恢复)" : "")")
+        var statusLine = "状态: \(Self.statusLabel(status, health))"
+        if let d = healthDetail, !d.isEmpty { statusLine += " · \(String(d.prefix(140)))" }
+        lines.append(statusLine)
+        var bits: [String] = []
+        if let at = healthAt { bits.append("验证 \(Self.shortTime(at))") }
+        if let l = latencyMs { bits.append("延迟 \(Int(l))ms") }
+        if let up = uptimePercent { bits.append("uptime \(up)%") }
+        if let n = failStreak, n > 0 { bits.append("连续失败 \(n) 次(单次失败保留可用,连续 2 次才降级)") }
+        if !bits.isEmpty { lines.append(bits.joined(separator: " · ")) }
+        if let cpa = viaCPAOk {
+            let at = viaCPAAt.map { Self.shortTime($0) } ?? ""
+            lines.append("CPA 链路: \(cpa ? "✓ 正常" : "✗ 异常(上游 OK ≠ 经 8317 的真实链路 OK)")\(at.isEmpty ? "" : " · \(at)")")
+        }
+        if ccMissing == true { lines.append("⚠ cc-switch 中 provider 已缺失但 key 可用,可点行内 ↺ 重新导入") }
+        if let v = verifyVerdict { lines.append("真伪鉴定: \(v)") }
+        if let n = note, !n.isEmpty { lines.append("备注: \(String(n.prefix(200)))") }
+        lines.append("写入: \(Self.targetLabels(targets).joined(separator: " · "))")
+        lines.append("ID \(id.prefix(8)) · 导入 \(Self.shortTime(ts)) · \(format)")
+        return lines.joined(separator: "\n")
+    }
+
+    static func statusLabel(_ status: String, _ health: String?) -> String {
+        if status == "deleted" { return "已删除" }
+        if status == "error" { return "导入失败" }
+        switch health {
+        case "ok": return "可用"
+        case "proxy-ok": return "可用(需代理)"
+        case "quota": return "无余额"
+        case "dead": return "已失效"
+        case "err": return "异常"
+        default: return "未测试"
+        }
+    }
+
+    static func targetLabels(_ targets: [String]) -> [String] {
+        targets.map { t in
+            if t == "ccswitch" { return "cc-switch(Claude)" }
+            if t.hasPrefix("ccswitch-") { return "cc-switch(\(t.dropFirst("ccswitch-".count)))" }
+            switch t {
+            case "cpa": return "CPA"
+            case "dsh": return "DeepSeek Harness"
+            case "grok": return "Grok Build"
+            case "clash": return "Clash"
+            default: return t
+            }
+        }
+    }
+
+    static func shortTime(_ t: TimeInterval) -> String {
+        timeFormatter.string(from: Date(timeIntervalSince1970: t))
     }
 
     public var healthColor: (ok: Bool, dead: Bool) {
@@ -274,7 +339,7 @@ public struct HistoryEntry: Codable {
 }
 
 public final class HistoryStore {
-    static let shared = HistoryStore()
+    public static let shared = HistoryStore()
     private static let maxHistoryBytes = 64_000_000
 
     var storeDir: URL {
@@ -296,11 +361,72 @@ public final class HistoryStore {
     /// 上次解析失败的时间。解析失败期间(文件持续损坏)不更新 lastMtime 会反复重读 +
     /// 全量解码失败(最多 64MB),这是最热的读路径 —— 按 5s 退避,期间沿用内存快照
     private var lastParseFailureAt: TimeInterval? = nil
+    /// 内容代次:每次真正消费文件内容(mtime 变化后重载)自增。
+    /// 目录监听用它判定「外部变更已消费」,驱动 onExternalChange
+    private var dataGeneration = 0
+
+    /// 外部变更回调:CLI/另一进程/WebDAV 拉取写入 history.json 后触发。
+    /// 可能在任意后台队列调用,消费方自行跳主线程。nil 时不挂监听
+    public var onExternalChange: (() -> Void)? = nil
+    private var dirSource: DispatchSourceFileSystemObject? = nil
+    private var watchedDirPath: String? = nil
+    private var pendingExternalCheck = false
+
+    /// 监听账本【目录】而非文件:history.json 每次保存都 replaceItemAt 换 inode,
+    /// 文件 fd 在第一次保存后就指向旧 inode,事件从此静默失效。
+    /// 自身写盘也会触发事件,但到点后走 mtime 对账判定「无外部变更」而跳过,无害
+    private func startDirectoryWatcherLocked() {
+        let dir = storeDir.path
+        if dirSource != nil, watchedDirPath == dir { return }
+        // 首次运行时 ~/.keydrop 尚不存在,open 会失败、监听从此静默缺失
+        // (目录要等第一次 save 才创建)。挂监听前先补建
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        dirSource?.cancel()
+        dirSource = nil
+        let fd = open(dir, O_EVTONLY)
+        guard fd >= 0 else { return }
+        watchedDirPath = dir
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: .write,
+            queue: DispatchQueue(label: "keydrop.history.watch", qos: .utility))
+        src.setEventHandler { [weak self] in self?.scheduleExternalCheck() }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        dirSource = src
+    }
+
+    private func scheduleExternalCheck() {
+        guard !pendingExternalCheck else { return }
+        pendingExternalCheck = true
+        // 合并 0.4s 内的连续事件(批量写盘连发);到点后 mtime 对账,真有新内容才通知
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            self.pendingExternalCheck = false
+            var changed = false
+            self.lock.lock()
+            self.startDirectoryWatcherLocked()   // KEYDROP_HOME 变更(测试隔离)后重挂
+            let genBefore = self.dataGeneration
+            self.refreshIfExternalChangeLocked()
+            changed = self.dataGeneration != genBefore
+            self.lock.unlock()
+            if changed { self.onExternalChange?() }
+        }
+    }
 
     /// 非线程安全快照入口;UI/CLI 请用 snapshot()
     var items: [HistoryEntry] { snapshot() }
 
-    public init() { load() }
+    public init() {
+        load()
+        lock.lock()
+        startDirectoryWatcherLocked()
+        lock.unlock()
+    }
+
+    deinit {
+        // 测试环境每个套件都会建实例:监听不 cancel 会泄漏目录 fd 与事件源
+        dirSource?.cancel()
+    }
 
     public func snapshot() -> [HistoryEntry] {
         lock.lock(); defer { lock.unlock() }
@@ -345,11 +471,13 @@ public final class HistoryStore {
             // 否则 snapshot 每轮都会因 mtime 未变未更新而反复重读空文件
             _items = []; loadedIDs = []
             lastMtime = currentMtime
+            dataGeneration += 1
         } else if let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
             _items = w.items
             loadedIDs = Set(w.items.map { $0.id })
             lastMtime = currentMtime
             lastParseFailureAt = nil   // 成功消费后清除退避,后续失败立即重试
+            dataGeneration += 1
         } else {
             // 解析失败:很可能是 CLI 写到一半被并发读到(partial JSON)。保留上一份内存,不要清空,
             // 否则 mtime 刷新路径下 UI 会出现短暂的「历史清空」闪动。

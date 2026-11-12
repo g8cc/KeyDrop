@@ -48,4 +48,23 @@ enum NetSync {
     static func statusCode(_ o: Outcome) -> Int {
         (o.response as? HTTPURLResponse)?.statusCode ?? 0
     }
+
+    /// 连接层「不可达」类错误:同一 host 的备用路径重试必然重复同一失败
+    /// (DNS 拒绝/连接拒连/离线/TLS 失败),换 path 只是把同一超时再等一遍。
+    /// 离线扫描单 key 曾最坏串行 13 个请求 ≈ 220s;短路后一个请求 ≈ 12s。
+    /// timedOut 有意排除:读超时可能是单端点挂死,另一路径仍可能可用
+    static func isUnreachable(_ o: Outcome) -> Bool {
+        guard let e = o.error as? URLError else { return false }
+        switch e.code {
+        case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
+             .networkConnectionLost, .notConnectedToInternet,
+             .internationalRoamingOff, .dataNotAllowed,
+             .secureConnectionFailed, .serverCertificateHasBadDate,
+             .serverCertificateHasUnknownRoot, .serverCertificateNotYetValid,
+             .clientCertificateRejected, .clientCertificateRequired:
+            return true
+        default:
+            return false
+        }
+    }
 }

@@ -1423,16 +1423,17 @@ public final class Core {
         guard DSHWriter.installed() else { return [] }
         var out: [String] = []
         let claimed = history.snapshot().filter { $0.status == "active" && $0.targets.contains("dsh") }
-        var valid = Set(claimed.map { DSHWriter.routeKey(providerID: $0.id) })
+        // 认领按 id8 基名家族判定:路由名可能是装饰名(keydrop-<id8>-host-模型)
+        var claimedBases = Set(claimed.map { String($0.id.prefix(8)) })
         // CPA 常驻路由的生命周期归 syncCPAResidentEntries/removeCPAResident 管理,对账不碰
-        valid.insert(DSHWriter.routeKey(providerID: "cparesident"))
+        claimedBases.insert("cparesid")
 
         do {
-            let pruned = try DSHWriter.pruneOrphanRoutes(validRouteKeys: valid)
+            let pruned = try DSHWriter.pruneOrphanRoutes(claimedBases: claimedBases)
             if !pruned.isEmpty {
                 out.append("DSH 对账: 清理 \(pruned.count) 个孤儿路由(\(pruned.joined(separator: ", ")))")
             }
-            let byName = Dictionary(uniqueKeysWithValues: try DSHWriter.managedRoutes().map { ($0.name, $0) })
+            let managed = try DSHWriter.managedRoutes()
             var updated: [String] = []
             var missing: [String] = []
             for e in claimed {
@@ -1440,13 +1441,18 @@ public final class Core {
                 guard let url = e.url, let key = extractKey(e), !key.isEmpty else { continue }
                 let models = (e.models ?? (e.model.map { [$0] } ?? [])).filter { !$0.isEmpty }
                 guard !models.isEmpty else { continue }
-                guard let r = byName[rk] else {
+                // 家族查找:路由可能是旧的裸名,也可能是任一装饰名
+                guard let r = managed.first(where: { DSHWriter.isOwnedRoute($0.name, providerID: e.id) }) else {
                     missing.append(rk)
                     continue
                 }
                 // 与写入同源归一(sync 时 baseURL 过 normalizeBaseURL),否则必然误报漂移
-                if r.baseURL == DSHWriter.normalizeBaseURL(url), r.models == models,
+                // 装饰名也算漂移:旧命名的路由在对账时自动改名,无需逐条重新同步
+                let wantName = DSHWriter.displayRouteKey(providerID: e.id, url: url, models: models)
+                if r.name == wantName,
+                   r.baseURL == DSHWriter.normalizeBaseURL(url), r.models == models,
                    DSHWriter.hasCredential(env: r.env) { continue }
+                // add 会摘旧装饰名挂新名:url/models 变化即改名
                 _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
                 updated.append(rk)
             }
@@ -1459,7 +1465,7 @@ public final class Core {
         } catch {
             out.append("⚠ DSH 对账失败: \(error.localizedDescription)")
         }
-        for (file, stale) in DSHWriter.patchLayerStaleRoutes(validKeys: valid) {
+        for (file, stale) in DSHWriter.patchLayerStaleRoutes(claimedBases: claimedBases) {
             out.append("⚠ DSH 补丁层残留: \(file) 里有 \(stale.count) 个账本不再认领的 keydrop-* 路由(\(stale.prefix(3).joined(separator: ", "))\(stale.count > 3 ? " 等" : ""))——Cordis 私有层,KeyDrop 不自动改写,请在 Cordis 中删除或手动清理")
         }
         return out

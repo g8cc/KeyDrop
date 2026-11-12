@@ -27,6 +27,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.info("KeyDrop 启动 v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+        // 外部(CLI/WebDAV 拉取/另一进程)写入账本 → 面板自动刷新。
+        // 此前只有本进程操作后才 historyVersion += 1,面板开着时看到的列表是旧的
+        HistoryStore.shared.onExternalChange = { [weak state] in
+            Task { @MainActor in state?.historyVersion += 1 }
+        }
         // 更新包原地替换时，Dock 可能仍持有旧图标；直接使用本次 bundle 的资源。
         if let iconURL = Bundle.main.url(forResource: "KeyDrop", withExtension: "icns"),
            let icon = NSImage(contentsOf: iconURL), icon.isValid {
@@ -434,7 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let dateText = url.path
-        Task.detached(priority: .userInitiated) {
+        DispatchQueue.global(qos: .userInitiated).async {
             do {
                 let data = try Core.shared.exportLedger(passphrase: pass)
                 try data.write(to: url, options: .atomic)
@@ -454,7 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let pass = promptPassphrase(confirm: false, title: "导入账本:输入导出时设置的口令") else { return }
         // 读文件(账本可达几十 MB)与解密导入都在后台:runModal 后主线程同步
         // Data(contentsOf:) 会让菜单栏在读入期间无响应(导出路径早已后台化)
-        Task.detached(priority: .userInitiated) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let data = try Data(contentsOf: url)
                 let msg = try Core.shared.importLedger(data, passphrase: pass)
@@ -523,7 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func webdavPushAction() {
-        Task.detached(priority: .userInitiated) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let msg = try Core.shared.webdavPush()
                 AppLog.info(msg)
@@ -535,7 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     @objc func webdavPullAction() {
-        Task.detached(priority: .userInitiated) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 let msg = try Core.shared.webdavPull()
                 AppLog.info("WebDAV 拉取: \(msg)")
@@ -700,7 +705,15 @@ enum SecureLog {
         return NSHomeDirectory() + "/.keydrop/logs"
     }
 
+    private static let queue = DispatchQueue(label: "keydrop.securelog", qos: .utility)
+
     static func append(_ filename: String, line: String) {
+        // 行内容在调用线程构造,IO(createDirectory+stat+open+write)移后台队列:
+        // 粘贴是热路径,同步写曾在主线程每次 ⌘V 都做一轮文件操作
+        queue.async { write(filename, line: line) }
+    }
+
+    private static func write(_ filename: String, line: String) {
         lock.lock(); defer { lock.unlock() }
         let dir = logDir
         let path = (dir as NSString).appendingPathComponent(filename)
