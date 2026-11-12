@@ -375,35 +375,18 @@ final class Updater {
             throw UpdateError.extractFailed("更新包目录不是有效 UTF-8")
         }
 
-        var count = 0
-        var totalSize = 0
-        for line in text.split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
-            guard parts.count == 4,
-                  parts[1].count == 10,
-                  parts[2].contains(":"),
-                  let size = Int(parts[0]), size >= 0 else { continue }
-            let name = String(parts[3])
-            let normalized = name.replacingOccurrences(of: "\\", with: "/")
-            let components = normalized.split(separator: "/", omittingEmptySubsequences: true)
-            guard !normalized.hasPrefix("/"), !normalized.contains("\0"),
-                  !components.contains(".."), let first = components.first else {
-                throw UpdateError.extractFailed("更新包包含越界路径,已拒绝安装")
-            }
-            guard first == "KeyDrop.app" || first == "__MACOSX" || (components.count == 1 && first == ".DS_Store") else {
-                throw UpdateError.extractFailed("更新包顶层含非预期内容,已拒绝安装: \(name)")
-            }
-            count += 1
-            let (sum, overflow) = totalSize.addingReportingOverflow(size)
-            guard !overflow, sum <= 150_000_000 else {
-                throw UpdateError.extractFailed("更新包解压后超过 150MB,已拒绝安装")
-            }
-            totalSize = sum
-            guard count <= 10_000 else {
-                throw UpdateError.extractFailed("更新包文件数过多,已拒绝安装")
-            }
+        try Self.validateListing(text)
+    }
+
+    /// 清单解析与安全校验在 KeyDropCore.UpdatePackage(纯逻辑,与测试共用)
+    static func validateListing(_ text: String) throws {
+        do {
+            try UpdatePackage.validateListing(text)
+        } catch {
+            throw UpdateError.extractFailed(error.localizedDescription)
         }
     }
+
 
     private static func readProcessOutputBounded(_ pipe: Pipe, maxBytes: Int, process: Process) throws -> Data {
         var output = Data()

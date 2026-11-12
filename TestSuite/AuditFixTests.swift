@@ -526,6 +526,44 @@ enum AuditFixTests {
             t.equal(p2.models, ["deepseek-v4.1-flash"], "注解剥离(classify 路径)")
         }
 
+        // 更新包清单校验(用户朋友真实事故 2026-11-12):unzip -l 名称列的列对齐
+        // 填充空格残留在名称里 → 顶层组件 "  KeyDrop.app" ≠ "KeyDrop.app",
+        // v1.4.34 起任何真实更新包都被拒。fixture = GitHub v1.4.60 资产真实清单节选
+        h.runSuite("Audit.更新包清单校验") { t in
+            let fixture = """
+            Archive:  KeyDrop-v1.4.60.zip
+              Length      Date    Time    Name
+            ---------  ---------- -----   ----
+                    0  11-01-2026 13:28   KeyDrop.app/
+                 2200  11-01-2026 13:28   KeyDrop.app/Contents/_CodeSignature/CodeResources
+                  163  11-01-2026 13:28   KeyDrop.app/Contents/_CodeSignature/._CodeResources
+              4786656  11-01-2026 13:28   KeyDrop.app/Contents/MacOS/KeyDrop
+                  825  11-01-2026 13:28   KeyDrop.app/Contents/Info.plist
+            ---------  ---------- -----   ----
+              4789xxx                   5 files
+            """
+            do {
+                try UpdatePackage.validateListing(fixture)   // 修复前:每行都被顶层白名单拒绝
+                t.expect(true, "真实布局清单通过")
+            } catch {
+                t.expect(false, "真实布局清单被误拒: \(error.localizedDescription)")
+            }
+            // 越界路径仍要拦
+            do {
+                try UpdatePackage.validateListing("        0  11-01-2026 13:28   ../evil.sh")
+                t.expect(false, "越界路径未拦截")
+            } catch {
+                t.contains(error.localizedDescription, "越界", "越界路径拦截")
+            }
+            // 顶层白名单仍要拦
+            do {
+                try UpdatePackage.validateListing("        0  11-01-2026 13:28   EvilApp/")
+                t.expect(false, "顶层白名单未拦截")
+            } catch {
+                t.contains(error.localizedDescription, "顶层含非预期内容", "顶层白名单拦截")
+            }
+        }
+
         // CPA 生命周期守恒:账本 cpa 认领与 config.yaml 的 key 一一对应,删除即回收
         h.runSuite("Audit.CPA 生命周期守恒") { t in
             let env = try! TestEnv("audit-cpa-invariant")
