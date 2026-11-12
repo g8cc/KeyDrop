@@ -299,8 +299,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         importLedgerItem.target = self
         menu.addItem(importLedgerItem)
         let davSettingsItem = NSMenuItem(title: "WebDAV 同步设置…", action: #selector(webdavSettingsAction), keyEquivalent: "")
+        let magpieSettingsItem = NSMenuItem(title: "Magpie 设置…", action: #selector(magpieSettingsAction), keyEquivalent: "")
         davSettingsItem.target = self
         menu.addItem(davSettingsItem)
+        magpieSettingsItem.target = self
+        menu.addItem(magpieSettingsItem)
         let davPushItem = NSMenuItem(title: "推送到 WebDAV", action: #selector(webdavPushAction), keyEquivalent: "")
         davPushItem.target = self
         menu.addItem(davPushItem)
@@ -475,6 +478,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     // MARK: - WebDAV 同步(Phase 2 简化版:显式推送/拉取加密账本快照)
 
     /// 4 字段表单(URL/账号/密码/加密口令)→ 存本机 prefs(0600,不上传)
+    /// Magpie 设置:粘贴 Magpie 托盘的完整 Web 链接(http://host:port/?k=key),
+    /// KeyDrop 自己拆 base 与 key;清空 = 关闭 Magpie 同步
+    @objc func magpieSettingsAction() {
+        let alert = NSAlert()
+        alert.messageText = "Magpie 设置"
+        alert.informativeText = "粘贴 Magpie Web 链接整条(托盘菜单里的链接,含 ?k= 部分)。\n同步后需重启 DSH/Magpie 类界面才可见的说明同样适用于此处的写入。"
+        alert.alertStyle = .informational
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 22))
+        field.placeholderString = "http://127.0.0.1:3080/?k=…"
+        field.stringValue = Prefs.shared.magpieWebLink ?? ""
+        alert.accessoryView = field
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            Prefs.shared.magpieWebLink = v.isEmpty ? nil : v
+            try? Prefs.shared.save()
+        }
+    }
+
     @objc func webdavSettingsAction() {
         let alert = NSAlert()
         alert.messageText = "WebDAV 同步设置"

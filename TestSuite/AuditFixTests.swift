@@ -607,6 +607,44 @@ enum AuditFixTests {
             t.equal(capped.count, 500, "上限 500")
         }
 
+        // Magpie 同步:Web API 通道(?k= Cookie 登录 → providers upsert/delete)
+        h.runSuite("Audit.Magpie 同步") { t in
+            let env = try! TestEnv("audit-magpie")
+            defer { env.cleanup() }
+            guard let srv = try? MockHTTPServer(mode: .magpie) else {
+                t.expect(false, "mock 启动失败"); return
+            }
+            Prefs.shared.magpieWebLink = "http://127.0.0.1:\(srv.port)/?k=test-key-12345678"
+            let core = Core()
+            let e = HistoryEntry(
+                id: "magpie111-1111-1111-111111111111", ts: 1,
+                raw: "https://m.example.com/v1\nsk-magpie-key-0000001", format: "multiline",
+                name: "m", url: "https://m.example.com/v1", model: nil,
+                models: ["deepseek-v4.1"], key: "sk-magpie-key-0000001", keyMasked: "sk-m…",
+                targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                cpaConfigPath: nil, status: "active")
+            try! core.history.append(e)
+            let msg = try! core.syncTarget(entryIDPrefix: "magpie111", target: "magpie")
+            t.contains(msg, "Magpie", "同步成功: \(msg.prefix(80))")
+            t.contains(msg, "KeyDrop-magpie11-m.example.com", "装饰名")
+            var inv = srv.magpieProviders
+            t.equal(inv.count, 1, "Magpie 存储一行")
+            let saved = inv.first ?? [:]
+            t.equal(saved["name"] as? String, "KeyDrop-magpie11-m.example.com", "名字写入")
+            t.equal(saved["key"] as? String, "sk-magpie-key-0000001", "key 写入")
+            t.equal((saved["models"] as? [String]) ?? [], ["deepseek-v4.1"], "模型写入")
+            t.equal(saved["chat"] as? String, "https://m.example.com/v1", "chat = 版本段挂载")
+            t.equal(saved["anthropic"] as? String, "https://m.example.com", "anthropic = 协议根")
+            // 二次同步:同 id 原地更新不重复
+            _ = try! core.syncTarget(entryIDPrefix: "magpie111", target: "magpie")
+            t.equal(srv.magpieProviders.count, 1, "幂等单行")
+            // 删除 → /api/provider/delete
+            _ = try! core.delete(entryIDPrefix: "magpie111")
+            t.equal(srv.magpieDeleteCount, 1, "删除调 delete 端点")
+            t.equal(srv.magpieProviders.count, 0, "删除后行清空")
+            t.equal(core.history.find(idPrefix: "magpie111")?.status, "deleted", "账本同步删除")
+        }
+
         // CPA 生命周期守恒:账本 cpa 认领与 config.yaml 的 key 一一对应,删除即回收
         h.runSuite("Audit.CPA 生命周期守恒") { t in
             let env = try! TestEnv("audit-cpa-invariant")

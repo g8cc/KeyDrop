@@ -32,6 +32,7 @@ final class MockHTTPServer {
         case regionBlock403    // 任意路径 → 403 + JSON「access from your region is not available」(地域封锁,非 key 失效)
         case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
         case webdav   // WebDAV:PUT 存/GET 取/MKCOL(账本同步回环测试)
+        case magpie   // Magpie Web API:?k= 登录换 Cookie + providers 增删改
     }
     // cpaMgmt 状态:跨线程访问,统一走锁
     let mgmtLock = NSLock()
@@ -46,6 +47,12 @@ final class MockHTTPServer {
     var cpaPatchName = ""
     var cpaAuthHeader = ""
     var davStore: [String: Data] = [:]
+    // magpie mock 状态:登录后发 Cookie;providers 内存存储
+    var magpieProviders: [[String: Any]] = []
+    var magpieSaveCount = 0
+    var magpieDeleteCount = 0
+    var magpieLoginCount = 0
+    var magpieSeen: [String] = []
     var davPushCount = 0
     var cpaAuthFiles: [String: String] = [
         "acc-a.json": "{\"type\":\"xai\",\"email\":\"a@x.com\",\"proxy_url\":\"\"}"
@@ -117,6 +124,10 @@ final class MockHTTPServer {
         }
         if mode == .webdav {
             handleWebDAV(client, req, method, target)
+            return
+        }
+        if mode == .magpie {
+            handleMagpie(client, req, method, target)
             return
         }
         if (mode == .selectiveModelQuota || mode == .partialCatalog), method == "POST", target.contains("/chat/completions"),
@@ -315,6 +326,65 @@ final class MockHTTPServer {
         let resp = "HTTP/1.1 \(code) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
         client.write(resp)
         client.close()
+    }
+
+    private func handleMagpie(_ client: SocketClient, _ req: String, _ method: String, _ target: String) {
+        mgmtLock.lock()
+        defer { mgmtLock.unlock() }
+        magpieSeen.append(req.components(separatedBy: "\r\n").first ?? "?")
+        let hasCookie = req.lowercased().contains("cookie: magpie=test")
+        // 登录:GET /?k=... 换 Cookie
+        if method == "GET", target.contains("/?k=") || target.hasPrefix("/?k=") {
+            magpieLoginCount += 1
+            client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: magpie=test; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            client.close()
+            return
+        }
+        guard hasCookie else {
+            respond(client, 401, "Unauthorized", "{\"error\":\"no cookie\"}")
+            return
+        }
+        var body: [String: Any] = [:]
+        if let sep = req.range(of: "\r\n\r\n"),
+           let obj = try? JSONSerialization.jsonObject(with: Data(req[sep.upperBound...].utf8)) as? [String: Any] {
+            body = obj
+        } else if let r = req.lowercased().range(of: "content-length:"),
+                  let n = Int(req.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                      .prefix(while: { $0.isNumber })), n > 0 {
+            let text = client.readBody(toLength: n)
+            body = (try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]) ?? [:]
+        }
+        if target.hasPrefix("/api/providers") {
+            let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
+            respond(client, 200, "OK", payload, contentType: "application/json")
+            return
+        }
+        if target == "/api/provider/save" {
+            magpieSaveCount += 1
+            if let id = body["id"] as? String {
+                magpieProviders.removeAll { ($0["id"] as? String) == id }
+                magpieProviders.append(body)
+            }
+            let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
+            respond(client, 200, "OK", payload, contentType: "application/json")
+            return
+        }
+        if target == "/api/provider/delete" {
+            magpieDeleteCount += 1
+            if let id = body["id"] as? String {
+                magpieProviders.removeAll { ($0["id"] as? String) == id }
+            }
+            let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
+            respond(client, 200, "OK", payload, contentType: "application/json")
+            return
+        }
+        respond(client, 404, "Not Found", "")
+    }
+
+    private func magpieJSON(_ providers: [[String: Any]]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: providers),
+              let s = String(data: data, encoding: .utf8) else { return "[]" }
+        return s
     }
 
     private func handleWebDAV(_ client: SocketClient, _ req: String, _ method: String, _ target: String) {

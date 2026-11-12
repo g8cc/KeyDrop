@@ -1252,6 +1252,10 @@ struct HistoryRow: View {
                                     Button { onSyncTarget(entry.id, "grok") } label: {
                                         Label("Grok Build", systemImage: "sparkles")
                                     }
+                                    Button { onSyncTarget(entry.id, "magpie") } label: {
+                                        Label(entry.targets.contains("magpie") ? "Magpie(重新同步)" : "Magpie",
+                                              systemImage: "server.rack")
+                                    }
                                 }
                             } label: {
                                 Image(systemName: entry.targets.contains("dsh")

@@ -1854,6 +1854,16 @@ public final class Core {
                     entryLines.append("– CPA: 本机未找到 CPA 配置,跳过")
                 }
             }
+            // magpie(经 Web API,与行内同步同通道)
+            if e.targets.contains("magpie") {
+                do {
+                    let msg = try MagpieWriter.sync(providerID: e.id, baseURL: url, key: key, models: models)
+                    entryLines.append("Magpie: \(msg)")
+                    replayed += 1
+                } catch {
+                    entryLines.append("⚠ Magpie: \(error.localizedDescription)")
+                }
+            }
             // dsh(未装 DSH 的机器曾凭空创建 ~/.dsh 并落明文凭据,审计 2026-11-13)
             if e.targets.contains("dsh") {
                 guard DSHWriter.installed() else {
@@ -3018,6 +3028,15 @@ public final class Core {
                 throw ParseError.io("Grok Build 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
             }
             return "Grok Build: \(msg)"
+        case "magpie":
+            let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key, models: models)
+            if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
+            do { try history.update(entry) }
+            catch {
+                try? MagpieWriter.remove(providerID: entry.id)
+                throw ParseError.io("Magpie 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+            }
+            return "Magpie: \(msg)"
         default:
             throw ParseError.io("未知同步目标: \(target)")
         }
@@ -3104,6 +3123,19 @@ public final class Core {
                 }
             } else {
                 failures.append("Grok Build: 历史记录缺少配置路径、URL 或 key")
+            }
+        }
+        if entry.targets.contains("magpie") {
+            do {
+                let msg = try MagpieWriter.remove(providerID: entry.id)
+                if msg.isEmpty {
+                    lines.append("– Magpie: 未找到本条目的行,跳过")
+                } else {
+                    lines.append("✓ Magpie: \(msg)")
+                }
+                remaining.removeAll { $0 == "magpie" }
+            } catch {
+                failures.append("Magpie: \(error.localizedDescription)")
             }
         }
 

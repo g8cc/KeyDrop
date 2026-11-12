@@ -151,6 +151,7 @@ public struct HistoryEntry: Codable {
             if t.hasPrefix("ccswitch-") { return "cc-switch(\(t.dropFirst("ccswitch-".count)))" }
             switch t {
             case "cpa": return "CPA"
+            case "magpie": return "Magpie"
             case "dsh": return "DeepSeek Harness"
             case "grok": return "Grok Build"
             case "clash": return "Clash"
@@ -866,6 +867,8 @@ public final class Prefs {
     }
     /// WebDAV 同步:目录 URL / 账号 / 密码 / 账本加密口令(密文上云,口令仅存本机)
     private var _webdavURL: String? = nil
+    /// Magpie Web 链接(整条 http://host:port/?k=key),MagpieWriter 自己拆
+    private var _magpieWebLink: String? = nil
     private var _webdavUser: String? = nil
     private var _webdavPass: String? = nil
     private var _webdavExportPass: String? = nil
@@ -876,6 +879,10 @@ public final class Prefs {
     public var webdavURL: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavURL }
         set { lock.lock(); _webdavURL = newValue; lock.unlock() }
+    }
+    public var magpieWebLink: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _magpieWebLink }
+        set { lock.lock(); _magpieWebLink = newValue; lock.unlock() }
     }
     public var webdavUser: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavUser }
@@ -922,6 +929,7 @@ public final class Prefs {
         _cpaManagementKey = nil
         _cpaAPIBase = nil
         _webdavURL = nil
+        _magpieWebLink = nil
         _webdavUser = nil
         _webdavPass = nil
         _webdavExportPass = nil
@@ -950,6 +958,7 @@ public final class Prefs {
             _cpaManagementKey = obj["cpaManagementKey"] as? String
             _cpaAPIBase = obj["cpaAPIBase"] as? String
             _webdavURL = obj["webdavURL"] as? String
+            _magpieWebLink = obj["magpieWebLink"] as? String
             _webdavUser = obj["webdavUser"] as? String
             _webdavPass = obj["webdavPass"] as? String
             _webdavExportPass = obj["webdavExportPass"] as? String
@@ -998,6 +1007,7 @@ public final class Prefs {
         // WebDAV 字段必须在同一锁内快照:flock 只管跨进程文件写,
         // 管不住本进程 UI 线程写 _webdav* 与这里读的并发
         let webdavURL = _webdavURL
+        let magpieWebLink = _magpieWebLink
         let webdavUser = _webdavUser
         let webdavPass = _webdavPass
         let webdavExportPass = _webdavExportPass
@@ -1016,6 +1026,7 @@ public final class Prefs {
             // WebDAV 同步配置:URL/账号/密码/导出口令(后者用于账本端到端加密,
             // WebDAV 服务端只见密文)。prefs 0600,含凭据与账本同级敏感度
             if let v = webdavURL, !v.isEmpty { obj["webdavURL"] = v }
+            if let v = magpieWebLink, !v.isEmpty { obj["magpieWebLink"] = v }
             if let v = webdavUser, !v.isEmpty { obj["webdavUser"] = v }
             if let v = webdavPass, !v.isEmpty { obj["webdavPass"] = v }
             if let v = webdavExportPass, !v.isEmpty { obj["webdavExportPass"] = v }

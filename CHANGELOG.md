@@ -21,6 +21,16 @@
 - 此前对账报告的「N 个已同步路由缺失」多为已被 Jet Hub 采纳进其存储的
   路由(settings.yaml 被消费掉了),无需逐个重新同步
 
+### 新增第三方工具支持:Magpie(yetone/magpie)
+- 行内「同步到…」菜单新增 Magpie:经其 Web 管理 API 创建/更新 provider
+  (?k= Cookie 登录 → /api/provider/save),写入 名字(装饰名)/key/
+  chat·responses·anthropic 端点(版本段挂载与协议根,与 all-api-hub 的
+  channel-import 同语义)/模型勾选;二次同步原地更新,删除条目时调
+  /api/provider/delete 清理
+- 设置:菜单栏「Magpie 设置…」粘贴 Magpie 托盘的完整 Web 链接
+  (http://host:port/?k=…),KeyDrop 自己拆地址与 key;Cookie 手动捕获
+  回传(不依赖 CookieStorage 对 IP 主机的处理怪癖)
+
 ### DSH 路由名可读化
 - 路由名从 `keydrop-<id8>` 升级为 `keydrop-<id8>-<站点>-<首选模型>`(如
   `keydrop-378755c6-abc.com-deepseek-v4.1-flash-1017`),DSH 界面一眼可见是什么渠道;
