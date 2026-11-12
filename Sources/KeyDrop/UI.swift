@@ -16,6 +16,104 @@ func runOffPool<T>(qos: DispatchQoS.QoSClass = .userInitiated, _ work: @escaping
     }
 }
 
+/// 真伪鉴定结果弹窗:每模型结论一览 + 逐模型鉴定按钮 + 最近一次明细。
+/// v1.4.58 曾声称"结果弹窗展示"但 verifySheetShown 从未挂载——结果无处可看,
+/// 只剩盾形图标的颜色(真实反馈:不知道绿黄是什么意思、多模型分不清谁真谁假)
+struct VerifyReportSheet: View {
+    @ObservedObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("真伪鉴定").font(.headline)
+                Spacer()
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+            Text("能力阶梯实测:随机算术/字母计数/排名逻辑题,程序判定答案,每次新题不可背 —— 非指纹检测。绿=实测达旗舰级;黄=实测中端/基础级(疑似模型替换/降级);红=基础任务失败(网关异常或非模型响应)。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let id = state.verifySheetID, let entry = Core.shared.history.find(idPrefix: id) {
+                let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
+                if models.count > 1 {
+                    Text("逐模型结论(点「鉴定」实测该模型,约 1-3 分钟):")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                ForEach(models, id: \.self) { m in
+                    HStack {
+                        Text(m)
+                            .font(.system(size: 12, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        if let v = entry.verifyVerdicts?[m] {
+                            Text(v)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(VerifyPresentation.color(v) ?? .secondary)
+                        }
+                        Button(state.verifyingModel == m ? "鉴定中…" : (entry.verifyVerdicts?[m] == nil ? "鉴定" : "重鉴定")) {
+                            state.doVerify(id, model: m)
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(state.verifyingModel != nil)
+                    }
+                }
+                Divider()
+                ScrollView {
+                    if let lines = state.verifyReports[id], !lines.isEmpty {
+                        Text(lines.joined(separator: "\n"))
+                            .font(.system(size: 11, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text("明细将在鉴定完成后显示(重启 KeyDrop 后明细不保留,结论保留)。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxHeight: .infinity)
+            } else {
+                Text("条目不存在")
+            }
+        }
+        .padding(16)
+        .frame(width: 480, height: 440)
+    }
+}
+
+/// 真伪鉴定的展示语义(颜色映射与 tooltip),行视图与弹窗共用
+enum VerifyPresentation {
+    /// 绿=实测旗舰级相符 · 黄=实测中端/基础级(疑似降级/替换) · 红=基础任务失败
+    static func color(_ verdict: String?) -> Color? {
+        guard let verdict, !verdict.isEmpty else { return nil }
+        if verdict.hasPrefix("旗舰级") { return Color(red: 0.22, green: 0.58, blue: 0.40) }
+        if verdict.hasPrefix("异常") { return Color(red: 0.86, green: 0.28, blue: 0.24) }
+        return Color(red: 0.85, green: 0.55, blue: 0.15)
+    }
+
+    static func tooltip(entry: HistoryEntry, latest: String?) -> String {
+        var lines: [String] = []
+        lines.append("真伪鉴定 = 能力阶梯实测:随机算术/字母计数/排名逻辑题,程序判定答案,每次新题不可背(非指纹检测)")
+        if let vv = entry.verifyVerdicts, !vv.isEmpty {
+            for (m, v) in vv.sorted(by: { $0.key < $1.key }) {
+                lines.append("\(m): \(v)")
+            }
+        } else if let latest, !latest.isEmpty {
+            lines.append("上次鉴定(未记录模型): \(latest)")
+        } else {
+            lines.append("尚未鉴定")
+        }
+        lines.append("绿=实测达旗舰级 · 黄=实测中端/基础级(疑似模型替换/降级) · 红=基础任务失败(网关异常或非模型响应)")
+        lines.append("点击打开鉴定面板(自动鉴定未测模型)")
+        return lines.joined(separator: "\n")
+    }
+}
+
 final class AppState: ObservableObject {
     deinit {
         // 卫生清理:timer 不 invalidate 会留在 runloop 空转;task 不 cancel 会延迟触发 weak no-op
@@ -74,6 +172,10 @@ final class AppState: ObservableObject {
     @Published var verifyVerdicts: [String: String] = [:]
     @Published var verifyReports: [String: [String]] = [:]
     @Published var verifySheetShown = false
+    /// 当前打开鉴定弹窗的条目 id
+    @Published var verifySheetID: String? = nil
+    /// 正在鉴定的模型(弹窗内按钮进度用)
+    @Published var verifyingModel: String? = nil
     private var statusClearTask: DispatchWorkItem?
     private var healthTimer: Timer?
     private var webdavTimer: Timer?
@@ -367,27 +469,40 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// 真伪鉴定(按需,用户点击条目行的盾形按钮触发):跑能力阶梯探针,
-    /// 结论记入 verifyVerdicts(行内图标着色)并弹出结果明细
-    func doVerify(_ id: String) {
-        guard !isBusy, verifyingID == nil else { return }
+    /// 真伪鉴定(按需):跑能力阶梯探针,结论按模型持久化到条目并打开结果弹窗。
+    /// - Parameter model: 指定模型;nil = 第一个未鉴定的模型(全鉴定过取第一个)
+    func doVerify(_ id: String, model: String? = nil) {
+        guard verifyingModel == nil else { return }
         guard let entry = core.history.find(idPrefix: id) else { return }
         let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
         guard let url = entry.url, !url.isEmpty,
               let key = Core.shared.extractKey(entry), !key.isEmpty,
-              let model = models.first else {
+              !models.isEmpty else {
             setStatus("该条目缺少 URL/key/模型,无法鉴定", ok: false)
             return
         }
+        let target = (model?.trimmingCharacters(in: .whitespacesAndNewlines))
+            .flatMap { m in models.first { $0 == m } }
+            ?? models.first { entry.verifyVerdicts?[$0] == nil }
+            ?? models.first!
+        verifySheetID = id
+        verifySheetShown = true
+        verifyingModel = target
         verifyingID = id
         Task { @MainActor in
-            defer { verifyingID = nil }
+            defer {
+                verifyingModel = nil
+                verifyingID = nil
+            }
             // find + update(全量历史落盘,flock)在后台做:大账本下同步写会让
             // 主线程卡几十到上百毫秒(与 doAddClashProxies 同一处理)
             let (verdict, lines) = try await runOffPool { () -> (String, [String]) in
-                let report = AuthenticityProbe.run(base: url, key: key, model: model,
+                let report = AuthenticityProbe.run(base: url, key: key, model: target,
                                                    proxy: Core.shared.proxyForHealthPublic(), timeout: 40)
                 if var e = self.core.history.find(idPrefix: id) {
+                    var v = e.verifyVerdicts ?? [:]
+                    v[target] = report.verdict
+                    e.verifyVerdicts = v
                     e.verifyVerdict = report.verdict
                     try? self.core.history.update(e)
                 }
@@ -395,8 +510,6 @@ final class AppState: ObservableObject {
             }
             verifyVerdicts[id] = verdict
             verifyReports[id] = lines
-            // 结论已持久化到条目:重启后行图标仍着色,重复鉴定有历史可对照
-            verifySheetShown = true
             historyVersion += 1
         }
     }
@@ -1193,18 +1306,13 @@ struct HistoryRow: View {
                                 } else {
                                     Image(systemName: "checkmark.seal")
                                         .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(verifyVerdict == nil
-                                            ? Color(red: 0.45, green: 0.45, blue: 0.52)
-                                            : (verifyVerdict == "旗舰级"
-                                               ? Color(red: 0.22, green: 0.58, blue: 0.40)
-                                               : Color(red: 0.85, green: 0.55, blue: 0.15)))
+                                        .foregroundStyle(VerifyPresentation.color(verifyVerdict)
+                                            ?? Color(red: 0.45, green: 0.45, blue: 0.52))
                                 }
                             }
                             .buttonStyle(.borderless)
                             .disabled(verifyRunning || busy)
-                            .help(verifyVerdict == nil
-                                  ? "真伪鉴定:能力阶梯实测该模型(约 6 次请求)"
-                                  : "上次鉴定: \(verifyVerdict!) · 点击重新鉴定(结论会覆盖)")
+                            .help(VerifyPresentation.tooltip(entry: entry, latest: verifyVerdict))
 
                             Menu {
                                 Button("复制 BaseURL") {
@@ -2038,6 +2146,9 @@ struct PanelView: View {
         }
         .sheet(isPresented: $state.editShown) {
             EditView(state: state)
+        }
+        .sheet(isPresented: $state.verifySheetShown) {
+            VerifyReportSheet(state: state)
         }
         .sheet(isPresented: $state.settingsShown) {
             SettingsSheet(state: state)

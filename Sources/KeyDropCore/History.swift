@@ -24,6 +24,7 @@ public struct HistoryEntry: Codable {
         case deletedAt
         case updatedAt
         case verifyVerdict
+        case verifyVerdicts
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
@@ -63,6 +64,8 @@ public struct HistoryEntry: Codable {
     public var updatedAt: TimeInterval?
     /// 最近一次真伪鉴定的能力层级结论(旗舰级/中端级/基础级/异常);面板行图标着色与悬停展示
     public var verifyVerdict: String?
+    /// 每模型的真伪鉴定结论(模型 → 判定):多模型条目逐模型鉴定后各自留存
+    public var verifyVerdicts: [String: String]? = nil
     /// 最近一次 chat 探测的端到端延迟(毫秒)。实战监控:慢网关也显示"可用",
     /// 但延迟让用户对"用的时候行不行"有预期(真实反馈:显示可用,用起来 30s 无响应)
     public var latencyMs: Double?
@@ -125,7 +128,12 @@ public struct HistoryEntry: Codable {
             lines.append("CPA 链路: \(cpa ? "✓ 正常" : "✗ 异常(上游 OK ≠ 经 8317 的真实链路 OK)")\(at.isEmpty ? "" : " · \(at)")")
         }
         if ccMissing == true { lines.append("⚠ cc-switch 中 provider 已缺失但 key 可用,可点行内 ↺ 重新导入") }
-        if let v = verifyVerdict { lines.append("真伪鉴定: \(v)") }
+        if let vv = verifyVerdicts, !vv.isEmpty {
+            let parts = vv.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }
+            lines.append("真伪鉴定(能力阶梯实测): " + parts.joined(separator: " · "))
+        } else if let v = verifyVerdict {
+            lines.append("真伪鉴定: \(v)")
+        }
         if let n = note, !n.isEmpty { lines.append("备注: \(String(n.prefix(200)))") }
         lines.append("写入: \(Self.targetLabels(targets).joined(separator: " · "))")
         lines.append("ID \(id.prefix(8)) · 导入 \(Self.shortTime(ts)) · \(format)")
@@ -268,6 +276,7 @@ public struct HistoryEntry: Codable {
         deletedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .deletedAt)
         updatedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .updatedAt)
         verifyVerdict = try c.decodeIfPresent(String.self, forKey: .verifyVerdict)
+        verifyVerdicts = try c.decodeIfPresent([String: String].self, forKey: .verifyVerdicts)
         latencyMs = try c.decodeIfPresent(Double.self, forKey: .latencyMs)
         failStreak = try c.decodeIfPresent(Int.self, forKey: .failStreak)
         viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)
@@ -306,6 +315,7 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
         try c.encodeIfPresent(updatedAt, forKey: .updatedAt)
         try c.encodeIfPresent(verifyVerdict, forKey: .verifyVerdict)
+        try c.encodeIfPresent(verifyVerdicts, forKey: .verifyVerdicts)
         try c.encodeIfPresent(latencyMs, forKey: .latencyMs)
         try c.encodeIfPresent(failStreak, forKey: .failStreak)
         try c.encodeIfPresent(viaCPAOk, forKey: .viaCPAOk)

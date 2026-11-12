@@ -1905,7 +1905,9 @@ public final class Core {
     /// 对条目的当前模型跑能力阶梯探针(数学/计数/逻辑逐级),返回真伪鉴定报告。
     /// 原理与局限见 docs/model-authenticity.md:实测的是"长在权重里的能力",
     /// 中转站改响应包装规避不了;同家族版本内替换判别力有限。
-    public func verifyModelAuthenticity(entryIDPrefix: String) throws -> String {
+    /// - Parameter model: 指定鉴定的模型;nil = 条目里第一个「未鉴定」的模型,
+    ///   全都鉴定过则取第一个。结论按模型存入 verifyVerdicts
+    public func verifyModelAuthenticity(entryIDPrefix: String, model: String? = nil) throws -> String {
         guard let entry = history.find(idPrefix: entryIDPrefix)
             ?? history.findActiveByRaw(entryIDPrefix)
         else {
@@ -1917,15 +1919,28 @@ public final class Core {
         let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard let model = models.first else {
+        guard !models.isEmpty else {
             throw ParseError.io("该记录没有模型,无法鉴定")
         }
-        let report = AuthenticityProbe.run(base: url, key: key, model: model,
+        let target = (model?.trimmingCharacters(in: .whitespacesAndNewlines))
+            .flatMap { m in models.first { $0 == m } }   // 必须是条目已知模型
+            ?? models.first { entry.verifyVerdicts?[$0] == nil }
+            ?? models.first!
+        let report = AuthenticityProbe.run(base: url, key: key, model: target,
                                            proxy: proxyForHealth(), timeout: 40)
-        var out = ["真伪鉴定: 声称模型 \(model)"]
+        var out = ["真伪鉴定: 声称模型 \(target)"]
         out.append(contentsOf: report.lines)
         if report.claimedTier == 3, report.verdict != "旗舰级" {
             out.append("⚠ 实测能力低于旗舰级声称——高概率模型替换/降级(网关间歇性失败也可能,建议隔天复测)")
+        }
+        // 每模型结论持久化:多模型条目逐个鉴定后各自可见
+        if var e2 = history.find(idPrefix: entryIDPrefix)
+            ?? history.findActiveByRaw(entryIDPrefix) {
+            var v = e2.verifyVerdicts ?? [:]
+            v[target] = report.verdict
+            e2.verifyVerdicts = v
+            e2.verifyVerdict = report.verdict
+            try? history.update(e2)
         }
         return out.joined(separator: "\n")
     }
