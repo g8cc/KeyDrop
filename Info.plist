@@ -6,18 +6,18 @@
 	<string>KeyDrop</string>
 	<key>CFBundleExecutable</key>
 	<string>KeyDrop</string>
+	<key>CFBundleIconFile</key>
+	<string>KeyDrop</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.keydrop.app</string>
 	<key>CFBundleName</key>
 	<string>KeyDrop</string>
-	<key>CFBundleIconFile</key>
-	<string>KeyDrop</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.4.60</string>
+	<string>1.4.61</string>
 	<key>CFBundleVersion</key>
-	<string>1.4.60</string>
+	<string>1.4.61</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
