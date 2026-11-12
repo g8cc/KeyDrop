@@ -1462,6 +1462,9 @@ public final class Core {
             if !missing.isEmpty {
                 out.append("DSH 对账: \(missing.count) 个已同步路由在 settings.yaml 缺失,未自动重建(\(missing.prefix(3).joined(separator: ", "))\(missing.count > 3 ? " 等" : ""))——行内「同步到 DSH」可恢复")
             }
+            if !(updated.isEmpty && missing.isEmpty), DSHWriter.dshWebRunning() {
+                out.append("⚠ DSH web 正在运行:以上变更需重启 DSH 后在 Jet Hub 可见(启动时才导入 settings.yaml)")
+            }
         } catch {
             out.append("⚠ DSH 对账失败: \(error.localizedDescription)")
         }
@@ -2840,6 +2843,9 @@ public final class Core {
         let reconcileLines = reconcileDSH()
         var msg = "✓ DeepSeek Harness: 已\(alreadyLinked ? "更新" : "添加") provider「\(route)」(\(models.count) 个模型)"
         msg += reconcileLines.map { "\n✓ " + $0 }.joined()
+        msg += DSHWriter.dshWebRunning()
+            ? "\n⚠ DSH web 正在运行:Jet Hub 在启动时才导入 settings.yaml,重启 DSH 后可见"
+            : "\nDSH 未在运行:下次启动 DSH 时自动导入"
         return msg
     }
 

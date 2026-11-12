@@ -287,6 +287,23 @@ public enum DSHWriter {
         FileManager.default.fileExists(atPath: dshHome)
     }
 
+    /// DSH web(Jet Hub 界面的后端)是否在运行。settings.yaml 是它的
+    /// 「启动时导入通道」:web 进程启动时把该文件合并进自己的 profile 存储
+    /// (随后改名 .imported),运行中不读该文件 —— KeyDrop 写入的路由
+    /// 要等 DSH web 重启才可见(真实反馈 2026-11-13:同步"不进去"实为此因)
+    public static func dshWebRunning() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        p.arguments = ["-f", "bin/dsh web"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (String(data: data, encoding: .utf8) ?? "").contains("\n") || !data.isEmpty
+    }
+
     // MARK: - 生命周期对账(reconcile)
 
     /// settings.yaml 里一个 KeyDrop 托管路由的内容快照

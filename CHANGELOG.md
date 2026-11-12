@@ -13,6 +13,14 @@
   BaseURL / API Key / 模型名(模型名按条目逐一列出,复制的是
   copyModelName 规整后的名字,与模型行的复制一致)
 
+### DSH 同步可见性说明(重要机制澄清)
+- `settings.yaml` 是 DSH web(Jet Hub)的「启动时导入通道」:web 进程启动时
+  把它合并进自己的 profile 存储(随后改名 .imported),运行中不读该文件。
+  KeyDrop 同步写入成功后,需**重启 DSH web** 才能在 Jet Hub 界面看到——
+  同步结果与对账报告现在会如实提示(dsh web 运行检测)
+- 此前对账报告的「N 个已同步路由缺失」多为已被 Jet Hub 采纳进其存储的
+  路由(settings.yaml 被消费掉了),无需逐个重新同步
+
 ### DSH 路由名可读化
 - 路由名从 `keydrop-<id8>` 升级为 `keydrop-<id8>-<站点>-<首选模型>`(如
   `keydrop-378755c6-abc.com-deepseek-v4.1-flash-1017`),DSH 界面一眼可见是什么渠道;
