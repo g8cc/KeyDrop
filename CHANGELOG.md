@@ -8,6 +8,11 @@
 - 接入启动 self-heal、每次「同步到 DSH」自动全量对账;新增 CLI 命令 `KeyDrop dsh-reconcile`
 - 守恒断言:同步两次路由数 == 账本认领数;漂移/自愈/缺失/补丁层场景回归
 
+### 复制按钮升级:主操作 + 下拉
+- 行内 curl 按钮:点击仍复制 curl(原行为);长按/点下拉可选复制
+  BaseURL / API Key / 模型名(模型名按条目逐一列出,复制的是
+  copyModelName 规整后的名字,与模型行的复制一致)
+
 ### DSH 路由名可读化
 - 路由名从 `keydrop-<id8>` 升级为 `keydrop-<id8>-<站点>-<首选模型>`(如
   `keydrop-378755c6-abc.com-deepseek-v4.1-flash-1017`),DSH 界面一眼可见是什么渠道;

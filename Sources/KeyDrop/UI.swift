@@ -1187,16 +1187,38 @@ struct HistoryRow: View {
                                   ? "真伪鉴定:能力阶梯实测该模型(约 6 次请求)"
                                   : "上次鉴定: \(verifyVerdict!) · 点击重新鉴定(结论会覆盖)")
 
-                            Button {
-                                onCopyCurl()
+                            Menu {
+                                Button("复制 BaseURL") {
+                                    onCopy(entry.url ?? "")
+                                }
+                                .disabled(entry.url == nil)
+                                Button("复制 API Key") {
+                                    onCopy(Core.shared.extractKey(entry) ?? "")
+                                }
+                                .disabled(!testable)
+                                if let displayModels, !displayModels.isEmpty {
+                                    Menu("复制模型名") {
+                                        ForEach(displayModels, id: \.self) { m in
+                                            let name = CCSwitchWriter.copyModelName(for: entry, model: m)
+                                            Button(name) { onCopy(name) }
+                                        }
+                                    }
+                                }
                             } label: {
-                                Image(systemName: "terminal")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(Color(red: 0.35, green: 0.40, blue: 0.48))
+                                HStack(spacing: 2) {
+                                    Image(systemName: "terminal")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundStyle(Color(red: 0.35, green: 0.40, blue: 0.48))
+                                    Image(systemName: "chevron.down")
+                                        .font(.system(size: 7, weight: .semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                            } primaryAction: {
+                                // 主操作 = 原行为:点击即复制 curl;下拉才是细分复制
+                                onCopyCurl()
                             }
-                            .buttonStyle(.borderless)
                             .disabled(busy)
-                            .help("复制可运行的 curl 请求")
+                            .help("点击复制可运行的 curl;长按按钮可选复制 BaseURL / API Key / 模型名")
 
                             Button {
                                 onRefresh(entry.id)
