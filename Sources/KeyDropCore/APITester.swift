@@ -23,7 +23,10 @@ public struct APITestResult {
     public let latencyMs: Double?
     /// 每个已探测模型的独立延迟(模型级监控:new-api 渠道×模型粒度)
     public let modelLatencies: [String: Double]?
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil) {
+    /// 失败属于「暂时性网络层」(超时/不可达/离线):健康扫描对此防抖保留可用;
+    /// false = 服务端明确拒绝(401/403/429/5xx 等),第一次失败即应降级
+    public let transientFailure: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -36,6 +39,7 @@ public struct APITestResult {
         self.quotaModels = quotaModels
         self.latencyMs = latencyMs
         self.modelLatencies = modelLatencies
+        self.transientFailure = transientFailure
     }
 }
 
@@ -214,14 +218,22 @@ public enum APITester {
                                      authFailed: false, needsProxy: true,
                                      quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
                                      workingModels: via.workingModels, quotaModels: via.quotaModels,
-                                     latencyMs: via.latencyMs, modelLatencies: via.modelLatencies)
+                                     latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
+                                     transientFailure: false)
             }
             // 代理侧也不通才回退直连一次:可能是本机代理挂了,也可能是地区限制解除
             // (或 key 真失效)。直连恢复可用就不再标 needsProxy,下轮回到常规路径
             let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
             if direct.ok { return direct }
             if direct.authFailed, !via.authFailed { return direct }
-            return via
+            // 两侧都失败:暂时性 = 两侧都暂时(一侧被明确拒绝就不是网络问题)
+            return APITestResult(ok: false, style: via.style, models: via.models,
+                                 detail: via.detail, authFailed: via.authFailed,
+                                 needsProxy: true, quotaExhausted: via.quotaExhausted,
+                                 chatDegraded: via.chatDegraded, workingModels: via.workingModels,
+                                 quotaModels: via.quotaModels, latencyMs: via.latencyMs,
+                                 modelLatencies: via.modelLatencies,
+                                 transientFailure: via.transientFailure && direct.transientFailure)
         }
         // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
         let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
@@ -259,6 +271,9 @@ public enum APITester {
         var lastErr = "无"
         var style = ""
         var authFailed = false
+        // 暂时性网络层失败标记(超时/不可达):健康扫描防抖判定依据。
+        // 服务端明确应答(HTTP 任意状态)反证网络层可达 → 非暂时性
+        var sawTransient = false
         for ep in candidates {
             guard let u = URL(string: ep) else { continue }
             var req = URLRequest(url: u)
@@ -342,6 +357,7 @@ public enum APITester {
                         // 全部 chat 路径超时/无响应:模型不可达,绝不能计入 working
                         // (归入 degraded,与 5xx「服务不可用」同向)
                         if degradedModel == nil { degradedModel = (probe, 0) }
+                        sawTransient = true
                         continue
                     }
                     working.append(probe)
@@ -369,6 +385,7 @@ public enum APITester {
                                          modelLatencies: hasRealModels && !modelLatencies.isEmpty ? modelLatencies : nil)
                 }
                 if let (m, st) = degradedModel {
+                    if st == 0 { sawTransient = true }
                     let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
                     return APITestResult(ok: false, style: style, models: models,
                                          detail: "GET \(ep) → 200, 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)" + (lastErr == "无" ? "" : " | \(lastErr)"),
@@ -383,6 +400,7 @@ public enum APITester {
                                      detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
                                      authFailed: false)
             }
+            if status == 0 { sawTransient = true }
             lastErr = "GET \(ep) → \(status == 0 ? "超时/无响应" : "HTTP \(status)")"
         }
 
@@ -403,7 +421,9 @@ public enum APITester {
         }
         authFailed = authFailed || chat.1
         lastErr += "; \(chat.2)"
-        return APITestResult(ok: false, style: style, models: [], detail: lastErr, authFailed: authFailed)
+        // 服务端明确拒绝(401/403)或任何 HTTP 应答都不是「暂时性」;纯网络层失败才是
+        return APITestResult(ok: false, style: style, models: [], detail: lastErr,
+                             authFailed: authFailed, transientFailure: sawTransient && !authFailed)
     }
 
     /// chat 探测模型采样:preferredModel(用户实际激活的模型)置顶 —— 显示可用

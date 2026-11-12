@@ -1538,13 +1538,15 @@ openai-compatibility:
                 core.scanHealth(staleAfter: 0) { _ in done.signal() }
                 _ = done.wait(timeout: .now() + 60)
                 var e = core.history.find(idPrefix: "mon-deb")!
-                t.equal(e.health, "ok", "首败保留可用(防抖)")
+                // chat524 是服务端明确应答(非暂时性网络失败):首败即降级,
+                // 不再吃一刀切防抖(真实反馈「监控全绿但访问完全不行」)
+                t.equal(e.health, "err", "确定性失败首败即降级")
                 t.equal(e.failStreak, 1, "首败计 streak=1")
                 core.scanHealth(staleAfter: 0) { _ in done.signal() }
                 _ = done.wait(timeout: .now() + 60)
                 e = core.history.find(idPrefix: "mon-deb")!
                 t.equal(e.failStreak, 2, "连续失败累计")
-                t.equal(e.health, "err", "连续 2 次失败 → 降级 err")
+                t.equal(e.health, "err", "连续失败维持 err")
             }
             // 场景 4b:key 死掉期间模型条不能冻结成灰 —— 防抖后仍判失败的轮次,
             // 所有模型都记红格(真实反馈:key 挂了,模型条却一直灰,看起来像「还没轮到测」)
@@ -1563,16 +1565,15 @@ openai-compatibility:
                     try! core.history.update(e)
                 }
                 let done = DispatchSemaphore(value: 0)
-                core.scanHealth(staleAfter: 0) { _ in done.signal() }   // 首败:防抖,不记红
+                core.scanHealth(staleAfter: 0) { _ in done.signal() }   // 401 确定性失败:首败即降级
                 _ = done.wait(timeout: .now() + 60)
                 var e = core.history.find(idPrefix: "mon-deadm")!
-                t.equal(e.health, "ok", "[死 key] 首败防抖保留可用")
-                t.expect(e.modelProbeLog?["model-b"] == nil, "[死 key] 首败不染红模型条")
-                core.scanHealth(staleAfter: 0) { _ in done.signal() }   // 连续 2 败:降级 + 全模型记红
+                t.equal(e.health, "dead", "[死 key] 401 首败即降级 dead")
+                t.expect(e.modelProbeLog?["model-a"]?.last?.ok == false, "[死 key] 首败即记红模型条")
+                core.scanHealth(staleAfter: 0) { _ in done.signal() }
                 _ = done.wait(timeout: .now() + 60)
                 e = core.history.find(idPrefix: "mon-deadm")!
-                t.equal(e.health, "dead", "[死 key] 连败降级 dead")
-                t.expect(e.modelProbeLog?["model-a"]?.last?.ok == false, "[死 key] 模型 a 记红格")
+                t.equal(e.health, "dead", "[死 key] 维持 dead")
                 t.expect(e.modelProbeLog?["model-b"]?.last?.ok == false, "[死 key] 模型 b 也记红格(不冻结)")
             }
             // 场景 4c:配置模型全红但 key 级 ok → 分区口径必须以用户配置为准

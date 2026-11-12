@@ -1058,6 +1058,22 @@ public final class Core {
         }
     }
 
+    /// 失败防抖分级决策(纯函数,供测试):
+    /// - 成功 → 清零 streak,应用新健康
+    /// - 暂时性网络失败(超时/不可达)+ 原本 ok + 首败 → 保留 ok(防抖),连败 ≥2 降级
+    /// - 服务端明确拒绝(401/403/429/5xx,非暂时)→ 首败即降级。
+    ///   真实反馈「监控全绿但访问完全不行」:一刀切防抖曾撑出最长 2 小时的全绿窗口
+    public static func healthDebounce(test: APITestResult, previousHealth: String?, previousStreak: Int,
+                               health: String?, detail: String) -> (health: String?, detail: String, streak: Int) {
+        let streak = previousStreak + (test.ok ? 0 : 1)
+        if test.ok { return (health, detail, 0) }
+        let keepAvailable = test.transientFailure && previousHealth == "ok" && streak < 2
+        if keepAvailable {
+            return ("ok", "⚠ 探测失败 1 次(保留可用,连续 2 次将降级): \(detail.prefix(70))", streak)
+        }
+        return (health, detail, streak)
+    }
+
     public func scanHealth(staleAfter: TimeInterval = 1800, completion: (([String]) -> Void)? = nil) {
         let synced = reconcileWithCCSwitch()
         if !synced.isEmpty {
@@ -1107,18 +1123,13 @@ public final class Core {
                 let (h, d) = Self.healthFor(test)
                 var updated = e
                 if test.ok { updated.apiStyle = test.style }
-                // 失败防抖:单次失败(网络抖动/瞬时 5xx)保留 ok 判定,只记 streak;
-                // 连续 ≥2 次失败才真正降级。成功即清零。真实反馈:显示可用但用不了,
-                // 反向问题同样存在 —— 一次抖动就把可用 key 踢进异常区造成误杀
-                let streak = (e.failStreak ?? 0) + (test.ok ? 0 : 1)
-                updated.failStreak = test.ok ? 0 : streak
-                if test.ok || streak >= 2 || (e.health != "ok" && e.health != nil) {
-                    updated.health = h
-                    updated.healthDetail = d
-                } else {
-                    updated.health = "ok"   // 防抖:首败保留可用,详情说明实情
-                    updated.healthDetail = "⚠ 探测失败 1 次(保留可用,连续 2 次将降级): \(d.prefix(70))"
-                }
+                // 失败防抖分级(决策纯函数见 healthDebounce,供测试)
+                let decision = Self.healthDebounce(test: test, previousHealth: e.health,
+                                                   previousStreak: e.failStreak ?? 0,
+                                                   health: h, detail: d)
+                updated.failStreak = decision.streak
+                updated.health = decision.health ?? updated.health
+                updated.healthDetail = decision.detail
                 updated.healthAt = now
                 updated.latencyMs = test.ok ? test.latencyMs : e.latencyMs
                 // 模型级监控:已探测的模型(通过/限流)各自记账 —— provider 导入多个模型,

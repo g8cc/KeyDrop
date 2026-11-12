@@ -645,6 +645,36 @@ enum AuditFixTests {
             t.equal(core.history.find(idPrefix: "magpie111")?.status, "deleted", "账本同步删除")
         }
 
+        // 防抖分级(纯函数):暂时性网络失败首败保留可用;确定性失败首败即降级
+        h.runSuite("Audit.防抖分级") { t in
+            func mk(ok: Bool, transient: Bool) -> APITestResult {
+                APITestResult(ok: ok, style: "openai", models: [], detail: "d",
+                              authFailed: false, transientFailure: transient)
+            }
+            let d = "detail"
+            // 暂时性(超时/不可达):首败保留 ok
+            let r1 = Core.healthDebounce(test: mk(ok: false, transient: true),
+                                         previousHealth: "ok", previousStreak: 0,
+                                         health: "err", detail: d)
+            t.equal(r1.health, "ok", "暂时性首败保留可用")
+            t.equal(r1.streak, 1, "streak=1")
+            // 连续 2 次暂时性:降级
+            let r2 = Core.healthDebounce(test: mk(ok: false, transient: true),
+                                         previousHealth: "ok", previousStreak: 1,
+                                         health: "err", detail: d)
+            t.equal(r2.health, "err", "暂时性连败 2 次降级")
+            // 确定性失败(401/5xx):首败即降级
+            let r3 = Core.healthDebounce(test: mk(ok: false, transient: false),
+                                         previousHealth: "ok", previousStreak: 0,
+                                         health: "dead", detail: d)
+            t.equal(r3.health, "dead", "确定性失败首败即降级")
+            // 成功清零
+            let r4 = Core.healthDebounce(test: mk(ok: true, transient: false),
+                                         previousHealth: "err", previousStreak: 3,
+                                         health: "ok", detail: d)
+            t.equal(r4.streak, 0, "成功清零")
+        }
+
         // CPA 生命周期守恒:账本 cpa 认领与 config.yaml 的 key 一一对应,删除即回收
         h.runSuite("Audit.CPA 生命周期守恒") { t in
             let env = try! TestEnv("audit-cpa-invariant")

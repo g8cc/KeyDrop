@@ -1048,6 +1048,11 @@ struct HistoryRow: View {
             && Core.shared.extractKey(entry) != nil
         let dotColor: Color = {
             if entry.status != "active" { return Color.secondary.opacity(0.6) }
+            // 防抖保留期(failStreak ≥ 1 但仍标 ok):警示黄,不再纯绿——
+            // 「看着能用实际不行」的窗口期必须可见
+            if entry.health == "ok", (entry.failStreak ?? 0) >= 1 {
+                return Color(red: 0.93, green: 0.68, blue: 0.20)
+            }
             switch entry.health {
             case "dead": return Color(red: 0.86, green: 0.28, blue: 0.24)
             case "err": return Color(red: 0.90, green: 0.55, blue: 0.18)
@@ -1119,6 +1124,20 @@ struct HistoryRow: View {
                                     RoundedRectangle(cornerRadius: 3)
                                         .fill(Color(red: 0.85, green: 0.55, blue: 0.15).opacity(0.13))
                                 )
+                        }
+                        if entry.viaCPAOk == false {
+                            // 经 CPA 网关的真实链路探测失败:上游直连是通的,
+                            // 但用户真实流量走的链路断了——行内可见而非只藏在 tooltip
+                            Text("CPA 链路 ✗")
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(Color(red: 0.86, green: 0.28, blue: 0.24))
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(Color(red: 0.86, green: 0.28, blue: 0.24).opacity(0.13))
+                                )
+                                .help("经 CPA 网关(8317)的真实链路探测失败,而直连上游是通的——你实际访问走的正是这条链路;多为 CPA 配置/容器网络问题")
                         }
                         monitorBadges(entry)
                     }
