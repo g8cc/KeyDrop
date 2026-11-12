@@ -43,6 +43,11 @@
 - chat 健康探测遇 429/402 + 有效 Retry-After 时,按 地址/凭据/模型/代理 隔离冷却(秒数与 HTTP 日期,上限一天,重启清除)
 
 ### 解析与导入修复
+- 内嵌 JSON 行提取:`{"_type":"newapi_channel_conn","key":…,"url":…}` 一行 JSON
+  + 活动说明 + 可用模型列表 的粘贴,曾整段按多行文本切碎(key 变垃圾碎片、
+  URL 被官方 fallback 误猜成 api.deepseek.com);现在正确提取并合并模型列表
+- 模型候选剥尾部注解:`deepseek-v4.1-flash (会映射到deepseek-flash)` 曾整行
+  因含空格被当非模型而丢失;`[日期]` 开头的活动标题行不再混进模型候选
 - 裸域名带路径/端口的 URL 识别(`tokenhub.icu/v1`、`gw.example.com:8317/v1`);漏判时禁止静默复用上次 URL(防拿新 key 测旧站),失败报错附复用说明
 - Clash 订阅 YAML 自引入起即非法的问题(字段缩进错位),同名节点去重防 mihomo 拒载
 

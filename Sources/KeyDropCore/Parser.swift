@@ -199,9 +199,65 @@ public enum Parser {
                 return p
             }
         }
+        // 整段不是合法 JSON 时,尝试「JSON 行 + 说明文字」形态
+        // (newapi_channel_conn 等渠道导出常见:一行 JSON,后面跟活动说明与可用模型列表)。
+        // 曾把这类粘贴当普通多行文本切碎:key 变垃圾碎片、URL 走官方 fallback 误猜成
+        // api.deepseek.com(真实反馈 2026-11-12)
+        let rawLines = trimmed.components(separatedBy: "\n")
+        for (idx, l) in rawLines.enumerated() {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix("{"), t.hasSuffix("}"),
+                  let d = t.data(using: .utf8),
+                  (try? JSONSerialization.jsonObject(with: d)) != nil else { continue }
+            var jp = ParsedKey()
+            extractJSON(try! JSONSerialization.jsonObject(with: d), into: &jp)
+            guard jp.key != nil else { continue }
+            jp.format = "json"
+            applyOfficialURLFallback(&jp, raw: text)
+            // 剩余行只提取模型(标题/「可用模型:」列表),不能走 parseMultiline ——
+            // 它没有 key 会抛错。跳过 [ 开头的日期/活动标题行
+            let rest = rawLines.enumerated()
+                .filter { $0.offset != idx }
+                .map { $0.element }
+            let merged = extractModels(fromLines: rest)
+            if !merged.isEmpty {
+                var seen = Set<String>()
+                jp.models = ((jp.models ?? []) + merged).filter { seen.insert($0).inserted }
+                if jp.model == nil { jp.model = merged.first }
+            }
+            return jp
+        }
         var p = try parseMultiline(trimmed)
         applyOfficialURLFallback(&p, raw: text)
         return p
+    }
+
+    /// 从说明行提取模型候选:剥首尾括号注解(「deepseek-v4.1-flash (会映射到 xx)」
+    /// 曾整行因含空格被 looksLikeModel 拒绝而丢失),跳过 [ 开头的日期/活动标题行
+    static func extractModels(fromLines lines: [String]) -> [String] {
+        var out: [String] = []
+        var seen = Set<String>()
+        for l in lines {
+            let t = l.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("[") { continue }
+            for tok in t.components(separatedBy: CharacterSet(charactersIn: " \t,，、;；:：")) {
+                let c = cleanModelToken(tok)
+                guard !c.isEmpty, looksLikeModel(c), !c.contains("不限"), !c.contains("免费"),
+                      !c.contains("额度"), !c.contains("有效"), !c.contains("活动"),
+                      seen.insert(c).inserted else { continue }
+                out.append(c)
+            }
+        }
+        return out
+    }
+
+    /// 剥模型 token 首尾的括号注解与引号
+    static func cleanModelToken(_ s: String) -> String {
+        var t = s.trimmingCharacters(in: .whitespaces)
+        if t.count >= 2, t.hasPrefix("("), t.hasSuffix(")") { t = String(t.dropFirst().dropLast()) }
+        if t.count >= 2, t.hasPrefix("（"), t.hasSuffix("）") { t = String(t.dropFirst().dropLast()) }
+        t = t.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        return t.trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - 官方站点 fallback
@@ -787,7 +843,26 @@ public enum Parser {
                     .filter { !$0.isEmpty }
                 p.model = list.first ?? m.0
             }
-            let modelCands = vals.filter { looksLikeModel($0) }
+            // 模型候选:整行像模型直接用;否则拆 token 剥注解再试
+            // ("deepseek-v4.1-flash (会映射到 xx)" 曾整行因含空格丢失)
+            let modelCands: [String] = {
+                var out: [String] = []
+                var seen = Set<String>()
+                for v in vals {
+                    if v.hasPrefix("[") { continue }   // [日期] 活动标题行
+                    if looksLikeModel(v) {
+                        if seen.insert(v).inserted { out.append(v) }
+                        continue
+                    }
+                    for tok in v.components(separatedBy: " ") {
+                        let c = cleanModelToken(tok)
+                        // 拆出来的短 token 收紧门槛,防把名称行("DeepSeek V4 Flash")拆碎污染
+                        guard c.count >= 6, looksLikeModel(c), seen.insert(c).inserted else { continue }
+                        out.append(c)
+                    }
+                }
+                return out
+            }()
             if p.model == nil { p.model = modelCands.first }
             var extraModels: [String] = []
             if modelCands.isEmpty {

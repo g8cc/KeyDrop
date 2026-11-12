@@ -501,6 +501,31 @@ enum AuditFixTests {
             t.contains(tip, "cc-switch(Claude) · CPA · DeepSeek Harness")
         }
 
+        // 用户真实反馈(2026-11-12):newapi 渠道导出(JSON 行 + 活动说明 + 可用模型列表)
+        // 曾整段按普通多行文本切碎:key 变垃圾碎片、URL 被官方 fallback 误猜成
+        // api.deepseek.com、带注解的模型行(deepseek-v4.1-flash (会映射到 xx))整行丢失
+        h.runSuite("Audit.内嵌 JSON 行 + 可用模型列表") { t in
+            let raw = """
+            {"_type":"newapi_channel_conn","key":"sk-MOX-qGuUJHrsLe2ReLNLP8wzpefaLVlEay2xoSSlraEvkoM75POq","url":"https://jpn.cdn.moxuna.com"}
+            [11.11 - 11.13] Deepseek-flash 1017不限量
+            可用模型：
+            deepseek-v4-pro
+            deepseek-flash
+            deepseek-v4.1-flash (会映射到deepseek-flash)
+            """
+            let p = try! Parser.parse(raw)
+            t.equal(p.url, "https://jpn.cdn.moxuna.com", "JSON 行 URL(修复前误猜官方站)")
+            t.equal(p.key, "sk-MOX-qGuUJHrsLe2ReLNLP8wzpefaLVlEay2xoSSlraEvkoM75POq", "JSON 行 key(修复前垃圾碎片)")
+            t.equal(p.models, ["deepseek-v4-pro", "deepseek-flash", "deepseek-v4.1-flash"],
+                    "模型列表全齐且注解剥离")
+            t.equal(p.model, "deepseek-v4-pro", "激活模型 = 列表第一个")
+            t.equal(p.format, "json", "标记 json 来源")
+
+            // 带 key 的普通多行 + 注解模型行(classify 路径)
+            let p2 = try! Parser.parse("https://x.example.com/v1\nsk-test-annkey-00001\ndeepseek-v4.1-flash (会映射到deepseek-flash)")
+            t.equal(p2.models, ["deepseek-v4.1-flash"], "注解剥离(classify 路径)")
+        }
+
         // CPA 生命周期守恒:账本 cpa 认领与 config.yaml 的 key 一一对应,删除即回收
         h.runSuite("Audit.CPA 生命周期守恒") { t in
             let env = try! TestEnv("audit-cpa-invariant")
