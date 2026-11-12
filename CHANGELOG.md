@@ -57,6 +57,27 @@
   真实资产清单回归测试。受影响的旧版本用户需手动安装一次(下载 dmg/zip
   拖入 Applications),之后的自动更新恢复正常
 
+### 同步链路专项加固(双代理审计 17 项发现)
+- **Grok key 轮换残留(P1)**:removeModelSections 按 model+key 寻址,换 key 后
+  旧 key 的模型表永久残留并在 upsert 时制造 #尾号 重复表;sync/edit 现传
+  staleKeys 清旧表
+- **replayArtifacts 复活用户手删产物(P1)**:cc-switch 重建跳过 ccMissing 待确认
+  条目;cc.add 新增 activate 参数,重放/同步不再抢激活(opencode 亦纳入),
+  is_current=0、不改 switch settings 指针与 live 配置
+- **feed LWW 三个越权(P1)**:本机墓碑不被远端 active 版复活;targets 取本机∪远端
+  (曾整条取远端丢本地标签);墓碑传播现在按本机绑定清理产物(CPA 池 key/
+  Grok/cc-switch,DSH 由孤儿清理自愈)
+- **未装工具的机器不再被写入(P1)**:replay/feed 的 DSH/Grok 分支加安装守卫,
+  不再凭空创建 ~/.dsh/~/.grok 并落明文凭据
+- 口径与边界:reconcileDSH 与写入端统一 trim;managedRoutes 补转义解码
+  (含引号/反斜杠的值曾每轮误判漂移无限重写);DSH 家族认领加 apiKeyEnv 校验
+  (id8 碰撞不再互删);syncTarget 四分支补齐账本失败回滚;CPA 同步先回收
+  旧路径 key 防双配置残留;常驻入口创建行打 keydrop 标记,用户手写的
+  同端点行不覆盖(与 native 铁律同源);cpaResident 关闭后常驻路由正常回收
+- reconcileWithCCSwitch 探测失败不再断言「key 仍可用」;401+HTML 盾页豁免
+  与 403 对齐;applyCap 近期墓碑(60 天)豁免;账本指纹纳入 targets
+  (targets 变更现在会触发自动推送)
+
 ### 解析与导入修复
 - 内嵌 JSON 行提取:`{"_type":"newapi_channel_conn","key":…,"url":…}` 一行 JSON
   + 活动说明 + 可用模型列表 的粘贴,曾整段按多行文本切碎(key 变垃圾碎片、

@@ -104,7 +104,7 @@ public enum LedgerCrypto {
     public static func ledgerFingerprint(_ entries: [HistoryEntry]) -> String {
         let joined = entries
             .sorted { $0.id < $1.id }
-            .map { "\($0.id)|\($0.key ?? "")|\($0.url ?? "")|\($0.status)|\($0.models?.joined(separator: ",") ?? "")|\($0.name ?? "")|\($0.note ?? "")" }
+            .map { "\($0.id)|\($0.key ?? "")|\($0.url ?? "")|\($0.status)|\($0.models?.joined(separator: ",") ?? "")|\($0.name ?? "")|\($0.note ?? "")|\($0.targets.joined(separator: ","))" }
             .joined(separator: "\n")
         return SHA256.hash(data: Data(joined.utf8)).map { String(format: "%02x", $0) }.joined()
     }

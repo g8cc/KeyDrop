@@ -564,6 +564,49 @@ enum AuditFixTests {
             }
         }
 
+        // Grok key 轮换:旧 key 的模型表必须清理(审计 P1:removeModelSections
+        // 按 model+key 寻址,换 key 不传旧 key 会永久残留 + upsert 制造 #尾号 重复表)
+        h.runSuite("Audit.Grok key 轮换清理") { t in
+            let env = try! TestEnv("audit-grok-rotate")
+            defer { env.cleanup() }
+            let w = GrokBuildWriter(configPath: env.dir + "/grok.toml")
+            _ = try! w.add(baseURL: "https://g.example.com/v1", key: "sk-old-key-000000001", models: ["grok-4-fast"])
+            _ = try! w.sync(baseURL: "https://g.example.com/v1", key: "sk-new-key-000000002",
+                            models: ["grok-4-fast"], removing: [], staleKeys: ["sk-old-key-000000001"])
+            let cfg = env.read("grok.toml")
+            t.expect(!cfg.contains("sk-old-key-000000001"), "旧 key 模型表清理")
+            t.contains(cfg, "sk-new-key-000000002", "新 key 表写入")
+            t.equal(cfg.components(separatedBy: "sk-new-key-000000002").count - 1, 1,
+                    "新 key 只出现一次(单表无 #尾号 重复)")
+        }
+
+        // applyCap 近期墓碑豁免:墓碑被裁 → localTombstoneKeys 失效 → 凭据复活
+        h.runSuite("Audit.applyCap 墓碑豁免") { t in
+            func mk(_ id: String, status: String, deletedAt: TimeInterval? = nil) -> HistoryEntry {
+                var e = HistoryEntry(
+                    id: id, ts: 1, raw: "raw", format: "t", name: nil, url: nil, model: nil,
+                    models: nil, key: "sk-\(id)-000000000001", keyMasked: "sk-…",
+                    targets: status == "active" ? [] : [],
+                    ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                    cpaConfigPath: nil, status: status)
+                e.deletedAt = deletedAt
+                return e
+            }
+            var actives: [HistoryEntry] = []
+            for i in 0..<499 {
+                actives.append(mk(String(format: "act%04d-", i) + "1111-1111-111111111111", status: "active"))
+            }
+            let recentTomb = mk("recenttomb-1111-1111-111111111111", status: "deleted",
+                                deletedAt: Date().timeIntervalSince1970 - 3600)
+            let oldTomb = mk("oldtomb1111-1111-1111-111111111111", status: "deleted",
+                             deletedAt: Date().timeIntervalSince1970 - 90 * 24 * 3600)
+            let capped = HistoryStore.applyCap(actives + [recentTomb, oldTomb])
+            let ids = Set(capped.map { $0.id })
+            t.expect(ids.contains(recentTomb.id), "近期墓碑豁免(删除不复活不变量的载体)")
+            t.expect(!ids.contains(oldTomb.id), "过期墓碑正常裁剪")
+            t.equal(capped.count, 500, "上限 500")
+        }
+
         // CPA 生命周期守恒:账本 cpa 认领与 config.yaml 的 key 一一对应,删除即回收
         h.runSuite("Audit.CPA 生命周期守恒") { t in
             let env = try! TestEnv("audit-cpa-invariant")

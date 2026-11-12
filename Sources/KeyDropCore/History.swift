@@ -588,7 +588,13 @@ public final class HistoryStore {
         var kept: [HistoryEntry] = []
         kept.reserveCapacity(items.count)
         for e in items.reversed() {
-            if toRemove > 0, e.status != "active" || e.targets.isEmpty {
+            // 近期墓碑豁免(60 天):墓碑是「已删 key 不复活」不变量的载体,
+            // 被裁后 localTombstoneKeys 失效 → 维护者再推 active 版原样收下(凭据复活)
+            let isRecentTombstone = e.status == "deleted" && {
+                let t = e.deletedAt ?? e.healthAt ?? e.ts
+                return Date().timeIntervalSince1970 - t < 60 * 24 * 3600
+            }()
+            if toRemove > 0, !isRecentTombstone, e.status != "active" || e.targets.isEmpty {
                 toRemove -= 1
             } else {
                 kept.append(e)

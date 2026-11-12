@@ -26,7 +26,10 @@ public final class GrokBuildWriter {
     }
 
     /// Upsert the selected models and remove stale models belonging to the same provider.
-    public func sync(baseURL: String, key: String, models: [String], removing oldModels: [String]) throws -> String {
+    /// - Parameter staleKeys: 该条目历史同步用过的旧 key(站方轮换/编辑换 key)。
+    ///   removeModelSections 按 model+key 寻址,旧 key 的模型表会永久残留并在
+    ///   upsert 时制造 #尾号 重复表(真实审计 2026-11-13)——换 key 场景必须传入
+    public func sync(baseURL: String, key: String, models: [String], removing oldModels: [String], staleKeys: [String] = []) throws -> String {
         let normalizedURL = normalizeURL(baseURL)
         let normalizedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         let selected = uniqueModels(models)
@@ -38,6 +41,9 @@ public final class GrokBuildWriter {
             var lines = try readLines()
             let stale = uniqueModels(oldModels).filter { !selected.contains($0) }
             _ = removeModelSections(&lines, models: stale, baseURL: normalizedURL, key: normalizedKey)
+            if !staleKeys.isEmpty {
+                _ = removeSectionsForStaleKeys(&lines, keys: staleKeys, baseURL: normalizedURL)
+            }
             var namespaced = 0
             for model in selected {
                 if upsertModel(&lines, model: model, baseURL: normalizedURL, key: normalizedKey) {
@@ -253,6 +259,25 @@ public final class GrokBuildWriter {
 
     /// 删除条件 = model 字段命中 ∧ api_key 相同 ∧ base_url 相同。
     /// 按 table id 删除在「#尾号共存」后会漏删/误删,必须按内容
+    /// 摘除旧 key 名下的全部模型表(按 baseURL + key 匹配,不限模型):
+    /// key 轮换后旧 key 的段靠这个清理,否则 Grok Build 里持续展示指向
+    /// 已吊销 key 的死模型
+    private func removeSectionsForStaleKeys(
+        _ lines: inout [String],
+        keys: [String],
+        baseURL: String
+    ) -> Int {
+        let stale = Set(keys.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        guard !stale.isEmpty else { return 0 }
+        let ranges = scanModelSections(in: lines)
+            .filter { stale.contains($0.apiKey ?? "") && normalizeURL($0.baseURL ?? "") == baseURL }
+            .map(\.range)
+        for range in ranges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
+            lines.removeSubrange(range)
+        }
+        return ranges.count
+    }
+
     private func removeModelSections(
         _ lines: inout [String],
         models: [String],

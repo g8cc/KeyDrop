@@ -75,7 +75,10 @@ public final class CCSwitchWriter {
 
     // MARK: - add
 
-    public func add(_ p: ParsedKey, nameOverride: String? = nil, appType: String = "claude", models: [String] = [], proxy: String? = nil) throws -> CCAddResult {
+    /// - Parameter activate: false = 只写凭据不抢激活(同步/重放语义:
+    ///   is_current=0、不动 switch settings 指针)。true = 导入语义(抢激活)。
+    ///   审计 2026-11-13:同步菜单曾隐含抢激活,把用户当前用的 provider 静默换掉
+    public func add(_ p: ParsedKey, nameOverride: String? = nil, appType: String = "claude", models: [String] = [], proxy: String? = nil, activate: Bool = true) throws -> CCAddResult {
         guard let key = p.key, !key.isEmpty else { throw WriterError.missingKey }
         guard let url = p.url, !url.isEmpty else { throw WriterError.missingURL }
         // 家族过滤必须收敛在写入层,不能依赖调用方传对(文件头不变量①):
@@ -90,7 +93,7 @@ public final class CCSwitchWriter {
         let name = (nameOverride?.isEmpty == false ? nameOverride! : p.name) ?? defaultName(for: url)
         let wireApi = "responses"
         let fakeRunning = ProcessInfo.processInfo.environment["KEYDROP_FAKE_CC_RUNNING"] == "1"
-        let deferActivation = (appType == "claude" || appType == "codex") && Self.ccSwitchStateMayBeStale()
+        let deferActivation = !activate || ((appType == "claude" || appType == "codex") && Self.ccSwitchStateMayBeStale())
         let supportsResponses = appType == "codex" && !fakeRunning
             ? APITester.supportsResponsesAPI(base: url, key: key, proxy: proxy) : true
         let apiFormat = supportsResponses ? "openai_responses" : "openai_chat"
@@ -1247,17 +1250,25 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         p.url = baseURL
         p.key = clientKey
 
-        // 既有匹配:所有候选里找 URL+key 双一致的第一个
+        // 既有匹配:所有候选里找 URL+key 双一致的第一个。
+        // 非 KeyDrop 托管行(meta 无 keydrop 标记且非 hostedID)即使 URL+key 双一致
+        // 也跳过:那是用户手写的同端点配置,整行覆盖曾抹掉用户手选的模型
+        // (真实事故,与 syncCPAResidentNative 的铁律同源)
         let rows = try db.query(
-            "SELECT p.id, e.url, p.settings_config FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
+            "SELECT p.id, e.url, p.settings_config, p.meta FROM providers p JOIN provider_endpoints e ON p.id=e.provider_id WHERE p.app_type=?",
             [appType]
         )
         var existingID: String? = nil
+        let hostedID = Self.cpaResidentID(appType: appType)
         for row in rows {
-            guard row.count > 2, let pid = row[0], let u = row[1],
+            guard row.count > 3, let pid = row[0], let u = row[1],
                   normalizeEndpointURL(u) == normURL,
                   Self.providerAPIKey(from: row[2] ?? "", appType: appType) == clientKey
             else { continue }
+            if pid != hostedID, !(row[3]?.contains("keydrop") ?? false) {
+                AppLog.warn("CPA 常驻(\(appType)): 同端点存在用户手写行(\(pid.prefix(8))),跳过不覆盖")
+                return "已跳过(存在用户手写的同端点配置,不覆盖)"
+            }
             existingID = pid
             break
         }
@@ -1292,9 +1303,11 @@ try mergeEnvIntoClaudeSettings(claudeEnv(for: p, models: models, proxy: proxy))
         }
 
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let meta = appType == "codex"
-            ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"openai_responses\"}"
-            : "{}"
+        // meta 打 keydrop 标记:二次同步凭此识别托管行(无标记的同端点行
+        // 是用户手写的,绝不覆盖 —— 与 native 路径铁律同源)
+        let meta = (appType == "codex"
+            ? "{\"commonConfigEnabled\":false,\"endpointAutoSelect\":true,\"apiFormat\":\"openai_responses\",\"keydrop\":{\"origin\":\"cpa-resident\"}}"
+            : "{\"keydrop\":{\"origin\":\"cpa-resident\"}}")
         try db.exec("BEGIN IMMEDIATE")
         do {
             // is_current=0:被动入口不抢激活;sort_index NULL:不打扰用户在 cc-switch 里的手动排序

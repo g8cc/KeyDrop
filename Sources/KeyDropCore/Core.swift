@@ -1263,7 +1263,9 @@ public final class Core {
                     appendNote("cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记")
                 } else {
                     updated.ccMissing = true
-                    appendNote("cc-switch provider 缺失,key 仍可用,可手动重新导入")
+                    appendNote(test.ok
+                               ? "cc-switch provider 缺失,key 仍可用,可手动重新导入"
+                               : "cc-switch provider 缺失(探测失败,key 状态未知);恢复后可手动重新导入")
                 }
                 updated.health = test.authFailed ? "dead" : (test.ok ? "ok" : "err")
                 updated.healthDetail = test.detail
@@ -1425,8 +1427,10 @@ public final class Core {
         let claimed = history.snapshot().filter { $0.status == "active" && $0.targets.contains("dsh") }
         // 认领按 id8 基名家族判定:路由名可能是装饰名(keydrop-<id8>-host-模型)
         var claimedBases = Set(claimed.map { String($0.id.prefix(8)) })
-        // CPA 常驻路由的生命周期归 syncCPAResidentEntries/removeCPAResident 管理,对账不碰
-        claimedBases.insert("cparesid")
+        // CPA 常驻路由只在常驻开关开启时认领:关掉后交给孤儿清理回收路由+凭据
+        if prefs.cpaResident {
+            claimedBases.insert("cparesid")
+        }
 
         do {
             let pruned = try DSHWriter.pruneOrphanRoutes(claimedBases: claimedBases)
@@ -1439,21 +1443,29 @@ public final class Core {
             for e in claimed {
                 let rk = DSHWriter.routeKey(providerID: e.id)
                 guard let url = e.url, let key = extractKey(e), !key.isEmpty else { continue }
-                let models = (e.models ?? (e.model.map { [$0] } ?? [])).filter { !$0.isEmpty }
+                // 与 syncToDSH/syncTarget 同口径 trim:账本值带空白时,对账曾用
+                // 未 trim 值判漂移并把脏数据回写目标应用(审计 2026-11-13)
+                let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+                let models = (e.models ?? (e.model.map { [$0] } ?? []))
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
                 guard !models.isEmpty else { continue }
                 // 家族查找:路由可能是旧的裸名,也可能是任一装饰名
-                guard let r = managed.first(where: { DSHWriter.isOwnedRoute($0.name, providerID: e.id) }) else {
+                // 家族匹配 + env 校验:id8 碰撞时按凭据 env 区分归属
+                guard let r = managed.first(where: {
+                    DSHWriter.isOwnedRoute($0.name, providerID: e.id) && $0.env == DSHWriter.envName(providerID: e.id)
+                }) else {
                     missing.append(rk)
                     continue
                 }
                 // 与写入同源归一(sync 时 baseURL 过 normalizeBaseURL),否则必然误报漂移
                 // 装饰名也算漂移:旧命名的路由在对账时自动改名,无需逐条重新同步
-                let wantName = DSHWriter.displayRouteKey(providerID: e.id, url: url, models: models)
+                let wantName = DSHWriter.displayRouteKey(providerID: e.id, url: trimmedURL, models: models)
                 if r.name == wantName,
-                   r.baseURL == DSHWriter.normalizeBaseURL(url), r.models == models,
+                   r.baseURL == DSHWriter.normalizeBaseURL(trimmedURL), r.models == models,
                    DSHWriter.hasCredential(env: r.env) { continue }
                 // add 会摘旧装饰名挂新名:url/models 变化即改名
-                _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
+                _ = try DSHWriter.add(providerID: e.id, key: key, url: trimmedURL, models: models)
                 updated.append(rk)
             }
             if !updated.isEmpty {
@@ -1614,6 +1626,32 @@ public final class Core {
                     t.targets = []
                     feedChanged.append(t)
                     tombstonePropagated += 1
+                    // 墓碑不只翻账本:按本机绑定清理产物。CPA 池的 key 会被真实流量
+                    // 轮询,最关键;cc/grok 次之;DSH 由 reconcileDSH 孤儿清理自愈
+                    var cleaned: [String] = []
+                    if local.targets.contains("cpa"), let cfg = local.cpaConfigPath {
+                        let keys = extractAllKeys(for: local) ?? []
+                        if !keys.isEmpty, let msg = try? CPAWriter(configPath: cfg).remove(apiKeys: keys) {
+                            cleaned.append("CPA: \(msg)")
+                        }
+                    }
+                    if local.targets.contains("grok"), let gp = local.grokConfigPath,
+                       let gk = local.key, !gk.isEmpty, let gURL = local.url {
+                        if let msg = try? GrokBuildWriter(configPath: gp).remove(baseURL: gURL, key: gk, models: local.models ?? []) {
+                            cleaned.append("Grok: \(msg)")
+                        }
+                    }
+                    if let pid = local.ccProviderID {
+                        let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                            .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                        if (try? cc.remove(providerID: pid, renamedFrom: local.ccRenamedFrom,
+                                           renamedTo: local.ccRenamedTo, appType: oldApp)) != nil {
+                            cleaned.append("cc-switch: 已移除")
+                        }
+                    }
+                    if !cleaned.isEmpty {
+                        AppLog.info("墓碑传播产物清理(\(local.id.prefix(8))): \(cleaned.joined(separator: "; "))")
+                    }
                 } else {
                     skippedTombstone += 1
                 }
@@ -1625,6 +1663,13 @@ public final class Core {
                 // 本机产物同步:cc 行内容更新 / CPA 组内旧 key 换新 / DSH upsert / grok sync
                 let localTS = local.updatedAt ?? 0
                 let remoteTS = e.updatedAt ?? 0
+                if remoteTS > localTS, local.status == "deleted", e.status != "deleted" {
+                    // 本机墓碑不被远端 active 版复活——即使远端较新(维护者更新不能
+                    // 推翻本机删除;曾同 id 绕过 localTombstoneKeys 守卫,审计 2026-11-13)。
+                    // 远端也是墓碑时走正常 LWW 更新 deletedAt
+                    skippedTombstone += 1
+                    continue
+                }
                 if remoteTS > localTS {
                     // 产物同步失败绝不能静默:账本已记新 key 而 CPA 池还轮询旧 key 时,
                     // 旧 key 会成为无账本指针的永久残留凭据。至少留痕
@@ -1655,10 +1700,14 @@ public final class Core {
                         }
                     }
                     if e.targets.contains("dsh"), let dk = e.key, !dk.isEmpty, let dURL = e.url {
-                        do {
-                            try DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: e.models ?? [])
-                        } catch {
-                            AppLog.error("feed 同步 DSH 写入失败(\(e.id.prefix(8))): \(error.localizedDescription)")
+                        if DSHWriter.installed() {
+                            do {
+                                try DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: e.models ?? [])
+                            } catch {
+                                AppLog.error("feed 同步 DSH 写入失败(\(e.id.prefix(8))): \(error.localizedDescription)")
+                            }
+                        } else {
+                            AppLog.info("feed 同步: 本机未安装 DSH,跳过(\(e.id.prefix(8)))")
                         }
                     }
                     if e.targets.contains("grok"), let gp = local.grokConfigPath,
@@ -1676,6 +1725,11 @@ public final class Core {
                     merged.ccRenamedTo = local.ccRenamedTo
                     merged.cpaConfigPath = local.cpaConfigPath
                     merged.grokConfigPath = local.grokConfigPath
+                    // targets 是【本机产物事实】:整条取远端曾丢掉本机独有的标签
+                    // (如本机同步过 DSH 而维护者没有)。取并集,顺序 = 本机优先
+                    for t in e.targets where !merged.targets.contains(t) {
+                        merged.targets.append(t)
+                    }
                     merged.updatedAt = Date().timeIntervalSince1970
                     feedChanged.append(merged)
                     updatedFromFeed += 1
@@ -1734,12 +1788,16 @@ public final class Core {
             guard let url = e.url, let key = e.key, !key.isEmpty,
                   let models = e.models, !models.isEmpty, !e.targets.isEmpty else { continue }
             var entryLines: [String] = []
+            var ccRebuilt = false
             // cc-switch
             if e.targets.contains(where: { $0.hasPrefix("ccswitch") }) {
                 let appType = e.targets.first(where: { $0.hasPrefix("ccswitch-") })
                     .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
                 if let pid = e.ccProviderID, cc.providerExists(pid, appType: appType) {
                     entryLines.append("cc-switch: 本机已有,跳过")
+                } else if e.ccMissing == true {
+                    // 用户在本机确认过 provider 缺失待决策:重放不得复活(审计 2026-11-13)
+                    entryLines.append("cc-switch: 已标记缺失待确认,跳过重放")
                 } else {
                     do {
                         var p = ParsedKey()
@@ -1747,28 +1805,37 @@ public final class Core {
                         p.key = key
                         p.model = models.first
                         p.name = e.name
+                        // 重放语义 = 重建产物,不抢激活(activate: false;
+                        // 曾批量重放多条时最后一条赢,激活结果取决于快照顺序)
                         let r = try cc.add(p, nameOverride: e.name, appType: appType,
-                                           models: models, proxy: px)
+                                           models: models, proxy: px, activate: false)
                         e.ccProviderID = r.providerID
                         let tag = appType == "claude" ? "ccswitch" : "ccswitch-\(appType)"
                         if !e.targets.contains(tag) { e.targets.append(tag) }
-                        entryLines.append("cc-switch: 已重放")
+                        entryLines.append("cc-switch: 已重放(未激活)")
                         replayed += 1
+                        ccRebuilt = true
                     } catch {
                         entryLines.append("⚠ cc-switch: \(error.localizedDescription)")
                     }
                 }
             }
-            // grok
+            // grok(本机未装 Grok Build 时凭空建目录+落明文 key 曾无守卫,审计 2026-11-13)
             if e.targets.contains("grok") {
-                do {
-                    let writer = GrokBuildWriter(configPath: e.grokConfigPath)
-                    let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])
-                    e.grokConfigPath = writer.configPath
-                    entryLines.append("Grok Build: 已重放")
-                    replayed += 1
-                } catch {
-                    entryLines.append("⚠ Grok Build: \(error.localizedDescription)")
+                let grokInstalled = e.grokConfigPath != nil
+                    || FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.grok")
+                if !grokInstalled {
+                    entryLines.append("– Grok Build: 本机未安装,跳过")
+                } else {
+                    do {
+                        let writer = GrokBuildWriter(configPath: e.grokConfigPath)
+                        let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])
+                        e.grokConfigPath = writer.configPath
+                        entryLines.append("Grok Build: 已重放")
+                        replayed += 1
+                    } catch {
+                        entryLines.append("⚠ Grok Build: \(error.localizedDescription)")
+                    }
                 }
             }
             // cpa
@@ -1787,8 +1854,12 @@ public final class Core {
                     entryLines.append("– CPA: 本机未找到 CPA 配置,跳过")
                 }
             }
-            // dsh
+            // dsh(未装 DSH 的机器曾凭空创建 ~/.dsh 并落明文凭据,审计 2026-11-13)
             if e.targets.contains("dsh") {
+                guard DSHWriter.installed() else {
+                    entryLines.append("– DSH: 本机未安装,跳过")
+                    continue
+                }
                 do {
                     _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
                     entryLines.append("DSH: 已重放")
@@ -1798,7 +1869,7 @@ public final class Core {
                 }
             }
             guard !entryLines.isEmpty else { continue }
-            e.ccMissing = nil
+            if ccRebuilt { e.ccMissing = nil }   // 只在确实重建了 provider 时清除待确认状态
             do { try history.update(e) } catch {
                 entryLines.append("⚠ 账本更新失败: \(error.localizedDescription)")
             }
@@ -2611,11 +2682,15 @@ public final class Core {
         } else if desiredAppType == "grok", entry.targets.contains("grok") {
             do {
                 let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
+                // 换 key(站方轮换)必须传旧 key:removeModelSections 按 model+key 寻址,
+                // 不传则旧 key 的模型表永久残留并在 upsert 时制造 #尾号 重复表
+                let staleGrokKeys = (entry.key != nil && entry.key != effectiveKey) ? [entry.key!] : []
                 let msg = try writer.sync(
                     baseURL: url,
                     key: effectiveKey,
                     models: newModels,
-                    removing: previousModels
+                    removing: previousModels,
+                    staleKeys: staleGrokKeys
                 )
                 entry.grokConfigPath = writer.configPath
                 lines.append("✓ Grok Build: \(msg)")
@@ -2893,26 +2968,40 @@ public final class Core {
             p.key = key
             p.model = models.first
             p.name = entry.name
-            let r = try cc.add(p, nameOverride: entry.name, appType: appType, models: models, proxy: px)
+            // 同步语义 = 写入凭据,不抢激活(用户当前用的 provider 不被换掉)
+            let r = try cc.add(p, nameOverride: entry.name, appType: appType, models: models, proxy: px, activate: false)
             entry.ccProviderID = r.providerID
             let tag = appType == "claude" ? "ccswitch" : "ccswitch-\(appType)"
             if !entry.targets.contains(tag) { entry.targets.append(tag) }
             try history.update(entry)
-            return "cc-switch: 已新建 provider 并激活(\(tag))"
+            return "cc-switch: 已新建 provider(未激活,需要时在 cc-switch 中切换)"
         case "cpa":
             guard let cfg = prefs.resolvedCPAConfig() else {
                 throw ParseError.io("本机未找到 CPA 配置(config.yaml 或管理 API)")
+            }
+            // 旧配置路径漂移守卫:先从旧路径回收 key,防双配置残留无账本指针的凭据
+            if let oldCfg = entry.cpaConfigPath, oldCfg != cfg {
+                do { _ = try CPAWriter(configPath: oldCfg).remove(apiKeys: [key]) }
+                catch { AppLog.warn("CPA 同步: 旧配置(\(oldCfg))key 回收失败: \(error.localizedDescription)") }
             }
             let msg = try CPAWriter(configPath: cfg)
                 .addAggregated(baseURL: url, key: key, models: models)
             entry.cpaConfigPath = cfg
             if !entry.targets.contains("cpa") { entry.targets.append("cpa") }
-            try history.update(entry)
+            do { try history.update(entry) }
+            catch {
+                try? CPAWriter(configPath: cfg).remove(apiKeys: [key])
+                throw ParseError.io("CPA 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+            }
             return "CPA: \(msg)"
         case "dsh":
             let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
             if !entry.targets.contains("dsh") { entry.targets.append("dsh") }
-            try history.update(entry)
+            do { try history.update(entry) }
+            catch {
+                try? DSHWriter.remove(providerID: entry.id)
+                throw ParseError.io("DSH 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+            }
             // 先认领(history.update)再全量对账,顺序同理见 syncToDSH
             let reconcileLines = reconcileDSH()
             var msg = "DSH: \(route)"
@@ -2923,7 +3012,11 @@ public final class Core {
             let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])
             entry.grokConfigPath = writer.configPath
             if !entry.targets.contains("grok") { entry.targets.append("grok") }
-            try history.update(entry)
+            do { try history.update(entry) }
+            catch {
+                try? writer.remove(baseURL: url, key: key, models: models)
+                throw ParseError.io("Grok Build 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+            }
             return "Grok Build: \(msg)"
         default:
             throw ParseError.io("未知同步目标: \(target)")

@@ -287,7 +287,7 @@ public enum APITester {
             // 401/403 需区分「认证失败」与「CF 盾拦截」:盾页是 HTML(如 Cloudflare 挑战页),
             // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(真实事故:某中转站多代理链)
             // 区域封锁 403 同理——它是 JSON,但说的是所在地而非 key
-            if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
+            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) {
                 authFailed = true
             }
             if status == 200 {
@@ -560,8 +560,8 @@ public enum APITester {
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
             // HTML 盾页(CF 挑战/basic-auth realm)≠ 认证失败,与 /models 探测口径一致:
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
-            // 否则 reconcile 会把活 key 当死 key 删除(401 与 403 同等豁免,曾只豁免 403)
-            if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) {
+            // 否则 reconcile 会把活 key 当死 key 删除401/403 + JSON 才判认证失败,HTML 盾页同等豁免
+            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) {
                 return ChatProbeOutcome(style: native ? "anthropic" : "openai", authStatus: status)
             }
             if native, status == 400 { return ChatProbeOutcome(style: "anthropic", degraded: status) }
@@ -640,7 +640,7 @@ public enum APITester {
                 return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)")
             }
             // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败,不计入 authFailed
-            if status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body)) { authFailed = true }
+            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) { authFailed = true }
             lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }
         return (false, authFailed, lastDesc)

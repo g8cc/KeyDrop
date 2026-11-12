@@ -203,17 +203,36 @@ public enum DSHWriter {
         }
     }
 
-    /// 摘除该 provider 的全部路由块(含历史装饰名):id8 前缀家族匹配
+    /// 摘除该 provider 的全部路由块(含历史装饰名)。
+    /// 家族匹配必须再校验 apiKeyEnv:id8 前缀碰撞时(极低概率但存在),
+    /// 纯前缀匹配会互删对方路由 → 对账每轮互写抖动(审计 2026-11-13)
     private static func removeRoutesForID(_ text: inout String, providerID: String) {
         let lines = text.components(separatedBy: "\n")
-        let names = Set(lines.compactMap { line -> String? in
-            guard line.hasPrefix("    "), !line.hasPrefix("      ") else { return nil }
-            let t = line.trimmingCharacters(in: .whitespaces)
-            guard t.hasSuffix(":") else { return nil }
-            let name = String(t.dropLast())
-            return isOwnedRoute(name, providerID: providerID) ? name : nil
-        })
-        for n in names.sorted() { removeRoute(&text, route: n) }
+        let ownEnv = envName(providerID: providerID)
+        var nameEnv: [(String, String)] = []
+        var current: String? = nil
+        var currentEnv = ""
+        for line in lines {
+            if line.hasPrefix("    "), !line.hasPrefix("      ") {
+                if let c = current, isOwnedRoute(c, providerID: providerID), currentEnv == ownEnv {
+                    nameEnv.append((c, currentEnv))
+                }
+                let t = line.trimmingCharacters(in: .whitespaces)
+                current = t.hasSuffix(":") ? String(t.dropLast()) : nil
+                currentEnv = ""
+                continue
+            }
+            if current != nil, line.hasPrefix("      ") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("apiKeyEnv:") {
+                    currentEnv = String(t.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces)
+                }
+            }
+        }
+        if let c = current, isOwnedRoute(c, providerID: providerID), currentEnv == ownEnv {
+            nameEnv.append((c, currentEnv))
+        }
+        for (n, _) in nameEnv.sorted(by: { $0.0 < $1.0 }) { removeRoute(&text, route: n) }
     }
 
     /// YAML 标量:普通 URL/模型名/key 保持裸写(兼容既有格式与消费方),
@@ -314,6 +333,37 @@ public enum DSHWriter {
         public let models: [String]
     }
 
+    /// 与 yamlScalar 互逆的解码:双引号处理 \\ \" \r \n \t;单引号 '' → '。
+    /// 只剥引号不解码曾让含转义的值每轮对账误判漂移 → 无限重写(审计 2026-11-13)
+    static func decodeYAMLScalarValue(_ s: String) -> String {
+        if s.count >= 2, s.hasPrefix("'"), s.hasSuffix("'") {
+            return String(s.dropFirst().dropLast()).replacingOccurrences(of: "''", with: "'")
+        }
+        if s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") {
+            let inner = String(s.dropFirst().dropLast())
+            var out = ""
+            out.reserveCapacity(inner.count)
+            var escaped = false
+            for ch in inner {
+                if escaped {
+                    switch ch {
+                    case "n": out.append("\n")
+                    case "r": out.append("\r")
+                    case "t": out.append("\t")
+                    default: out.append(ch)
+                    }
+                    escaped = false
+                } else if ch == "\\" {
+                    escaped = true
+                } else {
+                    out.append(ch)
+                }
+            }
+            return out
+        }
+        return s
+    }
+
     /// 枚举 settings.yaml 里 KeyDrop 托管域(keydrop- 前缀)的路由及内容。
     /// 路由行 = 恰好 4 空格缩进;块内字段 6 空格,模型项 8 空格 `- id:`
     public static func managedRoutes() throws -> [ManagedRoute] {
@@ -339,17 +389,12 @@ public enum DSHWriter {
             }
             guard name != nil, line.hasPrefix("      ") else { continue }
             let t = line.trimmingCharacters(in: .whitespaces)
-            let unquote = { (s: String) -> String in
-                if s.count >= 2, s.hasPrefix("\""), s.hasSuffix("\"") { return String(s.dropFirst().dropLast()) }
-                if s.count >= 2, s.hasPrefix("'"), s.hasSuffix("'") { return String(s.dropFirst().dropLast()) }
-                return s
-            }
             if t.hasPrefix("apiKeyEnv:") {
-                env = unquote(String(t.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces))
+                env = decodeYAMLScalarValue(String(t.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces))
             } else if t.hasPrefix("baseURL:") {
-                baseURL = unquote(String(t.dropFirst("baseURL:".count)).trimmingCharacters(in: .whitespaces))
+                baseURL = decodeYAMLScalarValue(String(t.dropFirst("baseURL:".count)).trimmingCharacters(in: .whitespaces))
             } else if t.hasPrefix("- id:") {
-                let m = unquote(String(t.dropFirst("- id:".count)).trimmingCharacters(in: .whitespaces))
+                let m = decodeYAMLScalarValue(String(t.dropFirst("- id:".count)).trimmingCharacters(in: .whitespaces))
                 if !m.isEmpty { models.append(m) }
             }
         }
