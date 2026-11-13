@@ -10,7 +10,7 @@ enum AppDelegateRef {
 let args = Array(CommandLine.arguments.dropFirst())
 
 let cliCommands = ["add", "list", "scan", "cpa-sync", "delete", "rm", "parse", "status", "refresh",
-                   "reimport", "edit", "self-heal", "dsh-reconcile", "picker-test", "help", "h",
+                   "reimport", "edit", "self-heal", "dsh-reconcile", "dsh-converge", "picker-test", "help", "h",
                    "image-add", "image", "mcp-image", "proxy-pool", "export", "import", "webdav-push", "webdav-pull"]
 if let first = args.first {
     // 已知子命令/选项 → CLI;未知裸词命令必须报错退出而非静默启动菜单栏:

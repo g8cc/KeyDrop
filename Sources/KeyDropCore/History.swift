@@ -25,6 +25,7 @@ public struct HistoryEntry: Codable {
         case updatedAt
         case verifyVerdict
         case verifyVerdicts
+        case dshMissingAt
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
@@ -66,6 +67,9 @@ public struct HistoryEntry: Codable {
     public var verifyVerdict: String?
     /// 每模型的真伪鉴定结论(模型 → 判定):多模型条目逐模型鉴定后各自留存
     public var verifyVerdicts: [String: String]? = nil
+    /// DSH 认领路由在 settings.yaml 中首次发现缺失的时间:
+    /// reconcileDSH 据此判定「缺失持续 ≥3 天 → 用户已放弃,自动摘除 dsh 标」
+    public var dshMissingAt: TimeInterval? = nil
     /// 最近一次 chat 探测的端到端延迟(毫秒)。实战监控:慢网关也显示"可用",
     /// 但延迟让用户对"用的时候行不行"有预期(真实反馈:显示可用,用起来 30s 无响应)
     public var latencyMs: Double?
@@ -277,6 +281,7 @@ public struct HistoryEntry: Codable {
         updatedAt = try c.decodeIfPresent(TimeInterval.self, forKey: .updatedAt)
         verifyVerdict = try c.decodeIfPresent(String.self, forKey: .verifyVerdict)
         verifyVerdicts = try c.decodeIfPresent([String: String].self, forKey: .verifyVerdicts)
+        dshMissingAt = try c.decodeIfPresent(TimeInterval.self, forKey: .dshMissingAt)
         latencyMs = try c.decodeIfPresent(Double.self, forKey: .latencyMs)
         failStreak = try c.decodeIfPresent(Int.self, forKey: .failStreak)
         viaCPAOk = try c.decodeIfPresent(Bool.self, forKey: .viaCPAOk)
@@ -316,6 +321,7 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(updatedAt, forKey: .updatedAt)
         try c.encodeIfPresent(verifyVerdict, forKey: .verifyVerdict)
         try c.encodeIfPresent(verifyVerdicts, forKey: .verifyVerdicts)
+        try c.encodeIfPresent(dshMissingAt, forKey: .dshMissingAt)
         try c.encodeIfPresent(latencyMs, forKey: .latencyMs)
         try c.encodeIfPresent(failStreak, forKey: .failStreak)
         try c.encodeIfPresent(viaCPAOk, forKey: .viaCPAOk)

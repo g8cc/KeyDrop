@@ -1425,6 +1425,32 @@ public final class Core {
         return out
     }
 
+    /// 立即清理:摘除所有「账本认领但 settings.yaml 缺失」的 dsh 标。
+    /// 用于一次性收敛积压(日常由 reconcileDSH 的 3 天阈值自动处理)。
+    /// - Parameter keepLatest: 保留最近 N 个的 dsh 标(用户可能刚同步,别误摘)
+    public func dshConverge(keepLatest: Int = 1) throws -> [String] {
+        guard DSHWriter.installed() else { return [] }
+        let managed = try DSHWriter.managedRoutes()
+        let claimed = history.snapshot().filter { $0.status == "active" && $0.targets.contains("dsh") }
+        // 按updatedAt desc排序:最新的 keepLatest 个保留
+        let sorted = claimed.sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
+        var removed: [String] = []
+        for (i, e) in sorted.enumerated() {
+            let rk = DSHWriter.routeKey(providerID: e.id)
+            let owned = managed.first(where: {
+                DSHWriter.isOwnedRoute($0.name, providerID: e.id) && $0.env == DSHWriter.envName(providerID: e.id)
+            })
+            if owned != nil { continue }   // 路由存在,正常
+            if i < keepLatest { continue } // 最近的 N 个保留
+            var converged = e
+            converged.targets.removeAll { $0 == "dsh" }
+            converged.dshMissingAt = nil
+            try history.update(converged)
+            removed.append(rk)
+        }
+        return removed
+    }
+
     /// DSH 全生命周期对账(与 reconcileWithCCSwitch 同级的成熟度):
     /// ① 孤儿路由清理 —— 账本不再认领的 keydrop-*(连同凭据)移除
     /// ② 认领路由漂移修复 —— baseURL/models 与账本不一致 → 重写;凭据缺失 → 自愈
@@ -1451,6 +1477,7 @@ public final class Core {
             let managed = try DSHWriter.managedRoutes()
             var updated: [String] = []
             var missing: [String] = []
+            var convergedTags: [String] = []
             for e in claimed {
                 let rk = DSHWriter.routeKey(providerID: e.id)
                 guard let url = e.url, let key = extractKey(e), !key.isEmpty else { continue }
@@ -1466,6 +1493,26 @@ public final class Core {
                 guard let r = managed.first(where: {
                     DSHWriter.isOwnedRoute($0.name, providerID: e.id) && $0.env == DSHWriter.envName(providerID: e.id)
                 }) else {
+                    // 缺失路由收敛:首次发现打 dshMissingAt 标;持续 ≥3 天 → 用户已放弃,
+                    // 自动摘除 dsh 标(账本与 settings.yaml 现实收敛)。
+                    // 用户重新「同步到 DSH」时路由回来,标自动清除
+                    let now2 = Date().timeIntervalSince1970
+                    if let marked = e.dshMissingAt, now2 - marked > 3 * 24 * 3600 {
+                        var converged = e
+                        converged.targets.removeAll { $0 == "dsh" }
+                        converged.dshMissingAt = nil
+                        converged.updatedAt = now2
+                        do {
+                            try history.update(converged)
+                            convergedTags.append(rk)
+                        } catch {
+                            AppLog.warn("DSH 收敛: 摘除 \(rk) 的 dsh 标失败: \(error.localizedDescription)")
+                        }
+                    } else if e.dshMissingAt == nil {
+                        var marked = e
+                        marked.dshMissingAt = now2
+                        try? history.update(marked)
+                    }
                     missing.append(rk)
                     continue
                 }
@@ -1482,8 +1529,11 @@ public final class Core {
             if !updated.isEmpty {
                 out.append("DSH 对账: \(updated.count) 个路由与账本漂移,已重写(\(updated.joined(separator: ", ")))")
             }
+            if !convergedTags.isEmpty {
+                out.append("DSH 收敛: \(convergedTags.count) 个缺失 ≥3 天的路由已自动摘除 dsh 标(\(convergedTags.prefix(3).joined(separator: ", "))\(convergedTags.count > 3 ? " 等" : ""))")
+            }
             if !missing.isEmpty {
-                out.append("DSH 对账: \(missing.count) 个已同步路由在 settings.yaml 缺失,未自动重建(\(missing.prefix(3).joined(separator: ", "))\(missing.count > 3 ? " 等" : ""))——行内「同步到 DSH」可恢复")
+                out.append("DSH 对账: \(missing.count) 个已同步路由在 settings.yaml 缺失(\(missing.prefix(3).joined(separator: ", "))\(missing.count > 3 ? " 等" : ""))——行内「同步到 DSH」可恢复;持续缺失 3 天自动摘除")
             }
             if !(updated.isEmpty && missing.isEmpty), DSHWriter.dshWebRunning() {
                 out.append("⚠ DSH web 正在运行:以上变更需重启 DSH 后在 Jet Hub 可见(启动时才导入 settings.yaml)")
@@ -2941,6 +2991,7 @@ public final class Core {
         let alreadyLinked = entry.targets.contains("dsh")
         let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
         if !alreadyLinked { entry.targets.append("dsh") }
+        entry.dshMissingAt = nil   // 路由回来了,清缺失标
         do {
             try history.update(entry)
         } catch {
