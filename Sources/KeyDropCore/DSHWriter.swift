@@ -110,6 +110,9 @@ public enum DSHWriter {
         try upsertSettings(&settings, route: route, env: env, url: url, models: models)
         try upsertCredential(&creds, env: env, value: key)
 
+        // 同时写入 Cordis profile 补丁层(DSH web 运行时真正读取的配置源)
+        try cordisUpsert(providerID: providerID, env: env, baseURL: url, models: models)
+
         let fm = FileManager.default
         try fm.createDirectory(at: URL(fileURLWithPath: settingsPath).deletingLastPathComponent(), withIntermediateDirectories: true)
         try fm.createDirectory(at: URL(fileURLWithPath: credentialsPath).deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -194,6 +197,8 @@ public enum DSHWriter {
             removeRoutesForID(&settings, providerID: providerID)
             try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
         }
+        // 同时从 Cordis profile 补丁层移除
+        try? cordisRemove(providerID: providerID)
         if FileManager.default.fileExists(atPath: credentialsPath) {
             var creds = try readExisting(credentialsPath)
             removeCredential(&creds, env: env)
@@ -305,6 +310,146 @@ public enum DSHWriter {
 
     public static func installed() -> Bool {
         FileManager.default.fileExists(atPath: dshHome)
+    }
+
+    // MARK: - Cordis profile patch layer(DSH web 运行时真正读取的配置源)
+
+    static var cordisProfilesDir: String {
+        (dshHome as NSString).appendingPathComponent("profiles")
+    }
+
+    static func cordisPatchFiles() -> [String] {
+        let base = cordisProfilesDir
+        guard let en = FileManager.default.enumerator(atPath: base) else { return [] }
+        var out: [String] = []
+        for case let rel as String in en where rel.hasSuffix("cordis.patch.yml") {
+            out.append((base as NSString).appendingPathComponent(rel))
+        }
+        return out
+    }
+
+    static func cordisProviderName(url: String) -> String {
+        let host = URL(string: url)?.host?.lowercased() ?? ""
+        let labels = host.split(separator: ".").map(String.init)
+        let meaningful = labels.filter { !["api", "www", "openai", "gateway", "relay"].contains($0) }
+        let core = meaningful.count >= 2 ? Array(meaningful.dropLast()) : meaningful
+        let name = core.joined(separator: "-")
+        return name.isEmpty ? "unknown" : name
+    }
+
+    /// 向 Cordis profile 补丁文件 upsert 一个 provider(只改 llm-pi-ai 条目)。
+    /// Cordis patch 文件是 YAML 数组,providers 在 `id: llm-pi-ai` 条目的
+    /// `config.providers` 映射下(6 空格缩进的 provider 名,8 空格的字段)。
+    /// 这是 dsh web 运行时真正读取的配置源 —— settings.yaml 只是启动导入通道
+    static func cordisUpsert(providerID: String, env: String,
+                             baseURL: String, models: [String]) throws {
+        let normalizedURL = normalizeBaseURL(baseURL)
+        for patchPath in cordisPatchFiles() {
+            guard FileManager.default.fileExists(atPath: patchPath) else { continue }
+            let content: String
+            do { content = try String(contentsOfFile: patchPath, encoding: .utf8) }
+            catch { continue }
+            var lines = content.components(separatedBy: "\n")
+            var providersHeader = -1
+            var headerIndent = 4
+            for (i, line) in lines.enumerated() {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("providers:"), i > 0 {
+                    let prev = lines[i - 1].trimmingCharacters(in: .whitespaces)
+                    if prev.hasPrefix("config:") || prev.contains("llm-pi-ai") {
+                        providersHeader = i
+                        headerIndent = line.prefix(while: { $0 == " " }).count
+                        break
+                    }
+                }
+            }
+            guard providersHeader >= 0 else { continue }
+            let provIndent = String(repeating: " ", count: headerIndent + 2)
+            let fieldIndent = String(repeating: " ", count: headerIndent + 4)
+            var providersEnd = lines.count
+            var j = providersHeader + 1
+            while j < lines.count {
+                let l = lines[j]
+                if !l.trimmingCharacters(in: .whitespaces).isEmpty {
+                    let ind = l.prefix(while: { $0 == " " }).count
+                    if ind <= headerIndent { providersEnd = j; break }
+                }
+                j += 1
+            }
+            let base = routeKey(providerID: providerID)
+            var removeRange: Range<Int>? = nil
+            j = providersHeader + 1
+            while j < providersEnd {
+                let lt = lines[j].trimmingCharacters(in: .whitespaces)
+                if lt.hasSuffix(":"), isOwnedRoute(String(lt.dropLast()), providerID: providerID) {
+                    var k = j + 1
+                    while k < providersEnd {
+                        let lk = lines[k].trimmingCharacters(in: .whitespaces)
+                        if !lk.isEmpty {
+                            let ind = lines[k].prefix(while: { $0 == " " }).count
+                            if ind <= headerIndent + 2 { break }
+                        }
+                        k += 1
+                    }
+                    removeRange = j..<k
+                    break
+                }
+                j += 1
+            }
+            let shortName = cordisProviderName(url: baseURL)
+            var block = "\(provIndent)\(shortName):\n"
+            block += "\(fieldIndent)apiKeyEnv: \(env)\n"
+            block += "\(fieldIndent)api: openai-completions\n"
+            block += "\(fieldIndent)baseURL: \(yamlScalar(normalizedURL))\n"
+            block += "\(fieldIndent)models:\n"
+            for m in models {
+                block += "\(fieldIndent)  - id: \(yamlScalar(m))\n"
+                block += "\(fieldIndent)    name: \(yamlScalar(m))\n"
+            }
+            let blockLines = block.components(separatedBy: "\n")
+            if let range = removeRange {
+                lines.replaceSubrange(range, with: blockLines)
+            } else {
+                var insAt = providersEnd
+                while insAt > providersHeader + 1, lines[insAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insAt -= 1 }
+                lines.insert(contentsOf: blockLines, at: insAt)
+            }
+            try lines.joined(separator: "\n").write(toFile: patchPath, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// 从 Cordis profile 补丁文件移除一个 provider
+    static func cordisRemove(providerID: String) throws {
+        for patchPath in cordisPatchFiles() {
+            guard FileManager.default.fileExists(atPath: patchPath) else { continue }
+            let content: String
+            do { content = try String(contentsOfFile: patchPath, encoding: .utf8) }
+            catch { continue }
+            var lines = content.components(separatedBy: "\n")
+            var changed = false
+            var i = 0
+            while i < lines.count {
+                let t = lines[i].trimmingCharacters(in: .whitespaces)
+                if t.hasSuffix(":"), isOwnedRoute(String(t.dropLast()), providerID: providerID) {
+                    var k = i + 1
+                    while k < lines.count {
+                        let lt = lines[k].trimmingCharacters(in: .whitespaces)
+                        if !lt.isEmpty {
+                            let ind = lines[k].prefix(while: { $0 == " " }).count
+                            if ind <= 6 { break }
+                        }
+                        k += 1
+                    }
+                    lines.removeSubrange(i..<k)
+                    changed = true
+                    continue
+                }
+                i += 1
+            }
+            if changed {
+                try lines.joined(separator: "\n").write(toFile: patchPath, atomically: true, encoding: .utf8)
+            }
+        }
     }
 
     /// DSH web(Jet Hub 界面的后端)是否在运行。settings.yaml 是它的
