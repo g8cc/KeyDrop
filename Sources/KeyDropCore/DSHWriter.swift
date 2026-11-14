@@ -38,6 +38,7 @@ public enum DSHWriter {
         while slug.hasPrefix("-") { slug.removeFirst() }
         while slug.hasSuffix("-") { slug.removeLast() }
         if slug.count > 72 { slug = String(slug.prefix(72)) }
+        while slug.hasSuffix("-") { slug.removeLast() }   // 截断可能落在塌缩分隔符上
         return slug.isEmpty ? base : base + "-" + slug
     }
 

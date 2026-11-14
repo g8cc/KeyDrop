@@ -123,7 +123,7 @@ public struct HistoryEntry: Codable {
         lines.append(statusLine)
         var bits: [String] = []
         if let at = healthAt { bits.append("验证 \(Self.shortTime(at))") }
-        if let l = latencyMs { bits.append("延迟 \(Int(l))ms") }
+        if let l = latencyMs, l.isFinite, l >= 0, l < 1e9 { bits.append("延迟 \(Int(l))ms") }
         if let up = uptimePercent { bits.append("uptime \(up)%") }
         if let n = failStreak, n > 0 { bits.append("连续失败 \(n) 次(单次失败保留可用,连续 2 次才降级)") }
         if !bits.isEmpty { lines.append(bits.joined(separator: " · ")) }

@@ -114,6 +114,20 @@ Magpie 渠道支持、监控诚实化、真伪鉴定每模型结论、解析修�
 - 监控频率(未变,供参考):面板每 60 分钟一轮扫描,只测「上次测试已超 30 分钟」
   的条目;每条每轮最多 4 个模型(激活置顶轮换);行内 ↻ 随时手动重测
 
+### 终审修复(双代理全量再审)
+- **死 key 永远显示"可用(需代理)"**:healthFor 把 needsProxy 排在 ok/authFailed
+  之前,key 被吊销(双方 401)时仍返回 proxy-ok → 状态列永远绿;已修
+- **feed LWW targets 并集是死代码**:迭代了远端数组而非本机数组,本机独有的
+  DSH/CPA/Grok 标签整批丢失 → 下轮孤儿清理删路由+凭据;已修(迭代 local.targets)
+- **墓碑传播脱离 LWW**:updatedAt 被健康扫描持续刷新,维护者的墓碑几乎永远
+  传播不过来;远端有 deletedAt 且本机 active 时一律应用(不看时间戳)+ 清产物
+- **syncTarget 四分支回滚销毁同步前就存在的产物**:统一加 alreadyHadTarget 守卫;
+  ccswitch 分支补回滚
+- **refreshModels/testEntry 成功时清 failStreak**:连败后手动救活,streak 残留
+  导致下次瞬时失败直接降级
+- MagpieWriter 登录 URL 强解包修复 + webKey 重编码;Cookie 捕获改进
+- richTooltip 的 Int(latencyMs) 极端值钳制;displayRouteKey 截断尾 - 修复
+
 ### 解析与导入修复
 - 内嵌 JSON 行提取:`{"_type":"newapi_channel_conn","key":…,"url":…}` 一行 JSON
   + 活动说明 + 可用模型列表 的粘贴,曾整段按多行文本切碎(key 变垃圾碎片、

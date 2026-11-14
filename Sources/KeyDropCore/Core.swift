@@ -932,7 +932,10 @@ public final class Core {
         return out
     }
 
-    public static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {        if test.needsProxy {
+    public static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {
+        // needsProxy 只在探测成功时才标 proxy-ok:曾把 needsProxy 排在最前,
+        // key 被吊销(双方 401)时仍返回 proxy-ok → 死 key 永远显示"可用(需代理)"
+        if test.needsProxy && test.ok {
             return ("proxy-ok", test.detail + " ⚠ 该网关直连不可用,需代理;无代理的工具(dsh 等)需自行配置 HTTPS_PROXY 才可用")
         }
         if test.quotaExhausted { return ("quota", test.detail) }
@@ -1731,6 +1734,44 @@ public final class Core {
                     skippedTombstone += 1
                     continue
                 }
+                // 墓碑传播脱离 LWW:updatedAt 被健康扫描持续刷新,
+                // 维护者的墓碑几乎永远传播不过来(审计 2026-11-13 P1)。
+                // 远端有 deletedAt 且本机 active → 一律应用,不看时间戳
+                if mode == .feed, e.status == "deleted", e.deletedAt != nil {
+                    var t = local
+                    t.status = "deleted"
+                    t.deletedAt = e.deletedAt
+                    t.updatedAt = Date().timeIntervalSince1970
+                    t.targets = []
+                    feedChanged.append(t)
+                    tombstonePropagated += 1
+                    // 墓碑产物清理(同上)
+                    var cleaned: [String] = []
+                    if local.targets.contains("cpa"), let cfg = local.cpaConfigPath {
+                        let keys = extractAllKeys(for: local) ?? []
+                        if !keys.isEmpty, let msg = try? CPAWriter(configPath: cfg).remove(apiKeys: keys) {
+                            cleaned.append("CPA: \(msg)")
+                        }
+                    }
+                    if local.targets.contains("grok"), let gp = local.grokConfigPath,
+                       let gk = local.key, !gk.isEmpty, let gURL = local.url {
+                        if let msg = try? GrokBuildWriter(configPath: gp).remove(baseURL: gURL, key: gk, models: local.models ?? []) {
+                            cleaned.append("Grok: \(msg)")
+                        }
+                    }
+                    if let pid = local.ccProviderID {
+                        let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
+                            .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                        if (try? cc.remove(providerID: pid, renamedFrom: local.ccRenamedFrom,
+                                           renamedTo: local.ccRenamedTo, appType: oldApp)) != nil {
+                            cleaned.append("cc-switch: 已移除")
+                        }
+                    }
+                    if !cleaned.isEmpty {
+                        AppLog.info("墓碑传播产物清理(脱离 LWW, \(local.id.prefix(8))): \(cleaned.joined(separator: "; "))")
+                    }
+                    continue
+                }
                 if remoteTS > localTS {
                     // 产物同步失败绝不能静默:账本已记新 key 而 CPA 池还轮询旧 key 时,
                     // 旧 key 会成为无账本指针的永久残留凭据。至少留痕
@@ -1787,8 +1828,9 @@ public final class Core {
                     merged.cpaConfigPath = local.cpaConfigPath
                     merged.grokConfigPath = local.grokConfigPath
                     // targets 是【本机产物事实】:整条取远端曾丢掉本机独有的标签
-                    // (如本机同步过 DSH 而维护者没有)。取并集,顺序 = 本机优先
-                    for t in e.targets where !merged.targets.contains(t) {
+                    // (如本机同步过 DSH 而维护者没有)。取并集,顺序 = 本机优先。
+                    // 必须迭代 local.targets:merged 初始 = e(远端),对 e 求差永假
+                    for t in local.targets where !merged.targets.contains(t) {
                         merged.targets.append(t)
                     }
                     merged.updatedAt = Date().timeIntervalSince1970
@@ -2065,6 +2107,7 @@ public final class Core {
                 found.apiStyle = test.style
                 found.healthDetail = h.detail
                 found.healthAt = Date().timeIntervalSince1970
+                found.failStreak = nil   // 手动重测成功即清零(审计 2026-11-14 P2)
                 historyUpdateLogged(found)
             }
             return "✓ 可用: \(h.detail) (\(test.models.count) 个模型)"
@@ -2302,6 +2345,7 @@ public final class Core {
                 entry.healthDetail = quotaNote ?? test.detail
             }
             entry.healthAt = Date().timeIntervalSince1970
+            entry.failStreak = nil   // 手动重测成功即清零
             // 手动重测同样进监控图(所有探测路径统一入档);probeLog 由 history.update
             // 保留,不怕后续整条覆盖
             do {
@@ -3060,7 +3104,12 @@ public final class Core {
             entry.ccProviderID = r.providerID
             let tag = appType == "claude" ? "ccswitch" : "ccswitch-\(appType)"
             if !entry.targets.contains(tag) { entry.targets.append(tag) }
-            try history.update(entry)
+            do { try history.update(entry) }
+            catch {
+                // 回滚 best-effort:防重复建 provider
+                try? cc.remove(providerID: r.providerID, renamedFrom: nil, renamedTo: nil, appType: appType)
+                throw ParseError.io("cc-switch 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+            }
             return "cc-switch: 已新建 provider(未激活,需要时在 cc-switch 中切换)"
         case "cpa":
             guard let cfg = prefs.resolvedCPAConfig() else {
@@ -3071,23 +3120,26 @@ public final class Core {
                 do { _ = try CPAWriter(configPath: oldCfg).remove(apiKeys: [key]) }
                 catch { AppLog.warn("CPA 同步: 旧配置(\(oldCfg))key 回收失败: \(error.localizedDescription)") }
             }
+            let alreadyHadCPA = entry.targets.contains("cpa")
             let msg = try CPAWriter(configPath: cfg)
                 .addAggregated(baseURL: url, key: key, models: models)
             entry.cpaConfigPath = cfg
             if !entry.targets.contains("cpa") { entry.targets.append("cpa") }
             do { try history.update(entry) }
             catch {
-                try? CPAWriter(configPath: cfg).remove(apiKeys: [key])
-                throw ParseError.io("CPA 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+                if !alreadyHadCPA { try? CPAWriter(configPath: cfg).remove(apiKeys: [key]) }
+                throw ParseError.io("CPA 已写入但账本保存失败: \(error.localizedDescription)")
             }
             return "CPA: \(msg)"
         case "dsh":
+            let alreadyHadDSH = entry.targets.contains("dsh")
             let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
             if !entry.targets.contains("dsh") { entry.targets.append("dsh") }
             do { try history.update(entry) }
             catch {
-                try? DSHWriter.remove(providerID: entry.id)
-                throw ParseError.io("DSH 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+                // 已有目标不回滚:回滚会销毁同步前就完好的产物
+                if !alreadyHadDSH { try? DSHWriter.remove(providerID: entry.id) }
+                throw ParseError.io("DSH 已写入但账本保存失败: \(error.localizedDescription)")
             }
             // 先认领(history.update)再全量对账,顺序同理见 syncToDSH
             let reconcileLines = reconcileDSH()
@@ -3095,23 +3147,25 @@ public final class Core {
             msg += reconcileLines.map { "; " + $0 }.joined()
             return msg
         case "grok":
+            let alreadyHadGrok = entry.targets.contains("grok")
             let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
             let msg = try writer.sync(baseURL: url, key: key, models: models, removing: [])
             entry.grokConfigPath = writer.configPath
             if !entry.targets.contains("grok") { entry.targets.append("grok") }
             do { try history.update(entry) }
             catch {
-                try? writer.remove(baseURL: url, key: key, models: models)
-                throw ParseError.io("Grok Build 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+                if !alreadyHadGrok { try? writer.remove(baseURL: url, key: key, models: models) }
+                throw ParseError.io("Grok Build 已写入但账本保存失败: \(error.localizedDescription)")
             }
             return "Grok Build: \(msg)"
         case "magpie":
+            let alreadyHadMagpie = entry.targets.contains("magpie")
             let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key, models: models)
             if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
             do { try history.update(entry) }
             catch {
-                try? MagpieWriter.remove(providerID: entry.id)
-                throw ParseError.io("Magpie 已写入但账本保存失败,已回滚: \(error.localizedDescription)")
+                if !alreadyHadMagpie { try? MagpieWriter.remove(providerID: entry.id) }
+                throw ParseError.io("Magpie 已写入但账本保存失败: \(error.localizedDescription)")
             }
             return "Magpie: \(msg)"
         default:

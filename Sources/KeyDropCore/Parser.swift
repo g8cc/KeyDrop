@@ -217,7 +217,14 @@ public enum Parser {
             // 剩余行只提取模型(标题/「可用模型:」列表),不能走 parseMultiline ——
             // 它没有 key 会抛错。跳过 [ 开头的日期/活动标题行
             let rest = rawLines.enumerated()
-                .filter { $0.offset != idx }
+                .filter { (i, l) in
+                    guard i != idx else { return false }
+                    let tl = l.trimmingCharacters(in: .whitespaces)
+                    // 跳过其余 JSON 行:它们是别的条目,不是说明文字
+                    if tl.hasPrefix("{"), tl.hasSuffix("}"),
+                       (try? JSONSerialization.jsonObject(with: Data(tl.utf8))) != nil { return false }
+                    return true
+                }
                 .map { $0.element }
             let merged = extractModels(fromLines: rest)
             if !merged.isEmpty {
@@ -242,7 +249,8 @@ public enum Parser {
             if t.hasPrefix("[") { continue }
             for tok in t.components(separatedBy: CharacterSet(charactersIn: " \t,，、;；:：")) {
                 let c = cleanModelToken(tok)
-                guard !c.isEmpty, looksLikeModel(c), !c.contains("不限"), !c.contains("免费"),
+                guard !c.isEmpty, looksLikeModel(c), !looksLikeKey(c),
+                      !c.contains("不限"), !c.contains("免费"),
                       !c.contains("额度"), !c.contains("有效"), !c.contains("活动"),
                       seen.insert(c).inserted else { continue }
                 out.append(c)
