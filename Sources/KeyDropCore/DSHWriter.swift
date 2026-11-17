@@ -376,28 +376,53 @@ public enum DSHWriter {
                 }
                 j += 1
             }
-            let base = routeKey(providerID: providerID)
-            var removeRange: Range<Int>? = nil
-            j = providersHeader + 1
-            while j < providersEnd {
-                let lt = lines[j].trimmingCharacters(in: .whitespaces)
-                if lt.hasSuffix(":"), isOwnedRoute(String(lt.dropLast()), providerID: providerID) {
-                    var k = j + 1
-                    while k < providersEnd {
-                        let lk = lines[k].trimmingCharacters(in: .whitespaces)
-                        if !lk.isEmpty {
-                            let ind = lines[k].prefix(while: { $0 == " " }).count
-                            if ind <= headerIndent + 2 { break }
+            // 去重:扫描 providers 段,找到所有 apiKeyEnv == 本条目 env 的块
+            // (含旧命名残留)全部移除,再插入统一命名的块。
+            // 关键修复:旧实现写入用 cordisProviderName(短名)但查重用 isOwnedRoute
+            // (keydrop-<id8>)——两个命名体系不匹配,查重永远失败,每次追加
+            var removeRanges: [Range<Int>] = []
+            var scan = providersHeader + 1
+            while scan < providersEnd {
+                let lt = lines[scan].trimmingCharacters(in: .whitespaces)
+                guard lt.hasSuffix(":"), !lt.isEmpty else { scan += 1; continue }
+                var blockEnv = ""
+                var k = scan + 1
+                while k < providersEnd {
+                    let lk = lines[k].trimmingCharacters(in: .whitespaces)
+                    if !lk.isEmpty {
+                        let ind = lines[k].prefix(while: { $0 == " " }).count
+                        if ind <= headerIndent + 2 { break }
+                        if lk.hasPrefix("apiKeyEnv:") {
+                            blockEnv = String(lk.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces)
                         }
-                        k += 1
                     }
-                    removeRange = j..<k
-                    break
+                    k += 1
+                }
+                let isOurs = blockEnv == env || isOwnedRoute(String(lt.dropLast()), providerID: providerID)
+                if isOurs {
+                    removeRanges.append(scan..<k)
+                    scan = k
+                } else {
+                    scan += 1
+                }
+            }
+            for range in removeRanges.sorted(by: { $0.lowerBound > $1.lowerBound }) {
+                lines.removeSubrange(range)
+            }
+            // 重新定位 providersEnd(删除后行号变化)
+            providersEnd = lines.count
+            j = providersHeader + 1
+            while j < lines.count {
+                let l = lines[j]
+                if !l.trimmingCharacters(in: .whitespaces).isEmpty {
+                    let ind = l.prefix(while: { $0 == " " }).count
+                    if ind <= headerIndent { providersEnd = j; break }
                 }
                 j += 1
             }
-            let shortName = cordisProviderName(url: baseURL)
-            var block = "\(provIndent)\(shortName):\n"
+            // 统一用 keydrop-<id8> 命名(确定性,可被 isOwnedRoute 匹配去重)
+            let routeName = routeKey(providerID: providerID)
+            var block = "\(provIndent)\(routeName):\n"
             block += "\(fieldIndent)apiKeyEnv: \(env)\n"
             block += "\(fieldIndent)api: openai-completions\n"
             block += "\(fieldIndent)baseURL: \(yamlScalar(normalizedURL))\n"
@@ -407,13 +432,9 @@ public enum DSHWriter {
                 block += "\(fieldIndent)    name: \(yamlScalar(m))\n"
             }
             let blockLines = block.components(separatedBy: "\n")
-            if let range = removeRange {
-                lines.replaceSubrange(range, with: blockLines)
-            } else {
-                var insAt = providersEnd
-                while insAt > providersHeader + 1, lines[insAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insAt -= 1 }
-                lines.insert(contentsOf: blockLines, at: insAt)
-            }
+            var insAt = providersEnd
+            while insAt > providersHeader + 1, lines[insAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insAt -= 1 }
+            lines.insert(contentsOf: blockLines, at: insAt)
             try lines.joined(separator: "\n").write(toFile: patchPath, atomically: true, encoding: .utf8)
         }
     }

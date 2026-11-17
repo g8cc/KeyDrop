@@ -128,6 +128,14 @@ Magpie 渠道支持、监控诚实化、真伪鉴定每模型结论、解析修�
 - MagpieWriter 登录 URL 强解包修复 + webKey 重编码;Cookie 捕获改进
 - richTooltip 的 Int(latencyMs) 极端值钳制;displayRouteKey 截断尾 - 修复
 
+### Cordis 补丁层去重修复(严重)
+- cordisUpsert 写入名(cordisProviderName 短名)与查重名(isOwnedRoute 的
+  keydrop-<id8>)不匹配 → 查重永远失败 → 每次同步/对账/重放都追加新块
+  → Cordis 补丁文件膨胀到 96 个 provider 块(34 个唯一),js-yaml 严格模式
+  因重复 key 拒载整个 overlay
+- 修复:写入统一用 keydrop-<id8> 命名(可被 isOwnedRoute 匹配);
+  去重按 apiKeyEnv(唯一且不随装饰名变化)扫描并移除全部同名块后再插入
+
 ### 解析与导入修复
 - 内嵌 JSON 行提取:`{"_type":"newapi_channel_conn","key":…,"url":…}` 一行 JSON
   + 活动说明 + 可用模型列表 的粘贴,曾整段按多行文本切碎(key 变垃圾碎片、
