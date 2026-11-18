@@ -208,9 +208,9 @@ public enum Parser {
             let t = l.trimmingCharacters(in: .whitespaces)
             guard t.hasPrefix("{"), t.hasSuffix("}"),
                   let d = t.data(using: .utf8),
-                  (try? JSONSerialization.jsonObject(with: d)) != nil else { continue }
+                  let obj = try? JSONSerialization.jsonObject(with: d) else { continue }
             var jp = ParsedKey()
-            extractJSON(try! JSONSerialization.jsonObject(with: d), into: &jp)
+            extractJSON(obj, into: &jp)
             guard jp.key != nil else { continue }
             jp.format = "json"
             applyOfficialURLFallback(&jp, raw: text)

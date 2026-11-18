@@ -141,6 +141,41 @@ enum LedgerTransferTests {
             }
         }
 
+        h.runSuite("LedgerTransfer.remote tombstone clears DSH") { t in
+            let env = try TestEnv("ledger-remote-tombstone-dsh")
+            defer { env.cleanup() }
+            let core = Core()
+            let result = try core.addDSHOnly(raw: "https://example.com/v1\nsk-fixture-tombstone\n模型: deepseek-test")
+            var remote = result.entry
+            remote.status = "deleted"
+            try core.history.update(result.entry)
+            remote.deletedAt = 10 // A subsequent local health/ledger update is newer.
+            let payload = LedgerPayload(schemaVersion: 1, exportedAt: 20, appVersion: "test",
+                                        entries: [remote], switches: nil)
+            let encrypted = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "passphrase-fixture")
+            let resultText = try core.importLedger(encrypted, passphrase: "passphrase-fixture", mode: .feed)
+            t.contains(resultText, "墓碑传播 1 条", "有删除时间的远端墓碑可应用")
+            t.equal(core.history.find(idPrefix: remote.id)?.status, "deleted", "账本标记删除")
+            t.expect(!env.read("dsh-creds.yaml").contains("sk-fixture-tombstone"), "使用完整删除链路清理 DSH")
+        }
+        h.runSuite("WebDAV.地址校验") { t in
+            let env = try TestEnv("webdav-reject-invalid")
+            defer { env.cleanup() }
+            Prefs.shared.webdavUser = "fixture"
+            Prefs.shared.webdavPass = "fixture"
+            Prefs.shared.webdavExportPass = "passphrase-fixture"
+            for address in ["ftp://example.com/", "https:/missing-host", "https://example.com/dav?query=1"] {
+                Prefs.shared.webdavURL = address
+                for pull in [false, true] {
+                    do {
+                        _ = try pull ? Core().webdavPull(replay: false) : Core().webdavPush()
+                        t.expect(false, "非法地址必须返回错误")
+                    } catch {
+                        t.contains(error.localizedDescription, "URL 无效", "非法地址给出诊断")
+                    }
+                }
+            }
+        }
         h.runSuite("WebDAV.推送拉取回环") { t in
             guard let server = try? MockHTTPServer(mode: .webdav) else {
                 t.expect(false, "mock 启动失败")
@@ -174,6 +209,24 @@ enum LedgerTransferTests {
             t.equal(storedCount, 1, "[推送] 远端存了一份快照")
             t.expect(storedBody.contains("sk-K7777777777777".data(using: .utf8)!) == false,
                      "[推送] 远端是密文(不含明文 key)")
+
+            // 第二台设备更新远端版本，本机不得覆盖。
+            server.mgmtLock.lock()
+            server.davRevision += 1
+            server.mgmtLock.unlock()
+            do {
+                _ = try core.webdavPush()
+                t.expect(false, "过期 ETag 不能覆盖远端")
+            } catch {
+                t.contains(error.localizedDescription, "先拉取", "给出恢复步骤")
+            }
+            server.mgmtLock.lock()
+            let pushesAfterConflict = server.davPushCount
+            server.mgmtLock.unlock()
+            t.equal(pushesAfterConflict, 1, "冲突推送不写入")
+            _ = try core.webdavPull(replay: false)
+            let retry = try core.webdavPush()
+            t.contains(retry, "已推送", "拉取新版本后可推送")
 
             // 本机删除 r1(墓碑)→ 拉取不得复活(同 id 已存在跳过,保持已删除)
             if var e = core.history.find(idPrefix: r1.entry.id) {

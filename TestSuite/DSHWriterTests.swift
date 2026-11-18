@@ -3,6 +3,52 @@ import KeyDropCore
 
 enum DSHWriterTests {
     static func run(_ h: Harness) {
+        h.runSuite("DSH.settings empty providers mapping") { t in
+            let env = try TestEnv("dsh-settings-empty-map")
+            defer { env.cleanup() }
+            env.write("dsh.yaml", "llm-pi-ai:\n  providers: {} # retained\n  options:\n    providers:\n      unmanaged: keep\n")
+            _ = try DSHWriter.add(providerID: "abcd4321-test", key: "sk-fixture-map", url: "https://example.com", models: ["deepseek-test"])
+            let settings = env.read("dsh.yaml")
+            let headers = settings.split(separator: "\n").filter { $0.hasPrefix("  providers:") }
+            t.equal(headers.count, 1, "不会重复创建 providers 映射")
+            t.contains(settings, "  providers: # retained\n    keydrop-abcd4321", "将空映射转为块并保留注释")
+            t.contains(settings, "  options:\n    providers:\n      unmanaged: keep", "保留嵌套配置")
+        }
+        h.runSuite("DSH.Cordis failure preserves local files") { t in
+            let env = try TestEnv("dsh-cordis-write-fail")
+            defer { env.cleanup() }
+            let id = "abcd1234-test"
+            _ = try DSHWriter.add(providerID: id, key: "sk-fixture-before", url: "https://example.com", models: ["deepseek-test"])
+            let settings = env.read("dsh.yaml")
+            let credentials = env.read("dsh-creds.yaml")
+            try FileManager.default.createDirectory(atPath: env.dir + "/profiles/web", withIntermediateDirectories: true)
+            let patch = """
+                - id: llm-pi-ai
+                  config:
+                    providers:
+                      manual:
+                        apiKeyEnv: OWN_AUTH
+                      manual:
+                        apiKeyEnv: OTHER_AUTH
+                """
+            env.write("profiles/web/cordis.patch.yml", patch)
+            do {
+                _ = try DSHWriter.add(providerID: id, key: "sk-fixture-after", url: "https://example.com", models: ["deepseek-test"])
+                t.expect(false, "无法安全改写 profile 时同步失败")
+            } catch {
+                t.contains(error.localizedDescription, "重复 provider", "解释文件拒写原因")
+            }
+            t.equal(env.read("dsh-creds.yaml"), credentials, "校验失败时保留原凭据")
+            do {
+                try DSHWriter.remove(providerID: id)
+                t.expect(false, "profile 删除失败必须返回错误")
+            } catch {
+                t.contains(error.localizedDescription, "重复 provider", "解释删除失败原因")
+            }
+            t.equal(env.read("dsh.yaml"), settings, "删除失败时保留原路由")
+            t.equal(env.read("dsh-creds.yaml"), credentials, "删除失败时保留原凭据")
+            t.equal(env.read("profiles/web/cordis.patch.yml"), patch, "不改手工配置")
+        }
         h.runSuite("DSH.Cordis legacy provider collisions") { t in
             let env = try TestEnv("dsh-cordis-collisions")
             defer { env.cleanup() }

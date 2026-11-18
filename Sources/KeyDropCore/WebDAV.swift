@@ -1,45 +1,48 @@
 import Foundation
 
-/// WebDAV 同步(Phase 2 简化版,无需自建账号服务):
-/// 把端到端加密的账本快照推送到用户自己的 WebDAV(坚果云等),另一台机器拉取后
-/// 走 importLedger 合并 + replayArtifacts 重放。WebDAV 服务端只见密文;
-/// 导出口令只存本机 prefs(与明文账本同级敏感度,不上传)。
-///
-/// 语义:显式推送/拉取,不做后台自动同步。推送=覆盖远端快照;
-/// 拉取=按 id 合并(绝不覆盖本机已有条目),本机墓碑(已删除)的 key 不复活。
+/// 加密账本快照同步。已有远端文件仅在版本与本机已知的 ETag 一致时更新。
 enum WebDAVSync {
 
-    struct Config {
-        let base: String        // 目录 URL(无尾斜杠)
+    struct Config: Equatable {
+        let directory: URL
         let user: String
         let pass: String
         let exportPass: String
 
-        static func resolved() -> Config? {
-            let p = Prefs.shared
-            guard let url = p.webdavURL, !url.isEmpty,
-                  let user = p.webdavUser, !user.isEmpty,
-                  let pass = p.webdavPass, !pass.isEmpty,
-                  let ep = p.webdavExportPass, !ep.isEmpty else { return nil }
-            var base = url
-            while base.hasSuffix("/") { base = String(base.dropLast()) }
-            guard let u = URL(string: base), u.scheme == "http" || u.scheme == "https" else { return nil }
-            return Config(base: base, user: user, pass: pass, exportPass: ep)
+        static func resolved() throws -> Config {
+            let values = Prefs.shared.webdavSettingsSnapshot()
+            let fields = [(values.url, "目录 URL"), (values.user, "账号"),
+                          (values.pass, "密码"), (values.exportPass, "加密口令")]
+            let missing = fields.compactMap { value, label in
+                value?.isEmpty == false ? nil : label
+            }
+            guard missing.isEmpty, let address = fields[0].0, let user = fields[1].0,
+                  let pass = fields[2].0, let exportPass = fields[3].0 else {
+                throw ParseError.io("WebDAV 未配置，缺少：\(missing.joined(separator: "、"))")
+            }
+            guard let parts = URLComponents(string: address.trimmingCharacters(in: .whitespacesAndNewlines)),
+                  let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                  let host = parts.host, !host.isEmpty, parts.user == nil, parts.password == nil,
+                  parts.query == nil, parts.fragment == nil,
+                  let directory = parts.url else {
+                throw ParseError.io("WebDAV 目录 URL 无效，请填写带主机名的 HTTP 或 HTTPS 目录地址")
+            }
+            return Config(directory: directory, user: user, pass: pass, exportPass: exportPass)
         }
+
+        var fileURL: URL { directory.appendingPathComponent("KeyDrop-ledger.keydrop", isDirectory: false) }
     }
 
-    static func notConfiguredMessage() -> String {
-        "WebDAV 未配置:需要目录 URL、账号、密码与账本加密口令(菜单栏「WebDAV 同步设置…」)"
+    private static func strongTag(_ response: URLResponse?) -> String? {
+        guard let tag = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "ETag")?
+            .trimmingCharacters(in: .whitespaces),
+              tag.hasPrefix("\""), tag.hasSuffix("\""), tag.count >= 2 else { return nil }
+        return tag
     }
 
-    /// 文件名固定:同目录只有一份快照,推送即覆盖,拉取即最新
-    static func fileURL(_ base: String) -> URL {
-        URL(string: base + "/KeyDrop-ledger.keydrop")!
-    }
-
-    private static func request(_ method: String, _ url: URL, cfg: Config,
-                                body: Data? = nil) throws -> (Int, Data) {
-        var req = URLRequest(url: url)
+    private static func request(_ method: String, _ url: URL, cfg: Config, body: Data? = nil,
+                                eTag: String? = nil) throws -> (code: Int, data: Data, eTag: String?) {
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         req.httpMethod = method
         req.timeoutInterval = 60
         let auth = Data("\(cfg.user):\(cfg.pass)".utf8).base64EncodedString()
@@ -47,39 +50,45 @@ enum WebDAVSync {
         if let body {
             req.httpBody = body
             req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            if let eTag = validatedTag(eTag) {
+                req.setValue(eTag, forHTTPHeaderField: "If-Match")
+            } else {
+                req.setValue("*", forHTTPHeaderField: "If-None-Match")
+            }
         }
-        // 走 NetSync 统一封装:超时后 cancel 并等回调收尾。手写 sem.wait() 无界等
-        // 只受 request 级 idle 超时约束,服务端慢速滴流可让 push/fetch 挂死,
-        // 自动同步定时器会因此越积越多
-        let o = NetSync.run(session: URLSession.shared, request: req, timeout: 60)
-        if let e = o.error { throw e }
-        return (NetSync.statusCode(o), o.data ?? Data())
+        let outcome = NetSync.run(session: URLSession.shared, request: req, timeout: 60)
+        if let error = outcome.error { throw error }
+        return (NetSync.statusCode(outcome), outcome.data ?? Data(), strongTag(outcome.response))
     }
 
-    /// 拉取远端快照并解密解码(GET → 信封解密 → LedgerPayload)
-    static func fetchSnapshot(cfg: Config) throws -> LedgerPayload {
-        let (code, data) = try request("GET", fileURL(cfg.base), cfg: cfg)
-        guard code == 200, !data.isEmpty else {
-            throw LedgerTransferError.badEnvelope("WebDAV 拉取失败: HTTP \(code)(远端还没有快照?)")
-        }
-        let payloadBytes = try LedgerCrypto.open(data, passphrase: cfg.exportPass)
-        return try JSONDecoder().decode(LedgerPayload.self, from: payloadBytes)
+    // Only accept a single strong entity tag. Treat missing/weak tags as an unknown version.
+    private static func validatedTag(_ tag: String?) -> String? {
+        guard let tag, tag.count >= 2, tag.first == "\"", tag.last == "\"",
+              tag.dropFirst().dropLast().utf8.allSatisfy({ $0 == 0x21 || $0 >= 0x23 && $0 <= 0x7e }) else { return nil }
+        return tag
     }
 
-    /// 推送:端到端加密导出 → PUT 覆盖远端快照。目录不存在时自动 MKCOL 一次。
-    public static func push(cfg: Config, ledger: Data) throws -> String {
-        let fileURL = fileURL(cfg.base)
-        var (code, _) = try request("PUT", fileURL, cfg: cfg, body: ledger)
-        if code == 409 {
-            // 目录不存在:MKCOL 父目录后重试一次(坚果云等对不存在的集合返回 409)
-            _ = try? request("MKCOL", URL(string: cfg.base)!, cfg: cfg)
-            (code, _) = try request("PUT", fileURL, cfg: cfg, body: ledger)
+    static func fetchSnapshot(cfg: Config) throws -> (payload: LedgerPayload, eTag: String?) {
+        let result = try request("GET", cfg.fileURL, cfg: cfg)
+        guard result.code == 200, !result.data.isEmpty else {
+            throw LedgerTransferError.badEnvelope("WebDAV 拉取失败: HTTP \(result.code)")
         }
-        guard (200...299).contains(code) else {
-            throw LedgerTransferError.badEnvelope("WebDAV 推送失败: HTTP \(code)(检查地址/账号/密码)")
-        }
-        return "已推送加密账本到 WebDAV(\(ledger.count) 字节,服务端只见密文)"
+        let data = try LedgerCrypto.open(result.data, passphrase: cfg.exportPass)
+        return (try JSONDecoder().decode(LedgerPayload.self, from: data), validatedTag(result.eTag))
     }
 
-
+    static func push(cfg: Config, ledger: Data, eTag: String?) throws -> (message: String, eTag: String?) {
+        var result = try request("PUT", cfg.fileURL, cfg: cfg, body: ledger, eTag: eTag)
+        if result.code == 409 {
+            _ = try? request("MKCOL", cfg.directory, cfg: cfg)
+            result = try request("PUT", cfg.fileURL, cfg: cfg, body: ledger, eTag: eTag)
+        }
+        if result.code == 412 {
+            throw LedgerTransferError.badEnvelope("WebDAV 远端账本已存在或已更新。请先拉取并检查合并结果，再重新推送。服务端须提供强 ETag 才能更新已有快照。")
+        }
+        guard (200...299).contains(result.code) else {
+            throw LedgerTransferError.badEnvelope("WebDAV 推送失败: HTTP \(result.code)")
+        }
+        return ("已推送加密账本到 WebDAV(\(ledger.count) 字节,服务端只见密文)", validatedTag(result.eTag))
+    }
 }

@@ -118,8 +118,9 @@ public struct HistoryEntry: Codable {
         }
         lines.append(head)
         lines.append("key: \(keyMasked)\(key == nil ? "(多 key 条目,凭据从原文恢复)" : "")")
-        var statusLine = "状态: \(Self.statusLabel(status, health))"
-        if let d = healthDetail, !d.isEmpty { statusLine += " · \(String(d.prefix(140)))" }
+        let label = status == "deleted" ? "已删除" : (status == "error" ? "导入失败" : availability.label)
+        var statusLine = "状态: \(label)"
+        if let d = displayHealthDetail, !d.isEmpty { statusLine += " · \(String(d.prefix(140)))" }
         lines.append(statusLine)
         var bits: [String] = []
         if let at = healthAt { bits.append("验证 \(Self.shortTime(at))") }
@@ -144,17 +145,10 @@ public struct HistoryEntry: Codable {
         return lines.joined(separator: "\n")
     }
 
-    static func statusLabel(_ status: String, _ health: String?) -> String {
-        if status == "deleted" { return "已删除" }
-        if status == "error" { return "导入失败" }
-        switch health {
-        case "ok": return "可用"
-        case "proxy-ok": return "可用(需代理)"
-        case "quota": return "无余额"
-        case "dead": return "已失效"
-        case "err": return "异常"
-        default: return "未测试"
-        }
+    public var displayHealthDetail: String? {
+        guard let healthDetail else { return nil }
+        guard let key, !key.isEmpty else { return healthDetail }
+        return healthDetail.replacingOccurrences(of: key, with: "•••")
     }
 
     static func targetLabels(_ targets: [String]) -> [String] {
@@ -558,36 +552,56 @@ public final class HistoryStore {
         }
     }
 
+    /// Validate the disk snapshot before a write, even when the read path has cached data.
+    private func readHistoryForWrite() throws -> [HistoryEntry]? {
+        struct Wrapper: Decodable { var items: [HistoryEntry] }
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            guard let size = attrs[.size] as? Int, size <= Self.maxHistoryBytes else {
+                throw ParseError.io("账本文件过大，已保留原文件")
+            }
+            let data = try Data(contentsOf: fileURL)
+            guard data.count <= Self.maxHistoryBytes,
+                  let wrapper = try? JSONDecoder().decode(Wrapper.self, from: data) else {
+                throw ParseError.io("账本文件无法解析，已保留原文件")
+            }
+            return wrapper.items
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+            (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
+            return nil
+        }
+    }
+
     private func saveLockedNoFlock(dirtyIDs: Set<String>) throws {
         struct Wrapper: Codable { var items: [HistoryEntry] }
         var merged = _items
         // 文件从存在变为缺失 = 其他进程/用户清空了历史。防复活规则同样适用:
         // 本会话已落盘过的条目不复活,只保留本次调用新增(非 loadedIDs)的脏条目。
         // 仅在文件确实不存在时触发;文件存在但读失败(瞬时 IO 错误)不动内存。
-        if !FileManager.default.fileExists(atPath: fileURL.path), lastMtime != nil {
-            merged = merged.filter { dirtyIDs.contains($0.id) || !loadedIDs.contains($0.id) }
-        } else if let data = try? Data(contentsOf: fileURL),
-           let w = try? JSONDecoder().decode(Wrapper.self, from: data) {
-            let fileIDs = Set(w.items.map { $0.id })
+        let onDisk = try readHistoryForWrite()
+        if onDisk == nil, lastMtime != nil {
+            merged = merged.filter { !loadedIDs.contains($0.id) }
+        } else if let items = onDisk {
+            let fileIDs = Set(items.map { $0.id })
             let memIDs = Set(merged.map { $0.id })
             // 文件 mtime 晚于我们上次消费的时间 = 其他进程改过:非脏同 id 条目以文件版为准,
             // 否则内存里的旧版本会把 CLI 刚改的 status/health 静默回滚
             var externalChanged = false
             if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-               let mtime = attrs[.modificationDate] as? Date, let last = lastMtime, mtime != last {
+               let mtime = attrs[.modificationDate] as? Date, mtime != lastMtime {
                 externalChanged = true
             }
             merged = merged.filter { e in
                 guard fileIDs.contains(e.id) else { return !loadedIDs.contains(e.id) }
                 if dirtyIDs.contains(e.id) { return true }
                 return !externalChanged
-            } + w.items.filter { wItem in
+            } + items.filter { wItem in
                 // 外部变更时,被丢弃的非脏同 id 内存条目必须用文件版补回,
                 // 否则条目凭空消失;脏条目(本次刚改)保持内存版,不回填文件旧版
                 !memIDs.contains(wItem.id) || (externalChanged && !dirtyIDs.contains(wItem.id))
             }
             // 文件独有的 id 登记进 loadedIDs:后续 save 时若它再从文件消失,同样按「其他进程删除」处理
-            for e in w.items where !loadedIDs.contains(e.id) { loadedIDs.insert(e.id) }
+            for e in items where !loadedIDs.contains(e.id) { loadedIDs.insert(e.id) }
             merged.sort { $0.ts > $1.ts }
         }
             // 合并可能带回文件独有的旧条目,重新执行上限(丢最旧)
@@ -623,9 +637,11 @@ public final class HistoryStore {
         defer { lock.unlock() }
         var e = e
         e.updatedAt = Date().timeIntervalSince1970
+        let previous = _items
         _items.insert(e, at: 0)
         _items = Self.applyCap(_items)
-        try saveLocked(dirtyIDs: [e.id])
+        do { try saveLocked(dirtyIDs: [e.id]) }
+        catch { _items = previous; throw error }
     }
 
     /// 历史上限 500,但绝不丢弃仍持有外部产物写入凭据的 active 条目:
@@ -664,31 +680,65 @@ public final class HistoryStore {
         // (refreshModels 先 appendProbePoint 再 update 整条),整条覆盖会回滚监控历史
         merged.probeLog = _items[i].probeLog
         merged.modelProbeLog = _items[i].modelProbeLog
+        let previous = _items[i]
         _items[i] = merged
-        try saveLocked(dirtyIDs: [e.id])
+        do { try saveLocked(dirtyIDs: [e.id]) }
+        catch { _items[i] = previous; throw error }
     }
 
-    /// 对账路径专用:整条更新 + 追加单个探测点,一次落盘。
-    /// 拆成 update + appendProbePoint 是每条对账 2 次全量序列化写(N 条失联 key
-    /// 离线时 2N 次 IO);语义与两者连用完全一致(probeLog 仍以 store 现状为准)
-    public func updateWithProbePoint(_ e: HistoryEntry, point: ProbePoint) throws {
+    private static func sameProbeConfiguration(_ current: HistoryEntry, _ tested: HistoryEntry) -> Bool {
+        current.status == "active" && !current.isDSHOnly &&
+            current.format == tested.format && current.url == tested.url && current.key == tested.key &&
+            (current.key != nil || current.raw == tested.raw) &&
+            current.model == tested.model && current.models == tested.models &&
+            current.targets.contains("cpa") == tested.targets.contains("cpa") &&
+            current.cpaConfigPath == tested.cpaConfigPath
+    }
+
+    /// 只在被测配置仍有效时，合并对账产生的字段，保留同时发生的用户编辑。
+    @discardableResult
+    func mergeCCReconciliation(tested: HistoryEntry, health: String, detail: String,
+                               authFailed: Bool, note: String, point: ProbePoint?) throws -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
-        var merged = e
-        merged.updatedAt = Date().timeIntervalSince1970
-        merged.probeLog = _items[i].probeLog
-        merged.modelProbeLog = _items[i].modelProbeLog
-        var log = (merged.probeLog ?? []) + [point]
-        if log.count > 30 { log = Array(log.suffix(30)) }
-        merged.probeLog = log
-        _items[i] = merged
-        try saveLocked(dirtyIDs: [e.id])
+        return try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let i = _items.firstIndex(where: { $0.id == tested.id }) else { return false }
+            let current = _items[i]
+            guard Self.sameProbeConfiguration(current, tested),
+                  current.ccProviderID == tested.ccProviderID, current.targets == tested.targets,
+                  current.ccMissing == tested.ccMissing, current.healthAt == tested.healthAt else { return false }
+            let now = point?.t ?? Date().timeIntervalSince1970
+            var updated = current
+            if authFailed {
+                updated.targets.removeAll { $0.hasPrefix("ccswitch") }
+                if updated.targets.isEmpty {
+                    updated.status = "deleted"
+                    updated.deletedAt = current.deletedAt ?? now
+                }
+            } else {
+                updated.ccMissing = true
+            }
+            if !(updated.note ?? "").components(separatedBy: "; ").contains(note) {
+                updated.note = [updated.note, note].compactMap { $0 }.joined(separator: "; ")
+            }
+            updated.health = health
+            updated.healthDetail = detail
+            updated.healthAt = now
+            updated.failStreak = nil
+            updated.latencyMs = point?.ms
+            updated.updatedAt = max(current.updatedAt ?? 0, now)
+            if let point {
+                updated.probeLog = Array(((updated.probeLog ?? []) + [point]).suffix(30))
+            }
+            _items[i] = updated
+            do { try saveLockedNoFlock(dirtyIDs: [current.id]) }
+            catch { _items[i] = current; throw error }
+            return true
+        }
     }
 
-    /// 批量健康更新:只合并 health/healthDetail/healthAt 三个字段,其余字段以内存现状为准。
-    /// scanHealth 持有旧快照做网络测试,测试期间条目可能被本进程或 CLI 改过(note/targets/status),
-    /// 整条覆盖会把并发修改静默回滚 —— 所以这里按字段合并而不是整条替换。
+    /// 批量合并本轮的探测字段。过时的结果在读写同一把文件锁内丢弃。
     public func mergeHealth(_ entries: [HistoryEntry], at: TimeInterval) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -696,8 +746,11 @@ public final class HistoryStore {
             refreshIfExternalChangeLocked()
             let indices = Dictionary(_items.enumerated().map { ($0.element.id, $0.offset) },
                                      uniquingKeysWith: { first, _ in first })
+            var previous: [(Int, HistoryEntry)] = []
             for e in entries {
-                guard let i = indices[e.id], _items[i].status == "active" else { continue }
+                guard let i = indices[e.id], Self.sameProbeConfiguration(_items[i], e),
+                      (_items[i].healthAt ?? -.infinity) < at else { continue }
+                previous.append((i, _items[i]))
                 if let style = e.apiStyle { _items[i].apiStyle = style }
                 _items[i].health = e.health
                 _items[i].healthDetail = e.healthDetail
@@ -707,10 +760,11 @@ public final class HistoryStore {
                 _items[i].failStreak = e.failStreak
                 _items[i].viaCPAOk = e.viaCPAOk
                 _items[i].viaCPAAt = e.viaCPAAt
-                _items[i].updatedAt = at
+                _items[i].updatedAt = max(_items[i].updatedAt ?? 0, at)
                 if e.health != "reachable" {
                     let pt = ProbePoint(t: at, ms: e.latencyMs,
-                                        ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
+                                        ok: (e.health == "ok" || e.health == "proxy-ok") && (e.failStreak ?? 0) == 0,
+                                        cpa: e.viaCPAOk)
                     _items[i].probeLog = Array(((_items[i].probeLog ?? []) + [pt]).suffix(30))
                 }
                 // 模型级追加:e.modelProbeLog 携带本轮各模型新点,与 store 现状合并截 30
@@ -724,7 +778,12 @@ public final class HistoryStore {
                     _items[i].modelProbeLog = merged
                 }
             }
-            try saveLockedNoFlock(dirtyIDs: Set(entries.map { $0.id }))
+            guard !previous.isEmpty else { return }
+            do { try saveLockedNoFlock(dirtyIDs: Set(previous.map { $0.1.id })) }
+            catch {
+                for (index, entry) in previous { _items[index] = entry }
+                throw error
+            }
         }
     }
 
@@ -925,9 +984,18 @@ public final class Prefs {
     private var _webdavAutoPush = false
     private var _webdavLastSync: TimeInterval? = nil
     private var _webdavLastPushFP: String? = nil
+    private var _webdavETag: String? = nil
     public var webdavURL: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavURL }
-        set { lock.lock(); _webdavURL = newValue; lock.unlock() }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            if _webdavURL != newValue {
+                _webdavETag = nil
+                _webdavLastSync = nil
+                _webdavLastPushFP = nil
+                _webdavURL = newValue
+            }
+        }
     }
     public var magpieWebLink: String? {
         get { lock.lock(); defer { lock.unlock() }; return _magpieWebLink }
@@ -935,15 +1003,39 @@ public final class Prefs {
     }
     public var webdavUser: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavUser }
-        set { lock.lock(); _webdavUser = newValue; lock.unlock() }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            if _webdavUser != newValue {
+                _webdavETag = nil
+                _webdavLastSync = nil
+                _webdavLastPushFP = nil
+                _webdavUser = newValue
+            }
+        }
     }
     public var webdavPass: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavPass }
-        set { lock.lock(); _webdavPass = newValue; lock.unlock() }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            if _webdavPass != newValue {
+                _webdavETag = nil
+                _webdavLastSync = nil
+                _webdavLastPushFP = nil
+                _webdavPass = newValue
+            }
+        }
     }
     public var webdavExportPass: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavExportPass }
-        set { lock.lock(); _webdavExportPass = newValue; lock.unlock() }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            if _webdavExportPass != newValue {
+                _webdavETag = nil
+                _webdavLastSync = nil
+                _webdavLastPushFP = nil
+                _webdavExportPass = newValue
+            }
+        }
     }
     public var webdavAutoPull: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _webdavAutoPull }
@@ -960,6 +1052,16 @@ public final class Prefs {
     public var webdavLastPushFP: String? {
         get { lock.lock(); defer { lock.unlock() }; return _webdavLastPushFP }
         set { lock.lock(); _webdavLastPushFP = newValue; lock.unlock() }
+    }
+
+    var webdavETag: String? {
+        get { lock.lock(); defer { lock.unlock() }; return _webdavETag }
+        set { lock.lock(); _webdavETag = newValue; lock.unlock() }
+    }
+
+    func webdavSettingsSnapshot() -> (url: String?, user: String?, pass: String?, exportPass: String?) {
+        lock.lock(); defer { lock.unlock() }
+        return (_webdavURL, _webdavUser, _webdavPass, _webdavExportPass)
     }
 
     /// 测试隔离:TestEnv 每个环境调用一次,把全部偏好重置为默认值。
@@ -986,6 +1088,7 @@ public final class Prefs {
         _webdavAutoPush = false
         _webdavLastSync = nil
         _webdavLastPushFP = nil
+        _webdavETag = nil
     }
 
     init() { load() }
@@ -1015,6 +1118,7 @@ public final class Prefs {
             _webdavAutoPush = obj["webdavAutoPush"] as? Bool ?? false
             _webdavLastSync = obj["webdavLastSync"] as? TimeInterval
             _webdavLastPushFP = obj["webdavLastPushFP"] as? String
+            _webdavETag = obj["webdavETag"] as? String
         }
     }
 
@@ -1064,6 +1168,7 @@ public final class Prefs {
         let webdavAutoPush = _webdavAutoPush
         let webdavLastSync = _webdavLastSync
         let webdavLastPushFP = _webdavLastPushFP
+        let webdavETag = _webdavETag
         lock.unlock()
         // flock 串行化跨进程写:app 与 CLI 并发 save 时,固定 tmp 路径会被对方
         // replaceItemAt 拽走导致写失败,并发覆盖也会丢掉对方的设置变更
@@ -1083,6 +1188,7 @@ public final class Prefs {
             obj["webdavAutoPush"] = webdavAutoPush
             if let v = webdavLastSync { obj["webdavLastSync"] = v }
             if let v = webdavLastPushFP { obj["webdavLastPushFP"] = v }
+            if let v = webdavETag { obj["webdavETag"] = v }
             try FileManager.default.createDirectory(
                 at: fileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true

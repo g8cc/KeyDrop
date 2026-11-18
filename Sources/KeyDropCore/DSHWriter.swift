@@ -100,26 +100,21 @@ public enum DSHWriter {
         let route = displayRouteKey(providerID: providerID, url: url, models: models)
         let env = envName(providerID: providerID)
 
-        backupFile(settingsPath)
-        backupFile(credentialsPath)
-        var settings = try readExisting(settingsPath)
-        var creds = try readExisting(credentialsPath)
-
+        let originalSettings = try FileChange.read(settingsPath)
+        let originalCredentials = try FileChange.read(credentialsPath)
+        var settings = originalSettings ?? ""
+        var creds = originalCredentials ?? ""
         removeRoutesForID(&settings, providerID: providerID)
         removeCredential(&creds, env: env)
         try upsertSettings(&settings, route: route, env: env, url: url, models: models)
         try upsertCredential(&creds, env: env, value: key)
 
-        let fm = FileManager.default
-        try fm.createDirectory(at: URL(fileURLWithPath: settingsPath).deletingLastPathComponent(), withIntermediateDirectories: true)
-        try fm.createDirectory(at: URL(fileURLWithPath: credentialsPath).deletingLastPathComponent(), withIntermediateDirectories: true)
-        // 写入顺序:creds(被引用方)先写,settings(引用方)后写。
-        // 反过来时 settings 写成功而 creds 失败会留下引用不存在 env 的半成品,DSH 启动报错;
-        // creds 先写失败则 settings 未动,多一个未被引用的 env 无害。
-        try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
-        try cordisUpsert(providerID: providerID, route: route, env: env, baseURL: url, models: models)
-        try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
+        let profiles = try cordisUpsert(providerID: providerID, route: route, env: env, baseURL: url, models: models)
+        // 引用方只在凭据写好后才更新。各文件先完成解析，再一起提交。
+        try applyChanges([
+            FileChange(path: credentialsPath, original: originalCredentials, replacement: creds, privateFile: true),
+            FileChange(path: settingsPath, original: originalSettings, replacement: settings)
+        ] + profiles)
         return route
     }
 
@@ -138,73 +133,53 @@ public enum DSHWriter {
     /// - Parameter claimedBases: 账本认领的 id8 基名(不含 "keydrop-" 前缀,
     ///   含 "cparesid");路由名等于 keydrop-<base> 或以 keydrop-<base>- 开头即视为认领
     public static func pruneOrphanRoutes(claimedBases: Set<String>) throws -> [String] {
-        guard FileManager.default.fileExists(atPath: settingsPath) else { return [] }
-        return try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
-            var settings = try readExisting(settingsPath)
-            var creds = try readExisting(credentialsPath)
-            // 单遍扫描:路由名行 = 恰好 4 空格缩进;其块内 6 空格缩进的 apiKeyEnv 行
-            var routeEnvs: [String: String] = [:]
-            var current: String? = nil
-            for line in settings.components(separatedBy: "\n") {
-                if line.hasPrefix("    "), !line.hasPrefix("      ") {
-                    let t = line.trimmingCharacters(in: .whitespaces)
-                    current = t.hasSuffix(":") ? String(t.dropLast()) : nil
-                    continue
-                }
-                if let r = current, line.hasPrefix("      ") {
-                    let t = line.trimmingCharacters(in: .whitespaces)
-                    if t.hasPrefix("apiKeyEnv:") {
-                        routeEnvs[r] = String(t.dropFirst("apiKeyEnv:".count))
-                            .trimmingCharacters(in: .whitespaces)
-                    }
-                }
+        try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
+            guard let original = try FileChange.read(settingsPath) else { return [] }
+            let claimed = Set(claimedBases.map { $0.lowercased() })
+            let orphans = managedRoutes(in: original).filter { route in
+                guard let base = route.name.dropFirst("keydrop-".count).split(separator: "-").first,
+                      !base.isEmpty, base.count <= 8 else { return false }
+                let owner = base.lowercased()
+                return route.env == envName(providerID: owner) && !claimed.contains(owner)
             }
-            let orphans = routeEnvs.keys
-                .filter { name in
-                    guard name.hasPrefix("keydrop-") else { return false }
-                    let base = String(name.dropFirst("keydrop-".count))
-                    let bare = base.contains("-") ? String(base[..<base.firstIndex(of: "-")!]) : base
-                    return !claimedBases.contains(base) && !claimedBases.contains(bare)
-                }
-                .sorted()
             guard !orphans.isEmpty else { return [] }
-            backupFile(settingsPath)
-            backupFile(credentialsPath)
-            for r in orphans {
-                removeRoute(&settings, route: r)
-                if let env = routeEnvs[r], !env.isEmpty {
+            var settings = original
+            for orphan in orphans { removeRoute(&settings, route: orphan.name) }
+
+            var changes = [FileChange(path: settingsPath, original: original, replacement: settings)]
+            if let originalCredentials = try FileChange.read(credentialsPath) {
+                let profileRefs = try cordisCredentialRefs()
+                var creds = originalCredentials
+                for env in Set(orphans.map(\.env)) where !profileRefs.contains(env) &&
+                    !settings.components(separatedBy: "\n").contains(where: {
+                        let field = $0.trimmingCharacters(in: .whitespaces)
+                        guard field.hasPrefix("apiKeyEnv:") else { return false }
+                        return decodeYAMLScalarValue(String(field.dropFirst("apiKeyEnv:".count))
+                            .trimmingCharacters(in: .whitespaces)) == env
+                    }) {
                     removeCredential(&creds, env: env)
                 }
+                changes.append(FileChange(path: credentialsPath, original: originalCredentials, replacement: creds, privateFile: true))
             }
-            try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
-            try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
-            return orphans
+            try applyChanges(changes)
+            return Array(Set(orphans.map(\.name))).sorted()
         }
     }
 
     private static func removeLocked(providerID: String) throws {
         let env = envName(providerID: providerID)
-
-        backupFile(settingsPath)
-        backupFile(credentialsPath)
-        // 读失败必须抛错(与 add 的 readExisting 同口径):吞掉失败会让调用方
-        // 照常摘掉 dsh tag,settings/creds 里的 route 与明文 key 永久残留且无账本指针
-        if FileManager.default.fileExists(atPath: settingsPath) {
-            var settings = try readExisting(settingsPath)
+        var changes = try cordisRemove(providerID: providerID)
+        if let original = try FileChange.read(settingsPath) {
+            var settings = original
             removeRoutesForID(&settings, providerID: providerID)
-            try settings.write(toFile: settingsPath, atomically: true, encoding: .utf8)
+            changes.append(FileChange(path: settingsPath, original: original, replacement: settings))
         }
-        // 同时从 Cordis profile 补丁层移除
-        try? cordisRemove(providerID: providerID)
-        if FileManager.default.fileExists(atPath: credentialsPath) {
-            var creds = try readExisting(credentialsPath)
+        if let original = try FileChange.read(credentialsPath) {
+            var creds = original
             removeCredential(&creds, env: env)
-            try creds.write(toFile: credentialsPath, atomically: true, encoding: .utf8)
-            // 原子写=临时文件+rename,新文件继承 umask(通常 0644),会把 add 时设置的
-            // 0600 重置成全员可读 —— 凭证文件里还有其他 provider 的明文 key,必须重设权限
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsPath)
+            changes.append(FileChange(path: credentialsPath, original: original, replacement: creds, privateFile: true))
         }
+        try applyChanges(changes)
     }
 
     /// 摘除该 provider 的全部路由块(含历史装饰名)。
@@ -216,7 +191,8 @@ public enum DSHWriter {
         var nameEnv: [(String, String)] = []
         var current: String? = nil
         var currentEnv = ""
-        for line in lines {
+        guard let providers = settingsProviders(in: lines) else { return }
+        for line in lines[providers] {
             if line.hasPrefix("    "), !line.hasPrefix("      ") {
                 if let c = current, isOwnedRoute(c, providerID: providerID), currentEnv == ownEnv {
                     nameEnv.append((c, currentEnv))
@@ -229,7 +205,7 @@ public enum DSHWriter {
             if current != nil, line.hasPrefix("      ") {
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if t.hasPrefix("apiKeyEnv:") {
-                    currentEnv = String(t.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces)
+                    currentEnv = decodeYAMLScalarValue(String(t.dropFirst("apiKeyEnv:".count)).trimmingCharacters(in: .whitespaces))
                 }
             }
         }
@@ -310,7 +286,7 @@ public enum DSHWriter {
         FileManager.default.fileExists(atPath: dshHome)
     }
 
-    // MARK: - Cordis profile patch layer(DSH web 运行时真正读取的配置源)
+    // MARK: - Cordis profile patch layer
 
     static var cordisProfilesDir: String {
         (dshHome as NSString).appendingPathComponent("profiles")
@@ -331,12 +307,78 @@ public enum DSHWriter {
         var baseURL: String?
     }
 
+    private struct FileChange {
+        let path: String
+        let original: String?
+        let replacement: String
+        var privateFile = false
+
+        static func read(_ path: String) throws -> String? {
+            do { return try String(contentsOfFile: path, encoding: .utf8) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+                return nil
+            }
+        }
+
+        func write(_ text: String, mode: Int) throws {
+            let file = URL(fileURLWithPath: path)
+            let parent = file.deletingLastPathComponent()
+            let temp = parent.appendingPathComponent(".keydrop-" + UUID().uuidString)
+            let fm = FileManager.default
+            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+            guard fm.createFile(atPath: temp.path, contents: nil, attributes: [.posixPermissions: mode]) else {
+                throw WriterError.file("无法创建 DSH 临时文件: \(file.lastPathComponent)")
+            }
+            defer { try? fm.removeItem(at: temp) }
+            try Data(text.utf8).write(to: temp)
+            guard rename(temp.path, path) == 0 else {
+                let code = errno
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(code), userInfo: [NSFilePathErrorKey: path])
+            }
+        }
+    }
+
+    private static func applyChanges(_ planned: [FileChange]) throws {
+        let changes = planned.filter { $0.original != $0.replacement }
+        let fm = FileManager.default
+        var applied: [(change: FileChange, originalMode: Int)] = []
+        do {
+            for change in changes {
+                guard try FileChange.read(change.path) == change.original else {
+                    throw WriterError.file("DSH 配置已被其他进程更新，请重试: \(change.path)")
+                }
+                let mode = try change.original.map { _ in
+                    try fm.attributesOfItem(atPath: change.path)[.posixPermissions] as? Int ?? 0o600
+                } ?? 0o600
+                backupFile(change.path)
+                try change.write(change.replacement, mode: change.privateFile ? 0o600 : mode)
+                applied.append((change, mode))
+            }
+        } catch {
+            var rollbackFailures: [String] = []
+            for (change, mode) in applied.reversed() {
+                do {
+                    guard try FileChange.read(change.path) == change.replacement else {
+                        throw WriterError.file("DSH 配置已被其他进程更新")
+                    }
+                    if let original = change.original { try change.write(original, mode: mode) }
+                    else { try fm.removeItem(atPath: change.path) }
+                } catch {
+                    rollbackFailures.append(change.path)
+                }
+            }
+            if !rollbackFailures.isEmpty {
+                throw WriterError.file("\(error.localizedDescription)。以下文件未能恢复，请检查 .keydrop-bak：\(rollbackFailures.joined(separator: "、"))")
+            }
+            throw error
+        }
+    }
+
     /// 只编辑 llm-pi-ai.config.providers 的直接子项，保留其他插件和手工块。
-    private static func editCordisProfiles(
+    private static func planCordisProfiles(
         writeChanges: Bool = true,
         _ edit: (inout [CordisProvider], Int) -> Void = { _, _ in }
-    ) throws -> Int {
-        var changed = 0
+    ) throws -> [FileChange] {
         let ws = CharacterSet.whitespaces
         func indent(_ line: String) -> Int { line.prefix(while: { $0 == " " }).count }
         func structural(_ line: String) -> Bool {
@@ -350,7 +392,7 @@ public enum DSHWriter {
         }
 
         // Prepare every change before writing any profile.
-        var updates: [(path: String, original: String, replacement: String)] = []
+        var updates: [FileChange] = []
         for path in cordisPatchFiles() {
             let content = try readExisting(path)
             var lines = content.components(separatedBy: "\n")
@@ -433,30 +475,22 @@ public enum DSHWriter {
             }
             lines.replaceSubrange((header + 1)..<end, with: Array(prefix) + providers.flatMap(\.lines))
             let replacement = lines.joined(separator: "\n")
-            if replacement != content { updates.append((path, content, replacement)) }
+            if replacement != content { updates.append(FileChange(path: path, original: content, replacement: replacement)) }
         }
-        for update in updates {
-            guard try readExisting(update.path) == update.original else {
-                throw WriterError.file("Cordis 配置已被其他进程更新，请重试: \(update.path)")
-            }
-            backupFile(update.path)
-            let attributes = try FileManager.default.attributesOfItem(atPath: update.path)
-            try update.replacement.write(toFile: update.path, atomically: true, encoding: .utf8)
-            if let mode = attributes[.posixPermissions] {
-                try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: update.path)
-            }
-            changed += 1
-        }
-        return changed
+        return updates
     }
 
     public static func repairCordisProfiles() throws -> Int {
-        try FileLock.withLock(FileLock.lockPath(for: settingsPath)) { try editCordisProfiles() }
+        try FileLock.withLock(FileLock.lockPath(for: settingsPath)) {
+            let changes = try planCordisProfiles()
+            try applyChanges(changes)
+            return changes.count
+        }
     }
 
     static func cordisCredentialRefs() throws -> Set<String> {
         var refs = Set<String>()
-        _ = try editCordisProfiles(writeChanges: false) { providers, _ in
+        _ = try planCordisProfiles(writeChanges: false) { providers, _ in
             for provider in providers {
                 if let owner = provider.owner { refs.insert(envName(providerID: owner)) }
             }
@@ -464,8 +498,8 @@ public enum DSHWriter {
         return refs
     }
 
-    static func cordisUpsert(providerID: String, route: String, env: String, baseURL: String, models: [String]) throws {
-        _ = try editCordisProfiles { providers, indent in
+    private static func cordisUpsert(providerID: String, route: String, env: String, baseURL: String, models: [String]) throws -> [FileChange] {
+        try planCordisProfiles { providers, indent in
             let owner = String(providerID.prefix(8)).lowercased()
             let index = providers.firstIndex { $0.owner == owner }
             let name = route
@@ -486,9 +520,9 @@ public enum DSHWriter {
         }
     }
 
-    static func cordisRemove(providerID: String) throws {
+    private static func cordisRemove(providerID: String) throws -> [FileChange] {
         let owner = String(providerID.prefix(8)).lowercased()
-        _ = try editCordisProfiles { providers, _ in providers.removeAll { $0.owner == owner } }
+        return try planCordisProfiles { providers, _ in providers.removeAll { $0.owner == owner } }
     }
 
     /// DSH web(Jet Hub 界面的后端)是否在运行。settings.yaml 是它的
@@ -553,7 +587,12 @@ public enum DSHWriter {
     /// 路由行 = 恰好 4 空格缩进;块内字段 6 空格,模型项 8 空格 `- id:`
     public static func managedRoutes() throws -> [ManagedRoute] {
         guard FileManager.default.fileExists(atPath: settingsPath) else { return [] }
-        let text = try readExisting(settingsPath)
+        return managedRoutes(in: try readExisting(settingsPath))
+    }
+
+    private static func managedRoutes(in text: String) -> [ManagedRoute] {
+        let lines = text.components(separatedBy: "\n")
+        guard let providers = settingsProviders(in: lines) else { return [] }
         var routes: [ManagedRoute] = []
         var name: String? = nil
         var env = ""
@@ -565,7 +604,7 @@ public enum DSHWriter {
             }
             name = nil; env = ""; baseURL = ""; models = []
         }
-        for line in text.components(separatedBy: "\n") {
+        for line in lines[providers] {
             if line.hasPrefix("    "), !line.hasPrefix("      ") {
                 flush()
                 let t = line.trimmingCharacters(in: .whitespaces)
@@ -625,6 +664,31 @@ public enum DSHWriter {
 
     // MARK: - settings.yaml
 
+    private static func settingsPlugin(in lines: [String]) -> Range<Int>? {
+        guard let header = lines.firstIndex(where: { Parser.regexMatch($0, #"^llm-pi-ai: *(?:#.*)?$"#) }) else { return nil }
+        let start = header + 1
+        let end = (start..<lines.count).first { index in
+            let line = lines[index]
+            let text = line.trimmingCharacters(in: .whitespaces)
+            return !text.isEmpty && !text.hasPrefix("#") && !line.hasPrefix(" ")
+        } ?? lines.count
+        return start..<end
+    }
+
+    private static func settingsProvidersEnd(in lines: [String], header: Int, limit: Int) -> Int {
+        (header + 1..<limit).first { index in
+            let line = lines[index]
+            let text = line.trimmingCharacters(in: .whitespaces)
+            return !text.isEmpty && !text.hasPrefix("#") && !line.hasPrefix("    ")
+        } ?? limit
+    }
+
+    private static func settingsProviders(in lines: [String]) -> Range<Int>? {
+        guard let section = settingsPlugin(in: lines),
+              let header = section.first(where: { lines[$0].hasPrefix("  providers:") }) else { return nil }
+        return (header + 1)..<settingsProvidersEnd(in: lines, header: header, limit: section.upperBound)
+    }
+
     private static func upsertSettings(
         _ text: inout String, route: String, env: String, url: String, models: [String]
     ) throws {
@@ -632,29 +696,23 @@ public enum DSHWriter {
             .components(separatedBy: "\n")
         var lines = text.components(separatedBy: "\n")
 
-        if let pi = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "llm-pi-ai:" }) {
-            var p: Int? = nil
-            var j = pi + 1
-            while j < lines.count {
-                let l = lines[j]
-                if l.isEmpty { j += 1; continue }
-                if !l.hasPrefix(" ") { break }
-                if l.trimmingCharacters(in: .whitespaces) == "providers:" { p = j }
-                j += 1
-            }
-            if let p {
-                var q = p + 1
-                while q < lines.count {
-                    let l = lines[q]
-                    if l.isEmpty { q += 1; continue }
-                    if l.hasPrefix("    ") { q += 1; continue }
-                    break
+        if let section = settingsPlugin(in: lines) {
+            let headers = section.filter { lines[$0].hasPrefix("  providers:") }
+            guard headers.count <= 1 else { throw WriterError.file("DSH settings.yaml 存在重复 providers 映射") }
+            if let header = headers.first {
+                let line = lines[header]
+                let suffix = String(line.dropFirst("  providers:".count)).trimmingCharacters(in: .whitespaces)
+                guard Parser.regexMatch(suffix, #"^(?:\{\} *)?(?:#.*)?$"#) else {
+                    throw WriterError.file("DSH settings.yaml 的 providers 格式无法安全改写")
                 }
-                lines.insert(contentsOf: blockLines + [""], at: q)
+                if suffix.hasPrefix("{}") {
+                    let comment = suffix.dropFirst(2).trimmingCharacters(in: .whitespaces)
+                    lines[header] = "  providers:" + (comment.isEmpty ? "" : " " + comment)
+                }
+                let end = settingsProvidersEnd(in: lines, header: header, limit: section.upperBound)
+                lines.insert(contentsOf: blockLines + [""], at: end)
             } else {
-                var q = pi + 1
-                while q < lines.count, lines[q].hasPrefix(" ") || lines[q].isEmpty { q += 1 }
-                lines.insert(contentsOf: ["  providers:"] + blockLines + [""], at: q)
+                lines.insert(contentsOf: ["  providers:"] + blockLines + [""], at: section.upperBound)
             }
         } else {
             if !text.isEmpty, !text.hasSuffix("\n") { lines.append("") }
@@ -677,23 +735,15 @@ public enum DSHWriter {
     }
 
     private static func removeRoute(_ text: inout String, route: String) {
-        let lines = text.components(separatedBy: "\n")
-        var out: [String] = []
-        var skipping = false
-        for line in lines {
-            if line.hasPrefix("    \(route):") {
-                skipping = true
-                continue
-            }
-            if skipping {
-                if line.hasPrefix("      ") || line.isEmpty {
-                    continue
-                }
-                skipping = false
-            }
-            out.append(line)
+        var lines = text.components(separatedBy: "\n")
+        guard let providers = settingsProviders(in: lines) else { return }
+        let starts = providers.filter { lines[$0].hasPrefix("    \(route):") }
+        for start in starts.reversed() {
+            var end = start + 1
+            while end < lines.count, lines[end].hasPrefix("      ") { end += 1 }
+            lines.removeSubrange(start..<end)
         }
-        text = out.joined(separator: "\n")
+        text = lines.joined(separator: "\n")
     }
 
     // MARK: - credentials

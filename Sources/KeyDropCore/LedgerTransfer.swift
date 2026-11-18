@@ -80,7 +80,7 @@ public enum LedgerCrypto {
     public static let iterations = 600_000
     static let marker = " …[已截断]… "
 
-    public static func deriveKey(passphrase: String, salt: Data) -> SymmetricKey {
+    private static func deriveKey(passphrase: String, salt: Data) throws -> SymmetricKey {
         var out = Data(repeating: 0, count: 32)
         let pw = Array(passphrase.utf8)
         let status = out.withUnsafeMutableBytes { optr in
@@ -95,7 +95,7 @@ public enum LedgerCrypto {
                 )
             }
         }
-        precondition(status == kCCSuccess, "PBKDF2 派生失败")
+        guard status == kCCSuccess else { throw LedgerTransferError.badEnvelope("账本密钥派生失败") }
         return SymmetricKey(data: out)
     }
 
@@ -113,7 +113,7 @@ public enum LedgerCrypto {
     public static func seal(_ payload: Data, passphrase: String) throws -> Data {
         guard passphrase.count >= 8 else { throw LedgerTransferError.badPassphrase }
         let salt = Data((0..<32).map { _ in UInt8.random(in: 0...255) })
-        let key = deriveKey(passphrase: passphrase, salt: salt)
+        let key = try deriveKey(passphrase: passphrase, salt: salt)
         let box = try AES.GCM.seal(payload, using: key)
         guard let combined = box.combined else {
             throw LedgerTransferError.badEnvelope("加密失败: 无法生成密文")
@@ -138,12 +138,12 @@ public enum LedgerCrypto {
         }
         guard env.format == magic, env.formatVersion == 1,
               env.kdf == "PBKDF2-SHA256",
-              let salt = Data(base64Encoded: env.salt),
+              let salt = Data(base64Encoded: env.salt), salt.count == 32,
               let combined = Data(base64Encoded: env.combined)
         else {
             throw LedgerTransferError.badEnvelope("不是有效的 KeyDrop 导出文件")
         }
-        let key = deriveKey(passphrase: passphrase, salt: salt)
+        let key = try deriveKey(passphrase: passphrase, salt: salt)
         let box: AES.GCM.SealedBox
         do {
             box = try AES.GCM.SealedBox(combined: combined)

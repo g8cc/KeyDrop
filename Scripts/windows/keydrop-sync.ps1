@@ -42,9 +42,17 @@ Write-Host "账本快照: $LedgerFile"
 
 # ── 2. 解密(PBKDF2-SHA256 60 万轮派生 + AES-256-GCM,与 macOS 端同参数) ──
 $envelope = Get-Content $LedgerFile -Raw | ConvertFrom-Json
-if ($envelope.format -ne "keydrop-export") { Write-Error "不是 KeyDrop 导出文件"; exit 1 }
+if ($envelope.format -ne "keydrop-export" -or $envelope.formatVersion -ne 1 -or
+    $envelope.kdf -ne "PBKDF2-SHA256" -or $envelope.iterations -ne 600000) {
+    Write-Error "不支持的 KeyDrop 导出格式"
+    exit 1
+}
 $salt     = [Convert]::FromBase64String($envelope.salt)
 $combined = [Convert]::FromBase64String($envelope.combined)
+if ($salt.Length -ne 32 -or $combined.Length -le 28) {
+    Write-Error "KeyDrop 导出文件的盐值或密文长度无效"
+    exit 1
+}
 $rfc  = [System.Security.Cryptography.Rfc2898DeriveBytes]::new($Passphrase, $salt, $envelope.iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
 $key  = $rfc.GetBytes(32)
 # combined = nonce(12) + ciphertext + tag(16)
@@ -71,7 +79,10 @@ if ($ListOnly) {
 
 # ── 3. 更新 Claude Code 的 settings.json(claude 系激活条目 → ANTHROPIC_* 环境块) ──
 function IsClaudeModel([string]$m) { return ($m -match "claude|sonnet|opus|haiku|fable") }
-$claudeEntries = @($active | Where-Object { ($_.models ?? @() | Where-Object { IsClaudeModel $_ }).Count -gt 0 })
+$claudeEntries = @($active | Where-Object {
+    $_.format -ne "dsh-only" -and $_.key -and $_.url -and
+    @($_.models ?? @() | Where-Object { IsClaudeModel $_ }).Count -gt 0
+})
 if ($claudeEntries.Count -eq 0) { Write-Host "⚠ 账本里没有含 claude 系模型的条目,跳过 Claude Code 更新"; }
 else {
     $pick = if ($EntryMatch) { @($claudeEntries | Where-Object { $_.name -match $EntryMatch -or $_.url -match $EntryMatch })[0] } else { $claudeEntries[0] }
@@ -108,5 +119,5 @@ Write-Host ""
 Write-Host "活跃条目清单(供 CPA/其他工具手动配置):"
 $active | ForEach-Object {
     Write-Host ("  ● {0}  {1}" -f $_.name, $_.url)
-    Write-Host ("    key: {0}" -f $_.key)
+    Write-Host ("    key: {0}" -f ($_.keyMasked ?? "未提供"))
 }

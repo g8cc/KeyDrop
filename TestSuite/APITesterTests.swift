@@ -55,6 +55,7 @@ final class MockHTTPServer {
     var magpieLoginCount = 0
     var magpieSeen: [String] = []
     var davPushCount = 0
+    var davRevision = 0
     var cpaAuthFiles: [String: String] = [
         "acc-a.json": "{\"type\":\"xai\",\"email\":\"a@x.com\",\"proxy_url\":\"\"}"
     ]
@@ -408,14 +409,27 @@ final class MockHTTPServer {
                 body.append(client.readBody(toLength: n - body.count).data(using: .utf8) ?? Data())
             }
         }
+        let tag = "\"revision-\(davRevision)\""
+        func reply(_ status: String, data: String = "") {
+            client.write("HTTP/1.1 \(status)\r\nETag: \"revision-\(davRevision)\"\r\nContent-Type: application/octet-stream\r\nContent-Length: \(data.utf8.count)\r\nConnection: close\r\n\r\n\(data)")
+            client.close()
+        }
         switch method {
         case "PUT":
+            let headers = req.components(separatedBy: "\r\n").map { $0.lowercased() }
+            if (davStore[target] != nil && headers.contains("if-none-match: *")) ||
+                (headers.contains { $0.hasPrefix("if-match:") } &&
+                    (davStore[target] == nil || !headers.contains("if-match: " + tag))) {
+                respond(client, 412, "Precondition Failed", "")
+                return
+            }
             davStore[target] = body
             davPushCount += 1
-            respond(client, 201, "Created", "")
+            davRevision += 1
+            reply("201 Created")
         case "GET":
             if let data = davStore[target], let text = String(data: data, encoding: .utf8) {
-                respond(client, 200, "OK", text, contentType: "application/octet-stream")
+                reply("200 OK", data: text)
             } else {
                 respond(client, 404, "Not Found", "")
             }
@@ -621,6 +635,7 @@ enum APITesterTests {
             let first = APITester.test(url: limitedBase, key: "sk-native0000000001", timeout: 2)
             let second = APITester.test(url: limitedBase, key: "sk-native0000000001", timeout: 2)
             t.expect(!first.ok && !second.ok && !second.authFailed, "冷却期间保持限流结果")
+            t.expect(!first.skippedForCooldown && second.skippedForCooldown, "区分 HTTP 限流与冷却跳过")
             t.equal(limited.countRequests("/v1/messages"), 1, "冷却期间跳过重复聊天请求")
             t.contains(second.detail, "暂停重复探测", "解释冷却原因")
             _ = APITester.test(url: limitedBase, key: "sk-native0000000002", timeout: 2)

@@ -492,7 +492,7 @@ enum AuditFixTests {
             t.contains(tip, "https://x.example.com/v1")
             t.contains(tip, "模型: deepseek-v4.1 / glm-5.3-flash")
             t.contains(tip, "key: sk-t…4321")
-            t.contains(tip, "状态: 可用 · GET → 200, 2 个模型")
+            t.contains(tip, "状态: 最近一次探测失败，待复测 · GET → 200, 2 个模型")
             t.contains(tip, "延迟 850ms")
             t.contains(tip, "uptime 100%")
             t.contains(tip, "连续失败 2 次")

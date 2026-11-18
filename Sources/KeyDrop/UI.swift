@@ -1180,11 +1180,7 @@ struct HistoryRow: View {
             case .dshOnly, .unverified, .reachable, .inactive: return Color.secondary.opacity(0.65)
             }
         }()
-        let detail = entry.healthDetail.map { detail in
-            let scrubbed = entry.key.flatMap { $0.isEmpty ? nil : $0 }
-                .map { detail.replacingOccurrences(of: $0, with: "•••") } ?? detail
-            return "\n" + String(scrubbed.prefix(240))
-        } ?? ""
+        let detail = entry.displayHealthDetail.map { "\n" + String($0.prefix(240)) } ?? ""
         let dotTip = "\(providerContext)\n\(availability.label)\(detail)"
 
         VStack(alignment: .leading, spacing: 4) {

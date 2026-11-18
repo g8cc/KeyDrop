@@ -27,7 +27,8 @@ public struct APITestResult {
     /// false = 服务端明确拒绝(401/403/429/5xx 等),第一次失败即应降级
     public let transientFailure: Bool
     public let reachabilityOnly: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false) {
+    public let skippedForCooldown: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false, skippedForCooldown: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -42,6 +43,7 @@ public struct APITestResult {
         self.modelLatencies = modelLatencies
         self.transientFailure = transientFailure
         self.reachabilityOnly = reachabilityOnly
+        self.skippedForCooldown = skippedForCooldown
     }
 }
 
@@ -214,6 +216,7 @@ public enum APITester {
         let p = proxy?.trimmingCharacters(in: .whitespaces)
         if knownNeedsProxy, let p, !p.isEmpty {
             let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
+            if via.skippedForCooldown { return via }
             if via.ok {
                 return APITestResult(ok: true, style: via.style, models: via.models,
                                      detail: via.detail + " | 需代理(本轮跳过直连)",
@@ -239,7 +242,7 @@ public enum APITester {
         }
         // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
         let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
-        if direct.ok { return direct }
+        if direct.ok || direct.skippedForCooldown { return direct }
         if p == nil || p!.isEmpty {
             return direct
         }
@@ -336,10 +339,17 @@ public enum APITester {
                 var authModel: (String, Int)? = nil
                 var gatedModels: [String] = []
                 var firstWorkingLatency: Double? = nil
+                var skippedCount = 0
+                var cooldownDetail: String?
                 var modelLatencies: [String: Double] = [:]
                 for probe in probeOrder {
                     let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe, native: style == "anthropic")
                     if let detectedStyle = chat.style { style = detectedStyle }
+                    if chat.skippedForCooldown {
+                        skippedCount += 1
+                        cooldownDetail = chat.detail
+                        continue
+                    }
                     if let st = chat.authStatus {
                         // 401/403 曾经一律判「key 失效」短路。真实事故(vyceai, 2026-09-23):
                         // 站点按模型限权 —— 同一把 key,deepseek-v4.1 chat 200,而
@@ -367,6 +377,11 @@ public enum APITester {
                         working.append(probe)
                         if firstWorkingLatency == nil { firstWorkingLatency = ms }
                     }
+                }
+                if skippedCount > 0, skippedCount == probeOrder.count {
+                    return APITestResult(ok: false, style: style, models: models,
+                                         detail: cooldownDetail ?? "服务端限流冷却中",
+                                         authFailed: false, skippedForCooldown: true)
                 }
                 if let (m, st) = authModel {
                     return APITestResult(ok: false, style: style, models: models,
@@ -521,6 +536,7 @@ public enum APITester {
         /// 不得当成「模型可用」—— /models 200 但 chat 挂死的网关,旧逻辑整 key 判 ok,
         /// 与 5xx 判 degraded(移出可用列表)方向完全相反
         var networkError = false
+        var skippedForCooldown = false
     }
 
     private static let cooldownLock = NSLock()
@@ -554,7 +570,12 @@ public enum APITester {
         let cached = cooldowns[cooldownKey]
         if let cached, cached.until <= Date() { cooldowns.removeValue(forKey: cooldownKey) }
         cooldownLock.unlock()
-        if let cached, cached.until > Date() { return cached.outcome }
+        if let cached, cached.until > Date() {
+            var result = cached.outcome
+            result.skippedForCooldown = true
+            result.detail = "服务端限流，暂停重复探测约 \(Int(ceil(cached.until.timeIntervalSinceNow))) 秒"
+            return result
+        }
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = native ? (hasV1 ? ["/messages"] : ["/messages", "/v1/messages"]) : (hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"])
         let s = session(for: proxy)

@@ -1181,6 +1181,7 @@ public final class Core {
                                           importedModels: e.models,
                                           probePool: probePool.isEmpty ? nil : probePool,
                                           knownNeedsProxy: e.health == "proxy-ok", styleHint: e.apiStyle)
+                guard !test.skippedForCooldown else { return }
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 let (h, d) = Self.healthFor(test)
                 var updated = e
@@ -1316,50 +1317,35 @@ public final class Core {
                 defer { sem.signal(); group.leave() }
                 guard let url = e.url, let key = e.key, !key.isEmpty else { return }
                 let px = self.proxyForHealth()
-                let test = APITester.test(url: url, key: key, timeout: 10, proxy: px)
+                let test = APITester.test(url: url, key: key, timeout: 10, proxy: px,
+                                          preferredModel: e.model, importedModels: e.models, styleHint: e.apiStyle)
+                guard !test.skippedForCooldown else { return }
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
-                var updated = e
-                // ccMissing 条目的 provider 仍不存在,每轮对账都会再次命中:备注只追加一次,
-                // 否则 note 每轮扫描无限变长(「…可手动重新导入; …可手动重新导入; …」)
-                func appendNote(_ text: String) {
-                    if updated.note?.contains(text) == true { return }
-                    updated.note = ([updated.note].compactMap { $0 } + [text]).joined(separator: "; ")
-                }
-                let alreadyMissing = e.ccMissing == true
+                // 再确认目标仍缺失。用户可能在网络探测期间重新导入。
+                let appType = e.targets.first { $0.hasPrefix("ccswitch-") }
+                    .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
+                guard let pid = e.ccProviderID, !self.cc.providerExists(id: pid, appType: appType) else { return }
+                let health = Self.healthFor(test)
+                let note: String
                 if test.authFailed {
-                    updated.targets.removeAll { $0.hasPrefix("ccswitch") }
-                    if updated.targets.isEmpty {
-                        updated.status = "deleted"
-                        // 记删除时间:账本压实按此计龄转审计桩;重复进入不刷新计龄起点
-                        if updated.deletedAt == nil { updated.deletedAt = Date().timeIntervalSince1970 }
-                    }
-                    appendNote("cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记")
+                    note = "cc-switch provider 已被删除且 key 失效,KeyDrop 已同步标记"
+                } else if health.health == "ok" || health.health == "proxy-ok" {
+                    note = "cc-switch provider 缺失,key 仍可用,可手动重新导入"
                 } else {
-                    updated.ccMissing = true
-                    appendNote(test.ok
-                               ? "cc-switch provider 缺失,key 仍可用,可手动重新导入"
-                               : "cc-switch provider 缺失(探测失败,key 状态未知);恢复后可手动重新导入")
+                    note = "cc-switch provider 缺失(探测失败,key 状态未知);恢复后可手动重新导入"
                 }
-                updated.health = test.authFailed ? "dead" : (test.ok ? "ok" : "err")
-                updated.healthDetail = test.detail
-                updated.healthAt = Date().timeIntervalSince1970
-                outLock.lock()
-                if test.authFailed {
-                    out.append("同步: 标记「\(e.name ?? String(e.id.prefix(8)))」为已删除(cc-switch 中 provider 不存在,key 失效)")
-                } else if !alreadyMissing {
-                    // 已标记过的不再每轮重复播报
-                    out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」provider 缺失但可用,已标记可重新导入")
-                }
-                outLock.unlock()
-                // 测完立刻落盘:不攒到最后批量写。批量写会把竞态窗口拉长到整轮扫描的时长,
-                // 期间 CLI 删除的条目会被旧内存快照复活;立即写窗口只有毫秒级。
-                // 更新 + 探测点合并成一次落盘(拆开是每条 2 次全量序列化写)
+                let point = test.reachabilityOnly ? nil : ProbePoint(
+                    t: Date().timeIntervalSince1970, ms: test.latencyMs,
+                    ok: health.health == "ok" || health.health == "proxy-ok")
                 do {
-                    try self.history.updateWithProbePoint(
-                        updated,
-                        point: ProbePoint(t: updated.healthAt ?? Date().timeIntervalSince1970,
-                                          ms: test.ok ? test.latencyMs : nil,
-                                          ok: test.ok, cpa: nil))
+                    guard try self.history.mergeCCReconciliation(tested: e, health: health.health,
+                                                                  detail: health.detail, authFailed: test.authFailed,
+                                                                  note: note, point: point) else { return }
+                    if test.authFailed || e.ccMissing != true {
+                        outLock.lock()
+                        out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」\(note)")
+                        outLock.unlock()
+                    }
                 } catch {
                     AppLog.error("对账落盘失败: \(error.localizedDescription)")
                 }
@@ -1732,9 +1718,6 @@ public final class Core {
         } catch {
             throw LedgerTransferError.badEnvelope("载荷解析失败: 文件可能来自更新版本的 KeyDrop")
         }
-        guard payload.schemaVersion <= LedgerCrypto.currentSchemaVersion else {
-            throw LedgerTransferError.schemaTooNew(payload.schemaVersion)
-        }
         return try importPayload(payload, mode: mode)
     }
 
@@ -1742,6 +1725,9 @@ public final class Core {
     /// .feed = 订阅同步(同 id 按 updatedAt LWW,维护者墓碑向订阅者传播,
     /// 本机较新的条目保留,目标开关不动 —— 订阅者自己的偏好自主)
     func importPayload(_ payload: LedgerPayload, mode: LedgerImportMode) throws -> String {
+        guard payload.schemaVersion <= LedgerCrypto.currentSchemaVersion else {
+            throw LedgerTransferError.schemaTooNew(payload.schemaVersion)
+        }
         var added = 0, skippedExisting = 0, skippedSameKey = 0, skippedTombstone = 0
         var updatedFromFeed = 0, skippedLocalNewer = 0, tombstonePropagated = 0
         let snapshotNow = history.snapshot()
@@ -1752,42 +1738,12 @@ public final class Core {
         for var e in payload.entries {
             let local = history.find(idPrefix: e.id)
             if e.status == "deleted" {
-                // 墓碑:.feed 模式下维护者的删除向订阅者传播(本地较新则保留)
+                let deletedAt = e.deletedAt
                 if mode == .feed, let local, local.status == "active",
-                   (local.updatedAt ?? 0) < (e.deletedAt ?? Date.distantFuture.timeIntervalSince1970) {
-                    var t = local
-                    t.status = "deleted"
-                    t.deletedAt = e.deletedAt ?? Date().timeIntervalSince1970
-                    t.updatedAt = Date().timeIntervalSince1970
-                    t.targets = []
-                    feedChanged.append(t)
+                   deletedAt != nil || (local.updatedAt ?? 0) < (e.updatedAt ?? 0) {
+                    // 健康更新不阻止显式删除。清理失败则保留绑定，下一次拉取可重试。
+                    _ = try deleteEntry(local, deletedAt: deletedAt ?? Date().timeIntervalSince1970)
                     tombstonePropagated += 1
-                    // 墓碑不只翻账本:按本机绑定清理产物。CPA 池的 key 会被真实流量
-                    // 轮询,最关键;cc/grok 次之;DSH 由 reconcileDSH 孤儿清理自愈
-                    var cleaned: [String] = []
-                    if local.targets.contains("cpa"), let cfg = local.cpaConfigPath {
-                        let keys = extractAllKeys(for: local) ?? []
-                        if !keys.isEmpty, let msg = try? CPAWriter(configPath: cfg).remove(apiKeys: keys) {
-                            cleaned.append("CPA: \(msg)")
-                        }
-                    }
-                    if local.targets.contains("grok"), let gp = local.grokConfigPath,
-                       let gk = local.key, !gk.isEmpty, let gURL = local.url {
-                        if let msg = try? GrokBuildWriter(configPath: gp).remove(baseURL: gURL, key: gk, models: local.models ?? []) {
-                            cleaned.append("Grok: \(msg)")
-                        }
-                    }
-                    if let pid = local.ccProviderID {
-                        let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
-                            .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
-                        if (try? cc.remove(providerID: pid, renamedFrom: local.ccRenamedFrom,
-                                           renamedTo: local.ccRenamedTo, appType: oldApp)) != nil {
-                            cleaned.append("cc-switch: 已移除")
-                        }
-                    }
-                    if !cleaned.isEmpty {
-                        AppLog.info("墓碑传播产物清理(\(local.id.prefix(8))): \(cleaned.joined(separator: "; "))")
-                    }
                 } else {
                     skippedTombstone += 1
                 }
@@ -1804,44 +1760,6 @@ public final class Core {
                     // 推翻本机删除;曾同 id 绕过 localTombstoneKeys 守卫,审计 2026-11-13)。
                     // 远端也是墓碑时走正常 LWW 更新 deletedAt
                     skippedTombstone += 1
-                    continue
-                }
-                // 墓碑传播脱离 LWW:updatedAt 被健康扫描持续刷新,
-                // 维护者的墓碑几乎永远传播不过来(审计 2026-11-13 P1)。
-                // 远端有 deletedAt 且本机 active → 一律应用,不看时间戳
-                if mode == .feed, e.status == "deleted", e.deletedAt != nil {
-                    var t = local
-                    t.status = "deleted"
-                    t.deletedAt = e.deletedAt
-                    t.updatedAt = Date().timeIntervalSince1970
-                    t.targets = []
-                    feedChanged.append(t)
-                    tombstonePropagated += 1
-                    // 墓碑产物清理(同上)
-                    var cleaned: [String] = []
-                    if local.targets.contains("cpa"), let cfg = local.cpaConfigPath {
-                        let keys = extractAllKeys(for: local) ?? []
-                        if !keys.isEmpty, let msg = try? CPAWriter(configPath: cfg).remove(apiKeys: keys) {
-                            cleaned.append("CPA: \(msg)")
-                        }
-                    }
-                    if local.targets.contains("grok"), let gp = local.grokConfigPath,
-                       let gk = local.key, !gk.isEmpty, let gURL = local.url {
-                        if let msg = try? GrokBuildWriter(configPath: gp).remove(baseURL: gURL, key: gk, models: local.models ?? []) {
-                            cleaned.append("Grok: \(msg)")
-                        }
-                    }
-                    if let pid = local.ccProviderID {
-                        let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
-                            .map { String($0.dropFirst("ccswitch-".count)) } ?? "claude"
-                        if (try? cc.remove(providerID: pid, renamedFrom: local.ccRenamedFrom,
-                                           renamedTo: local.ccRenamedTo, appType: oldApp)) != nil {
-                            cleaned.append("cc-switch: 已移除")
-                        }
-                    }
-                    if !cleaned.isEmpty {
-                        AppLog.info("墓碑传播产物清理(脱离 LWW, \(local.id.prefix(8))): \(cleaned.joined(separator: "; "))")
-                    }
                     continue
                 }
                 if remoteTS > localTS {
@@ -2112,53 +2030,52 @@ public final class Core {
 
     // MARK: - WebDAV 同步(Phase 2 简化版:显式推送/拉取加密账本快照,无自建后端)
 
-    /// 推送:端到端加密导出 → PUT 覆盖 WebDAV 远端快照。配置从 prefs 读取
-    /// (URL/账号/密码/导出口令,后者仅存本机,WebDAV 服务端只见密文)。
-    /// 校验 WebDAV 四项配置,缺一报出具体缺什么(用户排障友好)
-    private func webdavMissingFields() -> [String] {
-        let p = Prefs.shared
-        var missing: [String] = []
-        if (p.webdavURL ?? "").isEmpty { missing.append("目录 URL") }
-        if (p.webdavUser ?? "").isEmpty { missing.append("账号") }
-        if (p.webdavPass ?? "").isEmpty { missing.append("密码") }
-        if (p.webdavExportPass ?? "").isEmpty { missing.append("加密口令") }
-        return missing
-    }
-
+    /// 推送加密快照时使用远端最近一次确认的版本，避免覆盖另一台设备的更新。
     public func webdavPush(force: Bool = true) throws -> String {
-        let missing = webdavMissingFields()
-        guard missing.isEmpty else {
-            throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
-        }
-        let cfg = WebDAVSync.Config.resolved()!
+        let cfg = try WebDAVSync.Config.resolved()
         // 指纹去重必须先行:exportLedger 含 60 万轮 PBKDF2 + 全账本加密,自动推送
         // 每 30 分钟一跳,账本没变时旧实现每次也白付整段 KDF
         let fp = LedgerCrypto.ledgerFingerprint(history.snapshot())
         if !force, fp == prefs.webdavLastPushFP {
             return "WebDAV: 账本无变更,跳过推送"
         }
+        let eTag = prefs.webdavETag
         let ledger = try exportLedger(passphrase: cfg.exportPass)
-        let msg = try WebDAVSync.push(cfg: cfg, ledger: ledger)
-        prefs.webdavLastPushFP = fp
-        try? prefs.save()
-        return msg
+        guard try WebDAVSync.Config.resolved() == cfg else {
+            throw ParseError.io("WebDAV 设置已变更，请重试")
+        }
+        let result = try WebDAVSync.push(cfg: cfg, ledger: ledger, eTag: eTag)
+        if (try? WebDAVSync.Config.resolved()) == cfg {
+            prefs.webdavETag = result.eTag
+            prefs.webdavLastPushFP = fp
+            try? prefs.save()
+        }
+        return result.message
     }
 
     /// 拉取:下载远端快照 → 按 id 合并(本机墓碑的 key 不复活)→ 产物重放。
     @discardableResult
     public func webdavPull(replay: Bool = true, onlyIfNewer: Bool = false) throws -> String {
-        let missing = webdavMissingFields()
-        guard missing.isEmpty else {
-            throw ParseError.io("WebDAV 未配置,缺少: \(missing.joined(separator: "/"))(面板 ⚙ 设置里填写)")
+        let cfg = try WebDAVSync.Config.resolved()
+        let remote = try WebDAVSync.fetchSnapshot(cfg: cfg)
+        guard try WebDAVSync.Config.resolved() == cfg else {
+            throw ParseError.io("WebDAV 设置已变更，请重试")
         }
-        let cfg = WebDAVSync.Config.resolved()!
-        let payload = try WebDAVSync.fetchSnapshot(cfg: cfg)
-        if onlyIfNewer, let last = prefs.webdavLastSync, payload.exportedAt <= last {
-            return "WebDAV: 远端无更新,跳过拉取"
+        let payload = remote.payload
+        if onlyIfNewer {
+            if let tag = remote.eTag, tag == prefs.webdavETag {
+                return "WebDAV: 远端无更新,跳过拉取"
+            }
+            if remote.eTag == nil, let last = prefs.webdavLastSync, payload.exportedAt <= last {
+                return "WebDAV: 远端无更新,跳过拉取"
+            }
         }
         var lines = [try importPayload(payload, mode: .feed)]
-        prefs.webdavLastSync = payload.exportedAt
-        try? prefs.save()
+        if (try? WebDAVSync.Config.resolved()) == cfg {
+            prefs.webdavLastSync = payload.exportedAt
+            prefs.webdavETag = remote.eTag
+            try? prefs.save()
+        }
         if replay { lines.append(contentsOf: replayArtifacts()) }
         return lines.joined(separator: "\n")
     }
@@ -2173,6 +2090,7 @@ public final class Core {
         }
         let px = proxyForHealth()
         let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
+        if test.skippedForCooldown { return "暂缓探测: " + test.detail }
         noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
         if test.ok {
@@ -2379,6 +2297,7 @@ public final class Core {
         let test = APITester.test(url: url, key: key, proxy: effProxy,
                                   preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
         if test.ok { entry.apiStyle = test.style }
+        if test.skippedForCooldown, pickModels == nil { throw ParseError.io(test.detail) }
         // 端点报错但 /models 拿到了清单 ≠ 不能改选:恰恰是勾选的那个模型 503/429 才最需要
         // 换掉它。以前一报错就 throw,弹窗永远出不来(真实卡死 c30beaa0:模型改不了,
         // 又因 cc-switch 在跑删不掉 → 两头堵)。放行到弹窗,选完按新模型重探。
@@ -2438,7 +2357,7 @@ public final class Core {
             } catch {
                 AppLog.warn("探测点写入失败: \(error.localizedDescription)")
             }
-        } else {
+        } else if !test.skippedForCooldown {
             // 改选路径:先如实记下本次失败,选完再重探覆盖(别停在旧模型的 503 上)
             let h = Self.healthFor(test)
             entry.health = h.health
@@ -2664,11 +2583,13 @@ public final class Core {
         if repickAfterFail {
             let retest = APITester.test(url: url, key: key, proxy: effProxy,
                                         preferredModel: filtered.first, importedModels: filtered, styleHint: entry.apiStyle)
-            if retest.ok { entry.apiStyle = retest.style }
             let h = Self.healthFor(retest)
-            entry.health = h.health
-            entry.healthDetail = h.detail
-            entry.healthAt = Date().timeIntervalSince1970
+            if !retest.skippedForCooldown {
+                if retest.ok { entry.apiStyle = retest.style }
+                entry.health = h.health
+                entry.healthDetail = h.detail
+                entry.healthAt = Date().timeIntervalSince1970
+            }
             retestNote = retest.ok
                 ? "✓ 改选的模型实测可用: \(h.detail)"
                 : "⚠ 已改选 \(filtered.count) 个模型,当前仍不可用: \(h.detail)(下次扫描自动重测)"
@@ -3260,7 +3181,7 @@ public final class Core {
     }
 
     public func delete(entryIDPrefix: String) throws -> String {
-        guard var entry = history.find(idPrefix: entryIDPrefix)
+        guard let entry = history.find(idPrefix: entryIDPrefix)
             ?? history.findActiveByRaw(entryIDPrefix)
         else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
@@ -3269,6 +3190,11 @@ public final class Core {
             return "该记录已删除"
         }
 
+        return try deleteEntry(entry, deletedAt: Date().timeIntervalSince1970)
+    }
+
+    private func deleteEntry(_ original: HistoryEntry, deletedAt: TimeInterval) throws -> String {
+        var entry = original
         var lines: [String] = []
         var failures: [String] = []
         var remaining = entry.targets
@@ -3404,14 +3330,14 @@ public final class Core {
         entry.targets = remaining
         entry.status = remaining.isEmpty ? "deleted" : "active"
         // 记删除时间供账本压实计龄;恢复 active 时清除
-        entry.deletedAt = remaining.isEmpty ? Date().timeIntervalSince1970 : nil
+        entry.deletedAt = remaining.isEmpty ? deletedAt : nil
         if !failures.isEmpty {
             entry.note = Self.mergedNote(entry.note, failures)
         }
         do {
             try history.update(entry)
         } catch {
-            lines.append("⚠ 历史状态保存失败: \(error.localizedDescription)(实际删除已生效)")
+            failures.append("历史状态保存失败: \(error.localizedDescription)")
         }
         if !failures.isEmpty {
             throw ParseError.io((lines + failures.map { "✗ \($0)" }).joined(separator: "\n"))

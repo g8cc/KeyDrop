@@ -13,6 +13,44 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.refuses to overwrite unreadable ledger") { t in
+            let env = try TestEnv("hist-invalid-write")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            try store.append(entry("before-damage", ts: 1))
+            let corrupted = #"{"items":["#
+            env.write("home/history.json", corrupted)
+            do {
+                try store.append(entry("unsaved", ts: 2))
+                t.expect(false, "损坏的原账本不得被覆盖")
+            } catch {
+                t.contains(error.localizedDescription, "保留原文件", "告知账本未覆盖")
+            }
+            t.equal(env.read("home/history.json"), corrupted, "保留磁盘数据供恢复")
+            t.equal(store.snapshot().map(\.id), ["before-damage"], "保存失败不在内存伪造成功")
+        }
+        h.runSuite("History.rejects stale probe results") { t in
+            let env = try TestEnv("hist-stale-probe")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            var old = entry("stale-probe", ts: 1)
+            old.model = "old-model"
+            old.healthAt = 10
+            try store.append(old)
+            let cli = HistoryStore()
+            guard var current = cli.find(idPrefix: old.id) else { return t.expect(false, "fixture entry") }
+            current.key = "sk-rotated-fixture"
+            current.model = "new-model"
+            current.healthAt = 30
+            try cli.update(current)
+            old.health = "dead"
+            old.modelProbeLog = ["old-model": [ProbePoint(t: 20, ms: nil, ok: false)]]
+            try store.mergeHealth([old], at: 20)
+            let saved = HistoryStore().find(idPrefix: old.id)
+            t.equal(saved?.health, "ok", "旧密钥的探测不能标记新密钥失效")
+            t.equal(saved?.healthAt, 30, "迟到的结果不能回退检测时间")
+            t.expect(saved?.probeLog == nil && saved?.modelProbeLog == nil, "不添加旧模型的失败记录")
+        }
         h.runSuite("History.availability semantics") { t in
             var e = entry("availability", ts: 1)
             t.equal(e.availability, .unverified, "没有验证记录显示灰色")
@@ -25,6 +63,9 @@ enum HistoryTests {
             t.equal(e.availability, .quota, "额度用尽与认证失败分开")
             e.health = "err"
             t.equal(e.availability, .error, "探测失败明确呈现")
+            e.healthDetail = "拒绝 " + (e.key ?? "")
+            t.expect(!e.richTooltip.contains(e.key ?? ""), "整行悬停不会回显密钥")
+            t.contains(e.richTooltip, e.availability.label, "圆点和整行悬停使用同一状态")
             e.format = "dsh-only"
             t.equal(e.availability, .dshOnly, "仅 DSH 验证")
         }
@@ -133,6 +174,9 @@ enum HistoryTests {
             edited.status = "active"
             try cli.update(edited)
             try store.mergeHealth([pending], at: 201)
+            t.equal(store.find(idPrefix: pending.id)?.health, "ok", "旧模型的探测结果不写回")
+            pending.models = edited.models
+            try store.mergeHealth([pending], at: 202)
             let active = HistoryStore().snapshot()[0]
             t.equal(active.note, "CLI 新备注", "活跃条目也保留外部备注")
             t.equal(active.models, ["new-model"], "活跃条目也保留外部模型")

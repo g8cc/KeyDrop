@@ -203,39 +203,35 @@ enum CLI {
             let sem = DispatchSemaphore(value: 0)
             Core.shared.scanHealth(staleAfter: 0) { _ in sem.signal() }
             sem.wait()
-            let entries = Core.shared.history.snapshot()
-                .filter { $0.status == "active" && $0.url != nil && Core.shared.extractKey($0) != nil }
-            let skipped = Core.shared.history.snapshot()
-                .filter { $0.status == "active" && ($0.url == nil || Core.shared.extractKey($0) == nil) }.count
-            var dead: [String] = [], quota: [String] = [], err: [String] = [], ok = 0, demoted: [String] = []
+            let active = Core.shared.history.snapshot().filter { $0.status == "active" }
+            let entries = active.filter { !$0.isDSHOnly && $0.url != nil && Core.shared.extractKey($0) != nil }
+            let skipped = active.count - entries.count
+            var dead: [String] = [], quota: [String] = [], err: [String] = [], pending: [String] = []
+            var ok = 0, demoted: [String] = []
             for e in entries {
                 let prev = before[e.id] ?? "未测"
                 let label = "\(e.id.prefix(8)) \(e.name ?? "") \(e.url ?? "")"
-                let detail = e.healthDetail.map { String($0.prefix(100)) } ?? ""
-                switch e.health {
-                case "dead":
-                    dead.append("✗ 失效(→待删除区) \(label)\n    原状态:\(prev) | \(detail)")
-                case "quota":
-                    quota.append("¥ 无余额(→无余额区) \(label)\n    原状态:\(prev) | \(detail)")
-                case "proxy-ok":
-                    ok += 1
-                    demoted.append("△ 可用但需代理 \(label)")
-                case "ok":
-                    if prev != "ok" && prev != "proxy-ok" {
-                        demoted.append("↑ 恢复可用 \(label)(原状态:\(prev))")
+                let detail = e.displayHealthDetail.map { String($0.prefix(100)) } ?? ""
+                let row = "\(e.availability.label) \(label)\n    原状态:\(prev) | \(detail)"
+                switch e.availability {
+                case .dead: dead.append(row)
+                case .quota: quota.append(row)
+                case .error: err.append(row)
+                case .available, .proxyAvailable:
+                    if e.availability == .proxyAvailable || (prev != "ok" && prev != "proxy-ok") {
+                        demoted.append("\(e.availability.label) \(label)")
                     }
                     ok += 1
-                default:
-                    err.append("! 异常(留在列表,不自动归类) \(label)\n    原状态:\(prev) | \(detail)")
+                default: pending.append(row)
                 }
             }
             var out: [String] = []
-            out.append("═══ 探测结果(\(entries.count) 条可测,另有 \(skipped) 条无 key 条目跳过)═══")
-            if !dead.isEmpty { out.append("── 已失效 \(dead.count) 条(已移入待删除区)──"); out.append(dead.joined(separator: "\n")) }
-            if !quota.isEmpty { out.append("── 无余额 \(quota.count) 条(已移入无余额区)──"); out.append(quota.joined(separator: "\n")) }
-            if !err.isEmpty { out.append("── 异常 \(err.count) 条 ──"); out.append(err.joined(separator: "\n")) }
-            if !demoted.isEmpty { out.append("── 状态变化 ──"); out.append(demoted.joined(separator: "\n")) }
-            out.append("═══ 统计:可用 \(ok) / 无余额 \(quota.count) / 异常 \(err.count) / 失效 \(dead.count) ═══")
+            out.append("═══ 探测结果(\(entries.count) 条符合探测条件，\(skipped) 条跳过)═══")
+            for (title, rows) in [("认证失败", dead), ("额度或模型异常", quota), ("探测失败", err), ("待验证或复测", pending), ("状态变化", demoted)] where !rows.isEmpty {
+                out.append("── \(title) \(rows.count) 条 ──")
+                out.append(rows.joined(separator: "\n"))
+            }
+            out.append("═══ 统计:可用 \(ok) / 额度或模型异常 \(quota.count) / 待验证 \(pending.count) / 失败 \(err.count + dead.count) ═══")
             print(out.joined(separator: "\n"))
             return 0
 
@@ -405,7 +401,7 @@ enum CLI {
             }
 
         case "webdav-push", "webdav-pull":
-            let isPush = a.first == "webdav-push"
+            let isPush = cmd == "webdav-push"
             if let u = davURL { Prefs.shared.webdavURL = u }
             if let u = davUser { Prefs.shared.webdavUser = u }
             if let p = davPass { Prefs.shared.webdavPass = p }
