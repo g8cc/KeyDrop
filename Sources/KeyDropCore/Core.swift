@@ -71,6 +71,63 @@ public final class Core {
         }
     }
 
+    /// Explicit import for credentials that must be exercised by the real DSH client.
+    public func addDSHOnly(raw: String, models override: [String]? = nil) throws -> AddOutcome {
+        guard raw.utf8.count <= 1_000_000 else { throw ParseError.io("粘贴内容过大") }
+        let parsed = try Parser.parse(raw)
+        guard let url = parsed.url else { throw ParseError.noURL }
+        guard let key = parsed.key, !key.isEmpty else { throw ParseError.noKeyFound("解析未得到 key。") }
+        guard Set(Parser.extractAllKeys(raw) + [key]).count == 1 else {
+            throw ParseError.io("DSH 专用导入每次只接受一个 API key")
+        }
+        var seen = Set<String>()
+        let models = (override ?? parsed.models ?? parsed.model.map { [$0] } ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && !Self.isNonChatModel($0) && seen.insert($0).inserted }
+        guard !models.isEmpty else { throw ParseError.io("DSH 专用导入需要填写可用于对话的完整模型 ID") }
+
+        let existing = history.findActiveByKey(key)
+        if let existing, existing.url != url || !Set(existing.targets).isSubset(of: ["dsh"]) {
+            throw ParseError.duplicate(id: existing.id, message: "同一凭据已绑定其他地址或同步目标，请先处理旧记录")
+        }
+        var entry = existing ?? HistoryEntry(
+            id: UUID().uuidString.lowercased(), ts: Date().timeIntervalSince1970,
+            raw: raw, format: "dsh-only", name: parsed.name ?? cc.defaultName(for: url),
+            url: url, model: models.first, models: models, key: key, keyMasked: parsed.keyMasked,
+            targets: ["dsh"], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+            cpaConfigPath: nil, status: "active")
+        entry.raw = raw
+        entry.format = "dsh-only"
+        entry.model = models.first
+        entry.models = models
+        entry.targets = ["dsh"]
+        entry.health = nil
+        entry.healthAt = nil
+        entry.healthDetail = "DSH 专用 · 请在 DSH 内发起对话验证"
+        entry.failStreak = nil
+        entry.latencyMs = nil
+        entry.apiStyle = nil
+        let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
+        do {
+            if existing != nil {
+                try history.update(entry)
+            } else if let duplicate = try history.appendDedupByKey(entry) {
+                throw ParseError.duplicate(id: duplicate.id, message: "另一进程已导入同一凭据，请重试")
+            }
+        } catch {
+            if let existing, let previousModels = existing.models ?? existing.model.map({ [$0] }) {
+                try? DSHWriter.add(providerID: entry.id, key: key, url: url, models: previousModels)
+            } else {
+                try? DSHWriter.remove(providerID: entry.id)
+            }
+            throw error
+        }
+        return AddOutcome(entry: entry, lines: [
+            "✓ DeepSeek Harness: 已写入 \(route)（\(models.count) 个模型）",
+            "DSH 专用 · 请在 DSH 内发起对话验证"
+        ], ok: true)
+    }
+
     private func addImpl(
         raw: String, ccOverride: Bool?, grokOverride: Bool?, cpaOverride: Bool?,
         dshOverride: Bool?, models: [String]?, force: Bool, appType: String?,
@@ -210,6 +267,9 @@ public final class Core {
 
         var dup: HistoryEntry? = nil
         if let d = history.findActiveByKey(key) {
+            if d.isDSHOnly {
+                throw ParseError.duplicate(id: d.id, message: "这是 DSH 专用记录，请通过「仅导入 DSH」更新")
+            }
             if (d.url ?? "").trimmingCharacters(in: .whitespacesAndNewlines) == url {
                 dup = d
                 notes.append("幂等更新: 同 key 同 URL 已存在(\(d.id.prefix(8))),将刷新该条目而非新建")
@@ -382,7 +442,7 @@ public final class Core {
             if !test.ok && !explicitCanRescue {
                 throw ParseError.io("测试失败,未写入。\(test.detail)\(urlReusedNote.map { "\n(\($0))" } ?? "")\n(确认真实或 --force 跳过测试)")
             }
-            if test.ok {
+            if test.ok && !(test.reachabilityOnly && explicitCanRescue) {
                 addHealth = Self.healthFor(test)
             } else {
                 let verified = explicitSelectedModels?.joined(separator: ", ") ?? ""
@@ -933,12 +993,11 @@ public final class Core {
     }
 
     public static func healthFor(_ test: APITestResult) -> (health: String, detail: String) {
-        // needsProxy 只在探测成功时才标 proxy-ok:曾把 needsProxy 排在最前,
-        // key 被吊销(双方 401)时仍返回 proxy-ok → 死 key 永远显示"可用(需代理)"
+        if test.quotaExhausted { return ("quota", test.detail) }
+        if test.reachabilityOnly { return ("reachable", test.detail + " · 对话模型尚未验证") }
         if test.needsProxy && test.ok {
             return ("proxy-ok", test.detail + " ⚠ 该网关直连不可用,需代理;无代理的工具(dsh 等)需自行配置 HTTPS_PROXY 才可用")
         }
-        if test.quotaExhausted { return ("quota", test.detail) }
         if test.ok { return ("ok", test.detail) }
         if test.authFailed { return ("dead", test.detail) }
         return ("err", test.detail)
@@ -1086,7 +1145,7 @@ public final class Core {
         // extractKey 一次解析随目标携带:过滤与并发块各调一次曾是双倍开销,
         // 且 extractKey 对 raw 是路径/zip 的条目会重新读盘
         var targets: [(entry: HistoryEntry, key: String)] = []
-        for e in history.snapshot() where e.status == "active" && e.url != nil {
+        for e in history.snapshot() where e.status == "active" && e.url != nil && !e.isDSHOnly {
             guard let k = extractKey(e), !k.isEmpty else { continue }
             if let at = e.healthAt, now - at < staleAfter { continue }
             targets.append((e, k))
@@ -1434,6 +1493,7 @@ public final class Core {
     public func dshConverge(keepLatest: Int = 1) throws -> [String] {
         guard DSHWriter.installed() else { return [] }
         let managed = try DSHWriter.managedRoutes()
+        let cordisRefs = try DSHWriter.cordisCredentialRefs()
         let claimed = history.snapshot().filter { $0.status == "active" && $0.targets.contains("dsh") }
         // 按updatedAt desc排序:最新的 keepLatest 个保留
         let sorted = claimed.sorted { ($0.updatedAt ?? 0) > ($1.updatedAt ?? 0) }
@@ -1443,7 +1503,8 @@ public final class Core {
             let owned = managed.first(where: {
                 DSHWriter.isOwnedRoute($0.name, providerID: e.id) && $0.env == DSHWriter.envName(providerID: e.id)
             })
-            if owned != nil { continue }   // 路由存在,正常
+            let ref = DSHWriter.envName(providerID: e.id)
+            if owned != nil || (cordisRefs.contains(ref) && DSHWriter.hasCredential(env: ref)) { continue }
             if i < keepLatest { continue } // 最近的 N 个保留
             var converged = e
             converged.targets.removeAll { $0 == "dsh" }
@@ -1478,6 +1539,7 @@ public final class Core {
                 out.append("DSH 对账: 清理 \(pruned.count) 个孤儿路由(\(pruned.joined(separator: ", ")))")
             }
             let managed = try DSHWriter.managedRoutes()
+            let cordisRefs = try DSHWriter.cordisCredentialRefs()
             var updated: [String] = []
             var missing: [String] = []
             var convergedTags: [String] = []
@@ -1496,6 +1558,16 @@ public final class Core {
                 guard let r = managed.first(where: {
                     DSHWriter.isOwnedRoute($0.name, providerID: e.id) && $0.env == DSHWriter.envName(providerID: e.id)
                 }) else {
+                    // DSH may consume settings.yaml during startup while keeping the live profile.
+                    let ref = DSHWriter.envName(providerID: e.id)
+                    if cordisRefs.contains(ref), DSHWriter.hasCredential(env: ref) {
+                        if e.dshMissingAt != nil {
+                            var present = e
+                            present.dshMissingAt = nil
+                            try history.update(present)
+                        }
+                        continue
+                    }
                     // 缺失路由收敛:首次发现打 dshMissingAt 标;持续 ≥3 天 → 用户已放弃,
                     // 自动摘除 dsh 标(账本与 settings.yaml 现实收敛)。
                     // 用户重新「同步到 DSH」时路由回来,标自动清除
@@ -2005,6 +2077,7 @@ public final class Core {
         else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
+        guard !entry.isDSHOnly else { throw ParseError.io("DSH 专用条目，请在 DSH 内验证") }
         guard let url = entry.url, !url.isEmpty, let key = entry.key, !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法鉴定")
         }
@@ -2094,6 +2167,7 @@ public final class Core {
         guard let entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
+        guard !entry.isDSHOnly else { throw ParseError.io("DSH 专用条目，请在 DSH 内验证") }
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
@@ -2110,7 +2184,8 @@ public final class Core {
                 found.failStreak = nil   // 手动重测成功即清零(审计 2026-11-14 P2)
                 historyUpdateLogged(found)
             }
-            return "✓ 可用: \(h.detail) (\(test.models.count) 个模型)"
+            let label = test.reachabilityOnly ? "网关可达" : (test.quotaExhausted ? "额度用尽" : "✓ 可用")
+            return "\(label): \(h.detail) (\(test.models.count) 个模型)"
         }
         if var found = history.find(idPrefix: entryIDPrefix) {
             found.health = h.health
@@ -2297,6 +2372,7 @@ public final class Core {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
         let effProxy = proxy ?? proxyForHealth()
+        guard !entry.isDSHOnly else { throw ParseError.io("DSH 专用条目，请在 DSH 内验证") }
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
@@ -2337,7 +2413,7 @@ public final class Core {
                     quotaNote = "无余额/配额耗尽(余额接口)"
                 }
             }
-            entry.health = quotaNote != nil ? "quota" : "ok"
+            entry.health = quotaNote != nil ? "quota" : Self.healthFor(test).health
             if quotaNote == nil, balanceZero {
                 // 余额接口报 0 但 chat 实测可用:保留可用判定,详情里留痕提醒用户
                 entry.healthDetail = test.detail + " ⚠ 余额接口报 0,但 chat 实测可用 — 以实测为准"
@@ -2349,9 +2425,11 @@ public final class Core {
             // 手动重测同样进监控图(所有探测路径统一入档);probeLog 由 history.update
             // 保留,不怕后续整条覆盖
             do {
-                try history.appendProbePoint(id: entry.id, ok: entry.health == "ok",
-                                             ms: test.latencyMs, cpa: nil,
-                                             at: entry.healthAt ?? Date().timeIntervalSince1970)
+                if !test.reachabilityOnly {
+                    try history.appendProbePoint(id: entry.id, ok: entry.healthColor.ok,
+                                                 ms: test.latencyMs, cpa: nil,
+                                                 at: entry.healthAt ?? Date().timeIntervalSince1970)
+                }
                 var mps: [String: ProbePoint] = [:]
                 let lat = test.modelLatencies ?? [:]
                 for m in test.workingModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: true) }
@@ -2657,6 +2735,7 @@ public final class Core {
         guard let entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
+        guard !entry.isDSHOnly else { throw ParseError.io("DSH 专用条目，请在 DSH 内使用") }
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法探测模型")
         }
@@ -2682,6 +2761,10 @@ public final class Core {
         }
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法编辑")
+        }
+
+        if entry.isDSHOnly && (models != nil || newKey != nil) {
+            throw ParseError.io("请通过「仅导入 DSH」更新此条目的模型或凭据")
         }
 
         var lines: [String] = []
@@ -3068,6 +3151,9 @@ public final class Core {
         }
         guard entry.status == "active" else {
             throw ParseError.io("该记录已删除,无法同步")
+        }
+        if entry.isDSHOnly && target != "dsh" {
+            throw ParseError.io("此凭据仅配置给 DSH")
         }
         guard let url = entry.url, !url.isEmpty,
               let key = extractKey(entry), !key.isEmpty else {

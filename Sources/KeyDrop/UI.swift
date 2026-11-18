@@ -271,8 +271,8 @@ final class AppState: ObservableObject {
     }
 
     @MainActor
-    func continueAddKey(raw: String, assumeBusy: Bool = false) async {
-        if !useCC && !useGrok && !useCPA && !useDSH {
+    func continueAddKey(raw: String, assumeBusy: Bool = false, dshOnly: Bool = false) async {
+        if !dshOnly && !useCC && !useGrok && !useCPA && !useDSH {
             if assumeBusy { isBusy = false; busyLabel = "" }
             setStatus("请先开启 cc-switch、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
             return
@@ -293,7 +293,8 @@ final class AppState: ObservableObject {
         }
         do {
             let outcome = try await runOffPool { () throws -> AddOutcome in
-                try Core.shared.add(
+                if dshOnly { return try Core.shared.addDSHOnly(raw: raw) }
+                return try Core.shared.add(
                     raw: raw,
                     ccOverride: Prefs.shared.useCC,
                     grokOverride: Prefs.shared.useGrok,
@@ -321,6 +322,13 @@ final class AppState: ObservableObject {
             } else {
                 setStatus("失败: \(msg)", ok: false)
             }
+        }
+    }
+
+    func importDSHOnly() {
+        let raw = input
+        Task { @MainActor in
+            await continueAddKey(raw: raw, dshOnly: true)
         }
     }
 
@@ -1055,36 +1063,40 @@ struct HistoryRow: View {
     /// 两种状态都用固定格宽 → 总宽恒定,不随模型名长短/记录数变化(用户反馈:有的宽有的窄)
     @ViewBuilder
     private func modelSparkline(_ m: String) -> some View {
-        let log = entry.modelProbeLog?[m] ?? []
+        let log = entry.isDSHOnly ? [] : entry.modelProbeLog?[m] ?? []
         if log.isEmpty {
-            MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6)
-                .help("该模型尚未被探测(巡检只测你勾选的模型,每轮最多 4 个:激活模型置顶,其余按「从未测过→最久未测」在勾选范围内轮换);灰=无证据,≠不可用")
+            MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6, context: "\(providerContext) · \(m)")
+                .help("\(providerContext) · \(m) · 尚无探测记录")
         } else {
             let okc = log.filter { $0.ok }.count
             let up = Int((Double(okc) / Double(log.count) * 100).rounded())
-            MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6)
-                .help("绿=通过<3s · 黄=通过3-8s · 紫=通过≥8s(慢) · 红=失败;悬停单格看当次详情")
+            MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6, context: "\(providerContext) · \(m)")
+                .help("\(providerContext) · \(m) · 绿=通过 <3s，橙=通过 3–8s，紫=通过 ≥8s，红=失败")
             Text("\(up)%")
                 .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                 .foregroundStyle(up >= 95
                     ? Color(red: 0.22, green: 0.58, blue: 0.40)
                     : (up >= 80 ? Color.orange : Color.red))
                 .frame(width: 34, alignment: .trailing)
-                .help("该模型 uptime:探测中通过的占比(只数通过,不管快慢 —— 全黄/全紫也是 100%)")
+                .help("\(providerContext) · \(m) · 已采样探测通过率 \(up)%")
         }
+    }
+
+    private var providerContext: String {
+        "\(entry.name ?? "Provider") · \(entry.id.prefix(8))"
     }
 
     /// 实战监控徽章:探测延迟 / CPA 链路状态 / 最近验证时间。
     /// 拆成独立方法:内联在主行时表达式过复杂,SwiftUI 类型检查超时
     @ViewBuilder
     private func monitorBadges(_ entry: HistoryEntry) -> some View {
-        if let ms = entry.latencyMs, entry.health == "ok" || entry.health == "proxy-ok" {
+        if let ms = entry.latencyMs, entry.healthColor.ok {
             Text("·")
             Text(String(format: "%.1fs", ms / 1000))
                 .foregroundStyle(ms > 8000
                     ? Color(red: 0.85, green: 0.55, blue: 0.15)
                     : Color.secondary.opacity(0.9))
-                .help("最近一次探测延迟。越低体感越快;超过 8s 标黄提醒")
+                .help("\(providerContext) · 最近一次通过的探测耗时 \(Int(ms)) ms")
         }
         if let ok = entry.viaCPAOk, entry.targets.contains("cpa") {
             Text("·")
@@ -1092,25 +1104,25 @@ struct HistoryRow: View {
                 .foregroundStyle(ok
                     ? Color(red: 0.22, green: 0.58, blue: 0.40)
                     : Color(red: 0.85, green: 0.55, blue: 0.15))
-                .help(ok
-                    ? "CPA 链路探测通过(经 127.0.0.1:8317,实际请求走的路径)"
-                    : "上游可用但经 CPA 调不通:检查 CPA 配置/容器/模型路由(↻ 重测可复验)")
+                .help("\(providerContext) · " + (ok
+                    ? "最近一次 CPA 链路探测通过"
+                    : "最近一次 CPA 链路探测失败"))
         }
         if let at = entry.healthAt {
             Text("·")
             Text(Self.healthAgeStr(at))
-                .help("最近一次健康验证时间;扫描周期 30 分钟(仅测超期条目)")
+                .help("\(providerContext) · 最近一次探测时间")
         }
     }
 
     /// 健康验证距今的人类可读时长(监控:让"可用"带着新鲜度)
     static func healthAgeStr(_ at: TimeInterval) -> String {
         let mins = Int((Date().timeIntervalSince1970 - at) / 60)
-        if mins < 1 { return "刚刚验证" }
-        if mins < 60 { return "\(mins) 分钟前验证" }
+        if mins < 1 { return "刚刚探测" }
+        if mins < 60 { return "\(mins) 分钟前探测" }
         let hrs = mins / 60
-        if hrs < 24 { return "\(hrs) 小时前验证" }
-        return "\(hrs / 24) 天前验证"
+        if hrs < 24 { return "\(hrs) 小时前探测" }
+        return "\(hrs / 24) 天前探测"
     }
 
     let entry: HistoryEntry
@@ -1157,32 +1169,23 @@ struct HistoryRow: View {
         let displayModels = entry.models ?? (entry.model.map { [$0] })
         // 多 key 条目账本不落 key 字段(只记「N 个 key」),凭据能从 raw 恢复,
         // 所以按钮可见性也必须走 extractKey —— 否则 v1.4.51 修好的重测/curl 在这类行上根本点不到
-        let testable = entry.status == "active" && entry.url != nil
+        let testable = !entry.isDSHOnly && entry.status == "active" && entry.url != nil
             && Core.shared.extractKey(entry) != nil
+        let availability = entry.availability
         let dotColor: Color = {
-            if entry.status != "active" { return Color.secondary.opacity(0.6) }
-            // 防抖保留期(failStreak ≥ 1 但仍标 ok):警示黄,不再纯绿——
-            // 「看着能用实际不行」的窗口期必须可见
-            if entry.health == "ok", (entry.failStreak ?? 0) >= 1 {
-                return Color(red: 0.93, green: 0.68, blue: 0.20)
-            }
-            switch entry.health {
-            case "dead": return Color(red: 0.86, green: 0.28, blue: 0.24)
-            case "err": return Color(red: 0.90, green: 0.55, blue: 0.18)
-            case "proxy-ok": return Color(red: 0.93, green: 0.68, blue: 0.20)
-            default: return Color(red: 0.28, green: 0.68, blue: 0.42)
+            switch availability {
+            case .available, .proxyAvailable: return Color(red: 0.28, green: 0.68, blue: 0.42)
+            case .retry, .quota: return Color(red: 0.93, green: 0.68, blue: 0.20)
+            case .error, .dead: return Color(red: 0.86, green: 0.28, blue: 0.24)
+            case .dshOnly, .unverified, .reachable, .inactive: return Color.secondary.opacity(0.65)
             }
         }()
-        let dotTip: String = {
-            switch entry.health {
-            case "ok": return "可用 · 最近测试通过"
-            case "quota": return "无余额 · 充值后刷新恢复"
-            case "dead": return "key 已失效 · 建议删除"
-            case "err": return "测试异常 · 点 ↻ 重测"
-            case "proxy-ok": return "需代理 · 直连不可用,经代理可用"
-            default: return "尚未测试"
-            }
-        }()
+        let detail = entry.healthDetail.map { detail in
+            let scrubbed = entry.key.flatMap { $0.isEmpty ? nil : $0 }
+                .map { detail.replacingOccurrences(of: $0, with: "•••") } ?? detail
+            return "\n" + String(scrubbed.prefix(240))
+        } ?? ""
+        let dotTip = "\(providerContext)\n\(availability.label)\(detail)"
 
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .top, spacing: 8) {
@@ -1205,15 +1208,22 @@ struct HistoryRow: View {
                     .padding(.top, 4)
                     .help(dotTip)
 
+                if availability == .dshOnly || availability == .proxyAvailable || availability == .retry || availability == .error || availability == .unverified || availability == .reachable {
+                    Text(availability.label)
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.secondary)
+                        .help(dotTip)
+                }
+
                 // key 活着但用户配置的模型全被限流 → 已挬入无额度区,行内标注区别于真死 key
                 if entry.allConfiguredModelsLimited,
                    entry.health == "ok" || entry.health == "proxy-ok" {
-                    Text("所选模型均限流 · key 本身可用")
+                    Text("所选模型最近探测均失败")
                         .font(.system(size: 9.5, weight: .semibold))
                         .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.15))
                         .padding(.horizontal, 5).padding(.vertical, 1.5)
                         .background(RoundedRectangle(cornerRadius: 4).fill(Color(red: 0.85, green: 0.55, blue: 0.15).opacity(0.13)))
-                        .help("网关上其它模型能通所以 key 级判 ok,但你配置的模型最新探测全部失败;换选其它模型或等限流恢复")
+                        .help(dotTip)
                 }
 
                 VStack(alignment: .leading, spacing: 3) {
@@ -1237,6 +1247,7 @@ struct HistoryRow: View {
                                     RoundedRectangle(cornerRadius: 3)
                                         .fill(Color(red: 0.85, green: 0.55, blue: 0.15).opacity(0.13))
                                 )
+                                .help("\(providerContext) · 已同步到 DeepSeek Harness")
                         }
                         if entry.viaCPAOk == false {
                             // 经 CPA 网关的真实链路探测失败:上游直连是通的,
@@ -1250,7 +1261,7 @@ struct HistoryRow: View {
                                     RoundedRectangle(cornerRadius: 3)
                                         .fill(Color(red: 0.86, green: 0.28, blue: 0.24).opacity(0.13))
                                 )
-                                .help("经 CPA 网关(8317)的真实链路探测失败,而直连上游是通的——你实际访问走的正是这条链路;多为 CPA 配置/容器网络问题")
+                                .help("\(providerContext) · 最近一次 CPA 链路探测失败")
                         }
                         monitorBadges(entry)
                     }
@@ -1393,6 +1404,14 @@ struct HistoryRow: View {
                             .menuStyle(.borderlessButton)
                             .disabled(busy)
                             .help("选择同步目标")
+                        }
+                        if entry.isDSHOnly {
+                            Button { onSyncTarget(entry.id, "dsh") } label: {
+                                Image(systemName: "arrow.down.circle")
+                            }
+                            .buttonStyle(.borderless)
+                            .disabled(busy)
+                            .help("\(providerContext) · 重新同步 DSH")
                         }
                         if let app = appLaunch {
                             Button {
@@ -2441,6 +2460,10 @@ struct PanelView: View {
             .buttonStyle(.borderedProminent)
             .disabled(state.isBusy || state.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
+            Button("仅导入 DSH") { state.importDSHOnly() }
+                .disabled(state.isBusy || state.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("用于限定 DSH 客户端的凭据。填写地址、API key 和模型 ID，导入后在 DSH 内验证")
+
             Button("粘贴") {
                 state.input = NSPasteboard.general.string(forType: .string) ?? ""
                 inputFocused = true
@@ -2858,6 +2881,7 @@ struct MonitorSparkline: View {
     /// 固定格宽:设置后所有格(含未采集灰格)等宽固定,总宽 = slots×cellWidth+(slots-1)×spacing,
     /// 不随行内其他元素/记录数变化(用户反馈:监控条有的宽有的窄)
     var cellWidth: CGFloat? = nil
+    var context: String? = nil
     @State private var pulsing = false
 
     var body: some View {
@@ -2869,13 +2893,13 @@ struct MonitorSparkline: View {
                     .fill(Color.secondary.opacity(0.13))
                     .frame(width: cellWidth, height: height)
                     .frame(maxWidth: cellWidth == nil ? .infinity : nil)
-                    .help("该周期未采集(随自动扫描/↻ 重测逐渐填满)")
+                    .help((context.map { $0 + " · " } ?? "") + "该周期未采集")
             }
             ForEach(Array(points.enumerated()), id: \.offset) { i, p in
                 let isLatest = i == points.count - 1
                 StatusCell(point: p, uptime: uptimePercent, height: height,
                            pulse: pulseLatest && isLatest, pulsing: $pulsing,
-                           cellWidth: cellWidth)
+                           cellWidth: cellWidth, context: context)
             }
         }
     }
@@ -2897,6 +2921,7 @@ struct StatusCell: View {
     @Binding var pulsing: Bool
     /// 固定格宽(nil = 弹性填满,总览大图用)
     var cellWidth: CGFloat? = nil
+    var context: String? = nil
 
     var body: some View {
         let base = RoundedRectangle(cornerRadius: 2)
@@ -2920,7 +2945,7 @@ struct StatusCell: View {
                 base
             }
         }
-        .help(Self.hoverText(point, uptime: uptime))
+        .help((context.map { $0 + " · " } ?? "") + Self.hoverText(point, uptime: uptime))
     }
 
     /// 软件更新 sheet:发现新版本 → 自动下载(进度可见)→ 用户确认重启。
@@ -2931,12 +2956,13 @@ struct StatusCell: View {
     // 紫:通过但 ≥8s。曾用与失败几乎相同的红(0.82,0.35,0.25),用户看到整条红
     // 以为什么时候都挂了,实际 uptime 100% —— 两红无法区分,换成紫
     static let okTooSlow = Color(red: 0.62, green: 0.46, blue: 0.85)
+    static let okUntimed = Color(red: 0.29, green: 0.57, blue: 0.78)
     static let fail      = Color(red: 0.80, green: 0.28, blue: 0.24)   // 红:探测失败
     static let pending   = Color.secondary.opacity(0.13)               // 灰:未采集
 
     static func cellColor(_ p: ProbePoint) -> Color {
         if !p.ok { return fail }
-        let ms = p.ms ?? 3000
+        guard let ms = p.ms else { return okUntimed }
         if ms < 3000 { return okFast }
         if ms < 8000 { return okSlow }
         return okTooSlow
@@ -2951,7 +2977,7 @@ struct StatusCell: View {
             let speed = ms < 3000 ? "" : (ms < 8000 ? "(慢)" : "(很慢)")
             return "\(time) · 通过\(speed) · \(Int(ms)) ms\(up)"
         }
-        return "\(time) · 探测失败\(up)"
+        return "\(time) · \(p.ok ? "通过（未记录延迟）" : "探测失败")\(up)"
     }
 }
 
@@ -3075,6 +3101,7 @@ struct StatusLegend: View {
             cell(StatusCell.okFast, "通过 <3s")
             cell(StatusCell.okSlow, "通过 3-8s")
             cell(StatusCell.okTooSlow, "通过 ≥8s(慢)")
+            cell(StatusCell.okUntimed, "通过（无耗时）")
             cell(StatusCell.fail, "失败")
             cell(Color.secondary.opacity(0.13), "未采集")
             if showUptimeNote {
@@ -3128,7 +3155,7 @@ struct OverallStatusBanner: View {
                         "可用 \(okCount) 个 · \(warnCount) 个链路异常(上游正常但经 CPA 不通)")
             }
             return (Color(red: 0.18, green: 0.52, blue: 0.34),
-                    "checkmark.seal.fill", "全部网关可用 · \(okCount) 个在线")
+                    "checkmark.seal.fill", "已探测可用 · \(okCount) 个")
         }()
         HStack(spacing: 8) {
             Image(systemName: icon).font(.system(size: compact ? 13 : 15))

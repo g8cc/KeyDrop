@@ -155,9 +155,13 @@ public enum AppLog {
             let tok = ns.substring(with: r)
             // 只截断疑似密钥的 token。旧实现一律截 12 字符会破坏路径/模型名;
             // 但阈值只按长度 ≥24 会漏掉 16–23 字符的合法 key(key 判定门槛是 16)。
-            // 因此长 token 一律截断,短 token 仅当它长得像 key(如 sk-…/gsk_…/nvapi-…)且不含 /
-            // 时才截断,兼顾日志可读性与密钥不外泄。
-            let looksLikeKey = tok.count >= 16 && !tok.contains("/") && Parser.looksLikeKey(tok)
+            // 短凭据完全遮盖。长 token 沿用截断，保留日志中用于排查的前缀。
+            let looksLikeKey = !tok.contains("/") && Parser.looksLikeKey(tok)
+            if looksLikeKey && tok.count < 16 {
+                out += "•••"
+                pos = r.location + r.length
+                continue
+            }
             if tok.count >= 24 || looksLikeKey {
                 out += String(tok.prefix(12)) + "…(\(tok.count)ch)"
             } else {

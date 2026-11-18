@@ -13,6 +13,21 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.availability semantics") { t in
+            var e = entry("availability", ts: 1)
+            t.equal(e.availability, .unverified, "没有验证记录显示灰色")
+            e.healthAt = 2
+            t.equal(e.availability, .available, "探测通过才显示可用")
+            e.failStreak = 1
+            t.equal(e.availability, .retry, "防抖待复测不是可用")
+            t.equal(HistorySections([e]).okCount, 0, "不计入可用横幅")
+            e.health = "quota"
+            t.equal(e.availability, .quota, "额度用尽与认证失败分开")
+            e.health = "err"
+            t.equal(e.availability, .error, "探测失败明确呈现")
+            e.format = "dsh-only"
+            t.equal(e.availability, .dshOnly, "仅 DSH 验证")
+        }
         h.runSuite("History.protocol compatibility") { t in
             let env = try TestEnv("hist-protocol")
             defer { env.cleanup() }

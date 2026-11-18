@@ -14,7 +14,7 @@ public struct HistorySections {
         for e in entries.filter({ $0.status == "active" }).sorted(by: { $0.ts > $1.ts }) {
             let isDead = e.health == "dead" || e.health == "err"
             let isQuota = !isDead && (e.health == "quota" || e.allConfiguredModelsLimited)
-            if !isDead, !isQuota, e.healthAt != nil, e.health == "ok" || e.health == "proxy-ok" {
+            if e.availability == .available || e.availability == .proxyAvailable {
                 if e.viaCPAOk == false { warnCount += 1 } else { okCount += 1 }
             }
             if !terms.isEmpty {

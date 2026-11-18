@@ -3,6 +3,51 @@ import KeyDropCore
 
 enum DSHWriterTests {
     static func run(_ h: Harness) {
+        h.runSuite("DSH.Cordis legacy provider collisions") { t in
+            let env = try TestEnv("dsh-cordis-collisions")
+            defer { env.cleanup() }
+            let fixture = """
+                - id: other-plugin
+                  config:
+                    providers:
+                      untouched:
+                        apiKeyEnv: KEYDROP_AB12CD34_API_KEY
+                - id: llm-pi-ai
+                  config:
+                    timeout: 30
+                    providers:
+                      relay:
+                        apiKeyEnv: KEYDROP_AB12CD34_API_KEY
+                        baseURL: https://old.example.com/v1
+                      relay:
+                        apiKeyEnv: "KEYDROP_EF56AB78_API_KEY"
+                        baseURL: https://sibling.example.com/v1
+                      relay:
+                        apiKeyEnv: KEYDROP_AB12CD34_API_KEY
+                        baseURL: https://stale.example.com/v1
+                      custom:
+                        apiKeyEnv: OWN_API_KEY
+                        baseURL: https://manual.example.com/v1
+                """
+            let profiles = ["web", "desktop", "headless", "superagent"]
+            for profile in profiles {
+                try FileManager.default.createDirectory(atPath: env.dir + "/profiles/" + profile, withIntermediateDirectories: true)
+                env.write("profiles/\(profile)/cordis.patch.yml", fixture)
+            }
+            for _ in 0..<2 {
+                _ = try DSHWriter.add(providerID: "ab12cd34-test", key: "sk-fixture123", url: "https://current.example.com", models: ["deepseek-test"])
+            }
+            for profile in profiles {
+                let config = env.read("profiles/\(profile)/cordis.patch.yml")
+                t.expect(!config.contains("      relay:"), "\(profile) legacy collisions removed")
+                t.contains(config, "keydrop-ab12cd34", "\(profile) current provider present")
+                t.contains(config, "keydrop-ef56ab78", "\(profile) different credential preserved")
+                t.equal(config.components(separatedBy: "https://current.example.com/v1").count - 1, 1, "\(profile) upsert idempotent")
+                t.contains(config, "      custom:", "\(profile) manual provider preserved")
+                t.contains(config, "      untouched:", "\(profile) different plugin preserved")
+            }
+        }
+
         h.runSuite("DSHWriter") { t in
             // baseURL 规范化
             t.equal(DSHWriter.normalizeBaseURL("https://relay-test.example.com"), "https://relay-test.example.com/v1", "无 /v1 补齐")

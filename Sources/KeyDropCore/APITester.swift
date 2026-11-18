@@ -26,7 +26,8 @@ public struct APITestResult {
     /// 失败属于「暂时性网络层」(超时/不可达/离线):健康扫描对此防抖保留可用;
     /// false = 服务端明确拒绝(401/403/429/5xx 等),第一次失败即应降级
     public let transientFailure: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false) {
+    public let reachabilityOnly: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -40,6 +41,7 @@ public struct APITestResult {
         self.latencyMs = latencyMs
         self.modelLatencies = modelLatencies
         self.transientFailure = transientFailure
+        self.reachabilityOnly = reachabilityOnly
     }
 }
 
@@ -219,7 +221,7 @@ public enum APITester {
                                      quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
                                      workingModels: via.workingModels, quotaModels: via.quotaModels,
                                      latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
-                                     transientFailure: false)
+                                     transientFailure: false, reachabilityOnly: via.reachabilityOnly)
             }
             // 代理侧也不通才回退直连一次:可能是本机代理挂了,也可能是地区限制解除
             // (或 key 真失效)。直连恢复可用就不再标 needsProxy,下轮回到常规路径
@@ -255,7 +257,8 @@ public enum APITester {
                                  authFailed: false, needsProxy: true,
                                  quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
                                  workingModels: via.workingModels, quotaModels: via.quotaModels,
-                                 latencyMs: via.latencyMs, modelLatencies: via.modelLatencies)
+                                 latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
+                                 reachabilityOnly: via.reachabilityOnly)
         }
         // 两路都失败:直连拿到了 key 级结论(401/403)而代理侧只是连不通
         // (超时/无响应)→ 保留直连结论,别把代理故障说成 key 失效
@@ -360,8 +363,10 @@ public enum APITester {
                         sawTransient = true
                         continue
                     }
-                    working.append(probe)
-                    if firstWorkingLatency == nil { firstWorkingLatency = chat.latencyMs }
+                    if let ms = chat.latencyMs {
+                        working.append(probe)
+                        if firstWorkingLatency == nil { firstWorkingLatency = ms }
+                    }
                 }
                 if let (m, st) = authModel {
                     return APITestResult(ok: false, style: style, models: models,
@@ -397,8 +402,8 @@ public enum APITester {
                                          authFailed: false, quotaExhausted: true, quotaModels: quotaModels)
                 }
                 return APITestResult(ok: true, style: style, models: models,
-                                     detail: "GET \(ep) → 200" + (models.isEmpty ? " (列表为空)" : ", \(models.count) 个模型"),
-                                     authFailed: false)
+                                     detail: "GET \(ep) → 200，未验证对话模型",
+                                     authFailed: false, reachabilityOnly: true)
             }
             if status == 0 { sawTransient = true }
             lastErr = "GET \(ep) → \(status == 0 ? "超时/无响应" : "HTTP \(status)")"
@@ -417,7 +422,7 @@ public enum APITester {
         if chat.0 {
             return APITestResult(ok: true, style: "openai", models: [],
                                  detail: chat.2,
-                                 authFailed: false)
+                                 authFailed: false, reachabilityOnly: !chat.3)
         }
         authFailed = authFailed || chat.1
         lastErr += "; \(chat.2)"
@@ -628,7 +633,7 @@ public enum APITester {
         return ChatProbeOutcome(style: native ? "anthropic" : "openai", networkError: sawNetworkError || native)
     }
 
-    private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {
+    private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String, Bool) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
@@ -653,17 +658,16 @@ public enum APITester {
                 lastDesc = "POST \(base)\(path) → 连接不可达"
                 break
             }
-            let ok = status == 400
-                || (status == 200 && isJSONBody(body))
-                || (status == 404 && isGatewayErrorBody(body))
+            let verified = status == 200 && isSuccessfulChatBody(body)
+            let ok = verified || status == 400 || (status == 404 && isGatewayErrorBody(body))
             if ok {
-                return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)")
+                return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)", verified)
             }
             // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败,不计入 authFailed
             if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) { authFailed = true }
             lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }
-        return (false, authFailed, lastDesc)
+        return (false, authFailed, lastDesc, false)
     }
 
     static func isHTMLBody(_ s: String) -> Bool {
@@ -683,17 +687,32 @@ public enum APITester {
 
     /// HTTP 成功码仍可能携带空体、错误 JSON 或前端兜底页。
     private static func isSuccessfulChatBody(_ body: String) -> Bool {
-        if let data = body.data(using: .utf8),
-           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            return !object.isEmpty && object["error"] == nil && (object["type"] as? String) != "error"
+        func object(_ text: Substring) -> [String: Any]? {
+            try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
         }
-        // SSE 至少包含一个非错误 JSON 数据事件，单独的 [DONE] 不算成功。
-        return body.components(separatedBy: .newlines).contains { line in
-            guard line.hasPrefix("data:"),
-                  let data = String(line.dropFirst(5)).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-            return !object.isEmpty && object["error"] == nil && (object["type"] as? String) != "error"
+        func isError(_ obj: [String: Any]) -> Bool {
+            obj["error"] != nil || (obj["type"] as? String) == "error"
         }
+        func isChat(_ obj: [String: Any]) -> Bool {
+            if let choices = obj["choices"] as? [[String: Any]],
+               choices.contains(where: { $0["message"] is [String: Any] || $0["delta"] is [String: Any] }) {
+                return true
+            }
+            switch obj["type"] as? String {
+            case "message": return obj["content"] is [[String: Any]]
+            case "message_start": return obj["message"] is [String: Any]
+            case "content_block_delta": return obj["delta"] is [String: Any]
+            default: return false
+            }
+        }
+        if let obj = object(body[...]) { return !isError(obj) && isChat(obj) }
+        var hasChat = false
+        for line in body.split(whereSeparator: \.isNewline) {
+            guard line.hasPrefix("data:"), let obj = object(line.dropFirst(5)) else { continue }
+            if isError(obj) { return false }
+            if isChat(obj) { hasChat = true }
+        }
+        return hasChat
     }
 
     private static func isJSONBody(_ s: String) -> Bool {
@@ -738,7 +757,7 @@ public enum APITester {
         let o = NetSync.run(session: s, request: req, timeout: timeout)
         let status = NetSync.statusCode(o)
         let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
-        let ok = status == 200 && isJSONBody(body)
+        let ok = status == 200 && isSuccessfulChatBody(body)
         // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败
         let authFail = status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body))
         return (ok, authFail,

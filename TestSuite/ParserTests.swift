@@ -3,6 +3,14 @@ import KeyDropCore
 
 enum ParserTests {
     static func run(_ h: Harness) {
+        h.runSuite("Parser.short prefixed key") { t in
+            let key = "sk-123456"
+            let parsed = try Parser.parse("https://short-key.example.com\n\n\(key)")
+            t.equal(parsed.key, key, "粘贴两行时识别短 key")
+            t.equal(parsed.url, "https://short-key.example.com", "短 key 不影响 URL")
+            t.equal(Parser.extractAllKeys(key), [key], "批量提取同样识别短 key")
+            t.equal(Parser.extractAllKeys("something sk-1234"), [], "排除过短 key 和普通词")
+        }
         h.runSuite("Parser") { t in
             // 回归:京东云控制台样式「keybase64 : <base64>」—— 冒号两侧带空格。
             // 曾因只认无空格写法,标签 "keybase64" 被逐词切分漏进模型列表,

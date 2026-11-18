@@ -27,6 +27,7 @@ enum CLI {
         var davExportPass: String? = nil
         var davSave = false
         var force = false
+        var dshOnly = false
         var appType: String? = nil
         var proxy: String? = nil
         var sizeOverride = ""
@@ -44,6 +45,7 @@ enum CLI {
             case "--dsh": dshOverride = true
             case "--no-dsh": dshOverride = false
             case "--force": force = true
+            case "--dsh-only": dshOnly = true
             case "--yes", "-y": break
             case "--no-verify": noVerify = true
             case "--out":
@@ -120,6 +122,11 @@ enum CLI {
                 return 2
             }
             do {
+                if dshOnly {
+                    let outcome = try Core.shared.addDSHOnly(raw: text, models: modelsOverride.isEmpty ? nil : modelsOverride)
+                    print(outcome.lines.joined(separator: "\n"))
+                    return outcome.ok ? 0 : 1
+                }
                 let outcome = try Core.shared.add(
                     raw: text,
                     ccOverride: ccOverride,
@@ -312,6 +319,16 @@ enum CLI {
                 print(lines.joined(separator: "\n"))
             }
             return 0
+
+        case "dsh-repair-profiles":
+            do {
+                let count = try DSHWriter.repairCordisProfiles()
+                print("已修复 \(count) 个 Cordis profile")
+                return 0
+            } catch {
+                print("DSH profile 修复失败: \(error.localizedDescription)")
+                return 1
+            }
 
         case "dsh-converge":
             do {
@@ -762,6 +779,8 @@ enum CLI {
       KeyDrop --status               查看当前状态
       KeyDrop --self-heal            检查并重建丢失的 cc-switch provider
       KeyDrop dsh-reconcile          DSH 全量对账:清孤儿路由/修漂移/自愈凭据/检测补丁层残留
+      KeyDrop --add <内容> --dsh-only   仅导入 DSH，请在 DSH 内验证
+      KeyDrop dsh-repair-profiles     修复 Cordis 中遗留的 KeyDrop provider 重复项
       KeyDrop dsh-converge           立即摘除积压的 dsh 标(保留最近 1 个)
       KeyDrop --image-add <key> <url> 导入生图渠道(探测 /v1/images/generations)
                                        [--model 名称] [--no-cpa 强制直连] → 自动注册 claude/codex/opencode MCP

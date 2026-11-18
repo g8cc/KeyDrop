@@ -83,6 +83,10 @@ sk-xxxx..."
 # 强制导入(跳过测试)
 KeyDrop --add <内容> --force
 
+# 限定 DSH 客户端的凭据（粘贴中需包含地址、key 和完整模型 ID）
+KeyDrop --add <内容> --dsh-only
+# 界面对应「仅导入 DSH」。写入后请在 DSH 内发起对话验证。
+
 # 模型列表
 KeyDrop list
 

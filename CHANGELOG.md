@@ -136,6 +136,12 @@ Magpie 渠道支持、监控诚实化、真伪鉴定每模型结论、解析修�
 - 修复:写入统一用 keydrop-<id8> 命名(可被 isOwnedRoute 匹配);
   去重按 apiKeyEnv(唯一且不随装饰名变化)扫描并移除全部同名块后再插入
 
+### 短 key 支持与 UI 打磨
+- looksLikeKey 对已知前缀(sk-/ak- 等)的 key 降低最小长度到 8:
+  sk-114514 等短 key 是真实存在的,旧 16 字符门槛拒绝合法 key
+- 行内小徽章(DSH/CPA 链路)hover 加条目名上下文,不再所有行显示相同提示
+- 状态点 hover 加条目名
+
 ### 解析与导入修复
 - 内嵌 JSON 行提取:`{"_type":"newapi_channel_conn","key":…,"url":…}` 一行 JSON
   + 活动说明 + 可用模型列表 的粘贴,曾整段按多行文本切碎(key 变垃圾碎片、

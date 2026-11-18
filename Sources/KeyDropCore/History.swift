@@ -176,12 +176,46 @@ public struct HistoryEntry: Codable {
         timeFormatter.string(from: Date(timeIntervalSince1970: t))
     }
 
-    public var healthColor: (ok: Bool, dead: Bool) {
-        switch health {
-        case "dead": return (false, true)
-        case "err", "quota": return (false, false)
-        default: return (true, false)
+    public var isDSHOnly: Bool { format == "dsh-only" }
+
+    public enum Availability: Equatable {
+        case unverified, reachable, available, proxyAvailable, retry, quota, error, dead, dshOnly, inactive
+
+        public var label: String {
+            switch self {
+            case .unverified: return "尚无可用性验证"
+            case .reachable: return "网关可达，模型尚未验证"
+            case .available: return "最近一次探测通过"
+            case .proxyAvailable: return "经代理探测通过"
+            case .retry: return "最近一次探测失败，待复测"
+            case .quota: return "额度用尽或所选模型均探测失败"
+            case .error: return "探测失败"
+            case .dead: return "接口拒绝认证"
+            case .dshOnly: return "DSH 专用，请在 DSH 内验证"
+            case .inactive: return "记录已停用"
+            }
         }
+    }
+
+    public var availability: Availability {
+        guard status == "active" else { return .inactive }
+        if isDSHOnly { return .dshOnly }
+        switch health {
+        case "dead": return .dead
+        case "err": return .error
+        case "quota": return .quota
+        case "reachable": return .reachable
+        case "ok", "proxy-ok":
+            if allConfiguredModelsLimited { return .quota }
+            if (failStreak ?? 0) > 0 { return .retry }
+            guard healthAt != nil else { return .unverified }
+            return health == "proxy-ok" ? .proxyAvailable : .available
+        default: return .unverified
+        }
+    }
+
+    public var healthColor: (ok: Bool, dead: Bool) {
+        (availability == .available || availability == .proxyAvailable, availability == .dead)
     }
 
     public init(
@@ -674,12 +708,11 @@ public final class HistoryStore {
                 _items[i].viaCPAOk = e.viaCPAOk
                 _items[i].viaCPAAt = e.viaCPAAt
                 _items[i].updatedAt = at
-                // 探测历史滚动追加(监控图数据源)
-                let pt = ProbePoint(t: at, ms: e.latencyMs,
-                                    ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
-                var log = (_items[i].probeLog ?? []) + [pt]
-                if log.count > 30 { log = Array(log.suffix(30)) }
-                _items[i].probeLog = log
+                if e.health != "reachable" {
+                    let pt = ProbePoint(t: at, ms: e.latencyMs,
+                                        ok: e.health == "ok" || e.health == "proxy-ok", cpa: e.viaCPAOk)
+                    _items[i].probeLog = Array(((_items[i].probeLog ?? []) + [pt]).suffix(30))
+                }
                 // 模型级追加:e.modelProbeLog 携带本轮各模型新点,与 store 现状合并截 30
                 if let newPoints = e.modelProbeLog, !newPoints.isEmpty {
                     var merged = _items[i].modelProbeLog ?? [:]

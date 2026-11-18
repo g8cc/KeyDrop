@@ -8,6 +8,7 @@ final class MockHTTPServer {
 
     enum Mode {
         case nativeAnthropic, nativeLimited, nativeInvalid, nativeBadModel, nativeMultiple, nativeRetry, emptyChat, errorChat
+        case catalogOnly
         case openAI    // 200 {"data":[{id}]}
         case notFound  // 404 空
         case gateway404 // GET 全 404;POST /chat/completions → 404 + JSON error(网关可达,模型校验)
@@ -211,7 +212,7 @@ final class MockHTTPServer {
             body = "{\"error\":{\"message\":\"Unauthorized\"}}"
         } else if mode == .selectiveAuth {
             body = "{\"data\":[{\"id\":\"grok-4.6\",\"object\":\"model\"}]}"
-        } else if mode == .openAI {
+        } else if mode == .openAI || mode == .catalogOnly {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"},{\"id\":\"glm-5.2\",\"object\":\"model\"}]}"
         } else if mode == .gateway404, method == "POST" {
             body = "{\"error\":{\"code\":\"UnsupportedModel\",\"message\":\"model does not support the agent plan feature\"}}"
@@ -289,6 +290,12 @@ final class MockHTTPServer {
                 body = "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
             }
         }
+        // These mocks serve a real chat shape when simulating a usable gateway.
+        if method == "POST", target.contains("/chat/completions"),
+           [Mode.openAI, .balanceOK, .balanceZero, .balanceNoInfo, .manyModels, .claudeModels, .nonChatModels].contains(mode)
+            || (mode == .selectiveAuth && !invalidKey) {
+            body = #"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#
+        }
         let status: String
         if mode == .selectiveModelQuota, target.contains("/chat/completions"), !requestedModel.contains("free") {
             status = "429 Too Many Requests"
@@ -310,7 +317,7 @@ final class MockHTTPServer {
             status = "200 OK"
         } else if mode == .regionBlock403 {
             status = "403 Forbidden"
-        } else if mode == .openAI || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || mode == .partialCatalog && target.hasSuffix("/models") || (mode == .chat524 && target.hasSuffix("/models")) {
+        } else if mode == .openAI || mode == .catalogOnly || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || mode == .partialCatalog && target.hasSuffix("/models") || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
             status = "404 Not Found"
@@ -590,6 +597,16 @@ final class SocketClient {
 
 enum APITesterTests {
     static func run(_ h: Harness) {
+        h.runSuite("APITester.catalog is not chat evidence") { t in
+            let server = try MockHTTPServer(mode: .catalogOnly)
+            let base = "http://127.0.0.1:\(server.port)/v1"
+            let result = APITester.test(url: base, key: "sk-test-123", timeout: 2)
+            t.expect(result.ok && result.reachabilityOnly, "目录 JSON 无法证明模型可用")
+            t.equal(result.workingModels, [], "无模型通过真实聊天")
+            t.equal(Core.healthFor(result).health, "reachable", "单独表示网关可达")
+            t.expect(!APITester.testModelChat(base: base, key: "sk-test-123", model: "gpt-5.6-sol", timeout: 2).ok,
+                     "模型验证拒绝目录 JSON")
+        }
         h.runSuite("APITester.协议提示与冷却") { t in
             let native = try! MockHTTPServer(mode: .nativeAnthropic)
             let base = "http://127.0.0.1:\(native.port)/v1"

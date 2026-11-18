@@ -16,6 +16,46 @@ enum ImportPipelineTests {
 
     static func run(_ h: Harness) {
 
+        h.runSuite("导入管线.DSH 专用") { t in
+            let (env, core) = makeEnv("pipe-dsh-only")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .notFound)
+            let url = "http://127.0.0.1:\(server.port)/v1"
+            let model = "example/deepseek-v4.1-flash"
+            let key = "sk-fixture-dsh-only-1"
+            let encoded = Data(key.utf8).base64EncodedString()
+            let raw = "\(url)\nAPI Key: \(encoded)\n模型: \(model)"
+            let result = try core.addDSHOnly(raw: raw)
+            t.equal(result.entry.targets, ["dsh"], "只写 DSH")
+            t.equal(result.entry.models, [model], "保留完整模型名")
+            t.expect(result.entry.isDSHOnly && !result.entry.healthColor.ok, "已配置待验证")
+            t.expect(core.history.findActiveByKey(key)?.isDSHOnly == true, "保存专用范围")
+            t.contains(env.read("dsh.yaml"), model, "模型已同步")
+            do { _ = try core.syncTarget(entryIDPrefix: result.entry.id, target: "ccswitch"); t.expect(false, "阻止同步到不兼容目标") } catch { t.contains(error.localizedDescription, "仅配置给 DSH", "阻止同步到不兼容目标") }
+            do { _ = try core.refreshModels(entryIDPrefix: result.entry.id); t.expect(false, "阻止常规刷新") } catch { t.contains(error.localizedDescription, "请在 DSH 内验证", "阻止常规刷新") }
+            do {
+                _ = try core.addDSHOnly(raw: "\(url)\n\(key)")
+                t.expect(false, "要求显式模型 ID")
+            } catch {
+                t.contains(error.localizedDescription, "完整模型 ID", "要求显式模型 ID")
+            }
+            let revised = try core.addDSHOnly(raw: raw, models: ["example/deepseek-next"])
+            t.equal(revised.entry.id, result.entry.id, "重导更新原记录")
+            let profileDir = env.dir + "/profiles/web"
+            try FileManager.default.createDirectory(atPath: profileDir, withIntermediateDirectories: true)
+            env.write("profiles/web/cordis.patch.yml", "- id: llm-pi-ai\n  config:\n    providers: {}\n")
+            _ = try core.syncTarget(entryIDPrefix: revised.entry.id, target: "dsh")
+            try FileManager.default.removeItem(atPath: env.dir + "/dsh.yaml")
+            guard var claimed = t.notNil(core.history.find(idPrefix: revised.entry.id), "已认领 DSH 路由") else { return }
+            claimed.dshMissingAt = Date().timeIntervalSince1970 - 4 * 86400
+            try core.history.update(claimed)
+            _ = core.reconcileDSH()
+            t.equal(core.history.find(idPrefix: claimed.id)?.targets, ["dsh"], "启动导入 settings 后保留实际 profile 路由")
+            t.expect(core.history.find(idPrefix: claimed.id)?.dshMissingAt == nil, "已找到 Cordis 路由，清除缺失标记")
+            t.equal(try core.dshConverge(keepLatest: 0), [], "显式收敛也保留 Cordis 路由")
+            t.equal(server.countRequests("/v1/models"), 0, "未发外部目录探测")
+            t.equal(server.countRequests("/v1/chat/completions"), 0, "未发外部聊天探测")
+        }
         h.runSuite("导入管线.Anthropic 原生协议") { t in
             let (env, core) = makeEnv("pipe-native-anthropic")
             defer { env.cleanup() }

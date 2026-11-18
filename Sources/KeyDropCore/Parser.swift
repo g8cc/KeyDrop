@@ -1443,10 +1443,14 @@ public enum Parser {
     static func looksLikeKey(_ s: String) -> Bool {
         let t = stripCJK(s).trimmingCharacters(in: .whitespaces)
         if looksLikeJWT(t) { return true }
-        guard t.count >= 16, t.count <= 256 else { return false }
+        // 已知前缀的 key 门槛降到 8(sk-114514 等短 key 是真实存在的);
+        // 无前缀的仍需 ≥16 防误判普通单词
+        let hasKnownPrefix = regexMatch(t, #"^(sk|ak|key|pk|cr|sp|dk|bk|rk|fk|tk|xk|wk|zk|gk|vk|nk|mk|hk|csk|gsk|sk-or|sk-ant|sk_tr|cfut|nvapi|ms)[-_]"#, [.caseInsensitive])
+        let minLen = hasKnownPrefix ? 8 : 16
+        guard t.count >= minLen, t.count <= 256 else { return false }
         guard regexMatch(t, #"^[\x21-\x7E]+$"#) else { return false }
         if t.contains(":") { return false }
-        if regexMatch(t, #"^(sk|ak|key|pk|cr|sp|dk|bk|rk|fk|tk|xk|wk|zk|gk|vk|nk|mk|hk|csk|gsk|sk-or|sk-ant|sk_tr|cfut|nvapi|ms)[-_]"#, [.caseInsensitive]) {
+        if hasKnownPrefix {
             return true
         }
         if t.count >= 28,
