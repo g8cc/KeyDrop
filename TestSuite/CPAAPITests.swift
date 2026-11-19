@@ -56,6 +56,232 @@ private final class ConcurrentCPAConfigServer {
 /// 配置管理密钥后全部走 /v0/management/*,本地文件零触达;未配置回退文件模式)
 enum CPAAAPITests {
     static func run(_ h: Harness) {
+        h.runSuite("CPAAPI.cross-review spaced credential indentation") { t in
+            let env = try TestEnv("cross-review-spaced-key")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              - name: spaced
+                base-url: https://spaced.example/v1
+                api-key-entries:
+                  -   api-key: sk-spaced-fixture1111
+                      proxy-url: http://preserve-proxy.example:1234
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            let result = try writer.rotateKey(baseURL: "https://spaced.example/v1",
+                                               oldKey: "sk-spaced-fixture1111", newKey: "sk-rotated-fixture2222")
+            t.expect(!result.isEmpty, "多空格序列属性仍可轮换")
+            t.contains(env.read("cpa-config.yaml"), "-   api-key: sk-rotated-fixture2222", "保留 dash 后原始缩进")
+            t.contains(env.read("cpa-config.yaml"), "proxy-url: http://preserve-proxy.example:1234", "保留凭据的代理属性")
+        }
+        h.runSuite("CPAAPI.cross-review standalone dash mapping merge") { t in
+            let env = try TestEnv("cross-review-standalone-dash")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              -
+                  name: image.example-image
+                  base-url: https://image.example/v1
+                  models:
+                    - name: image-test
+                      alias: image-test
+                      image: true
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            _ = try writer.addImageChannel(baseURL: "https://image.example/v1", key: "sk-merged-fixture1111", models: ["image-test"])
+            t.contains(env.read("cpa-config.yaml"), "sk-merged-fixture1111", "独立 dash 及可变属性缩进可合并")
+        }
+        h.runSuite("CPAAPI.cross-review standalone dash image models") { t in
+            let env = try TestEnv("cross-review-standalone-image-models")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              -
+                  name: image.example-image
+                  base-url: https://image.example/v1
+                  api-key-entries:
+                    - api-key: sk-image-fixture1111
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            _ = try writer.addImageChannel(baseURL: "https://image.example/v1", key: "sk-image-fixture1111", models: ["image-test"])
+            let config = env.read("cpa-config.yaml")
+            t.contains(config, "      models:", "models 按已有属性缩进补建")
+            t.contains(config, "image: true", "新增图片模型保留 image 标记")
+            t.equal(config.components(separatedBy: "sk-image-fixture1111").count - 1, 1, "不重复插入已有 key")
+        }
+        h.runSuite("CPAAPI.cross-review standalone dash model update") { t in
+            let env = try TestEnv("cross-review-standalone-model-update")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              -
+                  name: models
+                  base-url: https://models.example/v1
+                  api-key-entries:
+                    - api-key: sk-models-fixture1111
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            _ = try writer.updateAggregatedModels(baseURL: "https://models.example/v1", models: ["model-test"])
+            let config = env.read("cpa-config.yaml")
+            t.contains(config, "      models:", "缺失模型段按已有属性缩进补建")
+            t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-test"], "写入模型可重新读取")
+            t.contains(config, "sk-models-fixture1111", "模型更新保留凭据池")
+        }
+        h.runSuite("CPAAPI.writer rotated and merged reordered keys") { t in
+            let env = try TestEnv("writer-reaudit-rotation")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility: # preserve providers
+            - base-url: https://image.example/v1 # preserve URL
+              name: image.example-image # name is not the first property
+              api-key-entries:
+              # key entries use an indentless sequence
+              - proxy-url: http://preserve-proxy.example:1234
+                api-key: 'sk-rotate-fixture1111' # credential is not the first property
+              models:
+                - name: image-test
+                  alias: image-test
+                  image: true
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            let rotated = try writer.rotateKey(baseURL: "https://image.example/v1/",
+                                               oldKey: "sk-rotate-fixture1111", newKey: "sk-rotated-fixture2222")
+            t.expect(!rotated.isEmpty, "找到重排和顶格子项里的 key")
+            var config = env.read("cpa-config.yaml")
+            t.expect(!config.contains("sk-rotate-fixture1111"), "原凭据已替换")
+            t.contains(config, "http://preserve-proxy.example:1234", "轮换保留凭据级代理")
+            _ = try writer.addImageChannel(baseURL: "https://image.example/v1", key: "sk-rotated-fixture2222", models: ["image-test"])
+            _ = try writer.addImageChannel(baseURL: "https://image.example/v1", key: "sk-added-fixture3333", models: ["image-test"])
+            config = env.read("cpa-config.yaml")
+            t.equal(config.components(separatedBy: "sk-rotated-fixture2222").count - 1, 1, "重导入识别非首行的既有 key")
+            t.equal(config.components(separatedBy: "image.example-image").count - 1, 1, "重导入不重复追加 provider")
+            t.equal(config.components(separatedBy: "sk-added-fixture3333").count - 1, 1, "按既有顶格子项缩进合并新 key")
+            t.contains(config, "# preserve providers", "保留段头注释")
+        }
+        h.runSuite("CPAAPI.writer nested fields cannot match credentials") { t in
+            let env = try TestEnv("writer-reaudit-nested-key")
+            defer { env.cleanup() }
+            let fixture = """
+            port: 8317
+            claude-api-key:
+              - api-key: sk-retain-fixture2222
+                base-url: https://a.example/v1
+                headers:
+                  api-key: sk-delete-fixture1111
+            """
+            env.write("cpa-config.yaml", fixture)
+            let core = Core()
+            var record = HistoryTests.entry("yaml-delete-nested", ts: 1)
+            record.key = "sk-delete-fixture1111"
+            record.url = "https://a.example/v1"
+            record.targets = ["cpa"]
+            record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+            try core.history.append(record)
+            _ = try core.delete(entryIDPrefix: record.id)
+            t.equal(env.read("cpa-config.yaml"), fixture, "嵌套同名字段不能触发整条 provider 删除")
+        }
+        h.runSuite("CPAAPI.writer single quoted hash key") { t in
+            let env = try TestEnv("writer-reaudit-quoted-key")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+                - name: quoted
+                  base-url: https://quoted.example/v1
+                  api-key-entries:
+                    - api-key: 'sk-fixture'' #literal' # comment
+                      proxy-url: http://preserve-proxy.example:1234
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            let result = try writer.rotateKey(baseURL: "https://quoted.example/v1",
+                                              oldKey: "sk-fixture' #literal", newKey: "sk-quoted-replacement")
+            t.expect(!result.isEmpty, "单引号转义和引号内 # 不截断凭据")
+            t.contains(env.read("cpa-config.yaml"), "sk-quoted-replacement", "非固定条目缩进下轮换成功")
+            t.contains(env.read("cpa-config.yaml"), "http://preserve-proxy.example:1234", "保持其他属性")
+        }
+        h.runSuite("CPAAPI.writer duplicate mapping rejected before write") { t in
+            let python = Process()
+            python.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            python.arguments = ["-c", "import yaml"]
+            python.standardError = FileHandle.nullDevice
+            try python.run()
+            python.waitUntilExit()
+            guard python.terminationStatus == 0 else { return } // optional runtime validator
+            let env = try TestEnv("writer-reaudit-duplicate-yaml")
+            defer { env.cleanup() }
+            let fixtures = [
+                "port: 8317\nport: 9090\n",
+                "port: 8317\nopenai-compatibility:\n  - name: existing\n    name: repeated\n    base-url: https://a.example/v1\n"
+            ]
+            for fixture in fixtures {
+                env.write("cpa-config.yaml", fixture)
+                do {
+                    _ = try CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+                        .addImageChannel(baseURL: "https://image.example/v1", key: "sk-validator-fixture1111", models: ["image-test"])
+                    t.expect(false, "重复 mapping key 必须拒绝写入")
+                } catch {
+                    t.contains(error.localizedDescription, "重复键", "说明真实的 YAML 重复键原因")
+                }
+                t.equal(env.read("cpa-config.yaml"), fixture, "预检拒绝时原配置逐字保留")
+            }
+        }
+        h.runSuite("CPAAPI.writer scoped deletion YAML variants") { t in
+            let fixtures = [
+                "port: 8317\nclaude-api-key:\n  - base-url: https://a.example/v1\n    api-key: sk-delete-fixture1111\n  - api-key: sk-delete-fixture1111\n    base-url: https://b.example/v1\n",
+                "port: 8317\nclaude-api-key: # flat providers\n  - api-key: 'sk-delete-fixture1111' # credential\n    base-url: \"https://a.example/v1\" # provider\n  - api-key: sk-delete-fixture1111\n    base-url: https://b.example/v1\n",
+                "port: 8317\nopenai-compatibility:\n  - base-url: https://a.example/v1\n    name: first\n    api-key-entries:\n      - api-key: sk-delete-fixture1111\n  - name: second\n    base-url: https://b.example/v1\n    api-key-entries:\n      - api-key: sk-delete-fixture1111\n",
+                "port: 8317\nopenai-compatibility: # providers\n- base-url: 'https://a.example/v1' # URL\n  name: first\n  api-key-entries:\n  - proxy-url: http://old-proxy.example:1234\n    api-key: 'sk-delete-fixture1111' # key\n- name: second\n  base-url: https://b.example/v1\n  api-key-entries:\n  - api-key: sk-delete-fixture1111\n"
+            ]
+            for (index, fixture) in fixtures.enumerated() {
+                let env = try TestEnv("writer-reaudit-yaml-\(index)")
+                defer { env.cleanup() }
+                env.write("cpa-config.yaml", fixture)
+                let core = Core()
+                var record = HistoryTests.entry("yaml-delete-\(index)", ts: 1)
+                record.key = "sk-delete-fixture1111"
+                record.url = "https://a.example/v1/"
+                record.targets = ["cpa"]
+                record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+                try core.history.append(record)
+                _ = try core.delete(entryIDPrefix: record.id)
+                let config = env.read("cpa-config.yaml")
+                t.expect(!config.contains("https://a.example/v1"), "字段序/注释/顶格列表变体 \(index) 删除正确地址")
+                t.contains(config, "https://b.example/v1", "变体 \(index) 保留其他地址")
+                t.equal(config.components(separatedBy: record.key!).count - 1, 1, "变体 \(index) 只保留其他 provider 的相同凭据")
+            }
+        }
+        h.runSuite("CPAAPI.writer deletion removes key properties") { t in
+            let env = try TestEnv("writer-reaudit-key-properties")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              - name: first
+                base-url: https://a.example/v1
+                api-key-entries:
+                  - api-key: sk-delete-fixture1111
+                    proxy-url: http://old-proxy.example:1234
+                  - api-key: sk-retain-fixture2222
+                    proxy-url: http://keep-proxy.example:4321
+            """)
+            let core = Core()
+            var record = HistoryTests.entry("yaml-delete-properties", ts: 1)
+            record.key = "sk-delete-fixture1111"
+            record.url = "https://a.example/v1"
+            record.targets = ["cpa"]
+            record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+            try core.history.append(record)
+            _ = try core.delete(entryIDPrefix: record.id)
+            let config = env.read("cpa-config.yaml")
+            t.expect(!config.contains("sk-delete-fixture1111") && !config.contains("old-proxy"), "删除完整凭据子项与其代理属性")
+            t.contains(config, "sk-retain-fixture2222", "保留下一把 key")
+            t.contains(config, "http://keep-proxy.example:4321", "保留下一把 key 的原代理")
+        }
         h.runSuite("WriterAudit.CPA 非法管理地址") { t in
             let env = try TestEnv("cpa-invalid-management-base")
             defer { env.cleanup() }

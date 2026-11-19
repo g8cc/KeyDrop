@@ -140,6 +140,27 @@ public enum LLMParser {
         return validate(content: content, source: raw)
     }
 
+    private static func containsSourceKey(_ key: String, in source: String) -> Bool {
+        if Parser.extractAllKeys(source).contains(key) { return true }
+        let prefix = "(?<![A-Za-z0-9_./+=-])"
+        let suffix = "(?![A-Za-z0-9_./+=-])"
+        let literal = NSRegularExpression.escapedPattern(for: key)
+        if source.range(of: prefix + literal + suffix, options: .regularExpression) != nil { return true }
+
+        // 在原文中允许 key 字符之间的排版分隔符，保留两端原有边界。
+        // 全文去分隔符会把英文标签/说明粘到 key 上，误拒绝真实的换行凭据。
+        let separators = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+            .subtracting(CharacterSet(charactersIn: "-_./+="))
+        let presentSeparators = Set(source.unicodeScalars.filter { separators.contains($0) })
+        guard !presentSeparators.isEmpty else { return false }
+        // 用 Unicode 转义构造字符类，避免引号、方括号等粘贴字符改变正则含义。
+        let separatorPattern = "[" + presentSeparators.sorted { $0.value < $1.value }
+            .map { "\\x{\(String($0.value, radix: 16))}" }.joined() + "]*"
+        let splitKey = key.unicodeScalars.map { NSRegularExpression.escapedPattern(for: String($0)) }
+            .joined(separator: separatorPattern)
+        return source.range(of: prefix + splitKey + suffix, options: .regularExpression) != nil
+    }
+
     private static func validate(content: String, source raw: String) -> LLMResult? {
         guard let start = content.firstIndex(of: "{"),
               let end = content.lastIndex(of: "}"),
@@ -165,18 +186,7 @@ public enum LLMParser {
         }
         guard let k = key else { return nil }
         let source = Parser.stripPasteNoise(Parser.normalizeFullWidth(raw))
-        let separators = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
-            .subtracting(CharacterSet(charactersIn: "-_./+="))
-        let compactSource = String(source.unicodeScalars.filter { !separators.contains($0) })
-        // 子串匹配会把完整 key 的截断前缀当作来源证据。核对 token 边界，
-        // 同时保留规则解码和空白拆分凭据的恢复能力。
-        let keyPattern = "(?<![A-Za-z0-9_./+=-])" + NSRegularExpression.escapedPattern(for: k)
-            + "(?![A-Za-z0-9_./+=-])"
-        guard Parser.extractAllKeys(source).contains(k)
-                || source.range(of: keyPattern, options: .regularExpression) != nil
-                || compactSource.range(of: keyPattern, options: .regularExpression) != nil else {
-            return nil
-        }
+        guard containsSourceKey(k, in: source) else { return nil }
 
         var url: String? = nil
         if let u = rawURL, !u.isEmpty {

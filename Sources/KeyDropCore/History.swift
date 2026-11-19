@@ -29,7 +29,7 @@ public struct HistoryEntry: Codable {
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
-        case apiStyle
+        case apiStyle, poolKeys
     }
 
     public var id: String
@@ -41,6 +41,8 @@ public struct HistoryEntry: Codable {
     public var model: String?
     public var models: [String]?
     public var key: String?
+    /// 多 key 导入经过认证筛选后实际写入的凭据；nil 表示旧账本尚未确认。
+    public var poolKeys: [String]? = nil
     public var keyMasked: String
     public var targets: [String]
     public var ccProviderID: String?
@@ -117,7 +119,7 @@ public struct HistoryEntry: Codable {
             head += "\n模型: \(shown)" + (ms.count > 8 ? " 等 \(ms.count) 个" : "")
         }
         lines.append(head)
-        lines.append("key: \(keyMasked)\(key == nil ? "(多 key 条目,凭据从原文恢复)" : "")")
+        lines.append("key: \(keyMasked)\(key == nil && format == "cpa-multikey" ? "(多 key 条目)" : "")")
         let label = status == "deleted" ? "已删除" : (status == "error" ? "导入失败" : availability.label)
         var statusLine = "状态: \(label)"
         if let d = displayHealthDetail, !d.isEmpty { statusLine += " · \(String(d.prefix(140)))" }
@@ -291,6 +293,7 @@ public struct HistoryEntry: Codable {
         model = try c.decodeIfPresent(String.self, forKey: .model)
         models = try c.decodeIfPresent([String].self, forKey: .models)
         key = try c.decodeIfPresent(String.self, forKey: .key)
+        poolKeys = try c.decodeIfPresent([String].self, forKey: .poolKeys)
         keyMasked = try c.decode(String.self, forKey: .keyMasked)
         targets = try c.decode([String].self, forKey: .targets)
         ccProviderID = try c.decodeIfPresent(String.self, forKey: .ccProviderID)
@@ -331,6 +334,7 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(model, forKey: .model)
         try c.encodeIfPresent(models, forKey: .models)
         try c.encodeIfPresent(key, forKey: .key)
+        try c.encodeIfPresent(poolKeys, forKey: .poolKeys)
         try c.encode(keyMasked, forKey: .keyMasked)
         try c.encode(targets, forKey: .targets)
         try c.encodeIfPresent(ccProviderID, forKey: .ccProviderID)
@@ -687,7 +691,7 @@ public final class HistoryStore {
     private static func sameProbeConfiguration(_ current: HistoryEntry, _ tested: HistoryEntry) -> Bool {
         current.status == "active" && !current.isDSHOnly &&
             current.format == tested.format && current.url == tested.url && current.key == tested.key &&
-            (current.key != nil || current.raw == tested.raw) &&
+            (current.key != nil || (current.raw == tested.raw && current.poolKeys == tested.poolKeys)) &&
             current.model == tested.model && current.models == tested.models &&
             current.targets.contains("cpa") == tested.targets.contains("cpa") &&
             current.cpaConfigPath == tested.cpaConfigPath

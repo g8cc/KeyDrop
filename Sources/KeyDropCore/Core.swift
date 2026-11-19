@@ -333,14 +333,14 @@ public final class Core {
             let chooser: (([String]) -> [String])? = !explicitModels.isEmpty
                 ? { _ in explicitModels }
                 : pickModels
-            let (msg, probedModels) = try CPAWriter(configPath: cfg)
+            let (msg, probedModels, acceptedKeys) = try CPAWriter(configPath: cfg)
                 .addMulti(baseURL: url, keys: allKeys, proxy: proxyURL, pickModels: chooser)
             prefs.cpaConfigPath = cfg
             var multiLines = [msg]
             // 常驻模型来源 = 条目最终 models(已有精选时即精选列表);
             // 空(探测失败且无既有列表)传 nil 回退收集其它条目的精选
             multiLines.append(contentsOf: syncCPAResidentEntries(models: probedModels.isEmpty ? nil : probedModels))
-            let entry = HistoryEntry(
+            var entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
                 ts: Date().timeIntervalSince1970,
                 raw: raw,
@@ -350,7 +350,7 @@ public final class Core {
                 model: probedModels.first ?? parsed.model,
                 models: probedModels.isEmpty ? nil : probedModels,
                 key: nil,
-                keyMasked: "\(allKeys.count) 个 key",
+                keyMasked: "\(acceptedKeys.count) 个 key",
                 targets: ["cpa"],
                 ccProviderID: nil,
                 ccRenamedFrom: nil,
@@ -358,6 +358,7 @@ public final class Core {
                 cpaConfigPath: cfg,
                 status: "active"
             )
+            entry.poolKeys = acceptedKeys
             try history.append(entry)
             do { try prefs.save() } catch { multiLines.append("⚠ 偏好保存失败: \(error.localizedDescription)") }
             return AddOutcome(entry: entry, lines: multiLines, ok: true)
@@ -1662,9 +1663,10 @@ public final class Core {
             // ② 超期已删 → 审计桩(计龄:deletedAt 缺失的历史条目回退 healthAt/ts)
             if e.status == "deleted" {
                 let age = e.deletedAt ?? e.healthAt ?? e.ts
-                if age < cutoff, e.key != nil || e.probeLog != nil || e.modelProbeLog != nil
+                if age < cutoff, e.key != nil || e.poolKeys != nil || e.probeLog != nil || e.modelProbeLog != nil
                     || e.raw != "archived" {
                     e.key = nil
+                    e.poolKeys = nil
                     e.raw = "archived"
                     e.probeLog = nil
                     e.modelProbeLog = nil
@@ -1796,17 +1798,31 @@ public final class Core {
                 }
                 if remoteTS > localTS {
                     // 先同步本机已认领的产物。失败时保留旧账本，后续拉取可重试。
-                    let incomingModels = e.models ?? e.model.map { [$0] }
+                    var incomingModels = e.models ?? e.model.map { [$0] }
                         ?? local.models ?? local.model.map { [$0] } ?? []
                     if local.targets.contains("cpa") {
                         guard let oldKeys = extractAllKeys(for: local), !oldKeys.isEmpty, let oldURL = local.url,
-                              let newKeys = extractAllKeys(for: e), !newKeys.isEmpty, let newURL = e.url,
+                              var newKeys = extractAllKeys(for: e), !newKeys.isEmpty, let newURL = e.url,
                               let cfg = local.cpaConfigPath ?? prefs.resolvedCPAConfig() else {
                             throw ParseError.io("同步 CPA 缺少地址、凭据或配置路径，已保留本机记录")
                         }
                         let writer = CPAWriter(configPath: cfg)
-                        for key in newKeys {
-                            _ = try writer.addAggregated(baseURL: newURL, key: key, models: incomingModels)
+                        if e.format == "cpa-multikey", e.key == nil, e.poolKeys == nil {
+                            let (_, actualModels, accepted) = try writer.addMulti(
+                                baseURL: newURL, keys: newKeys, proxy: proxyForHealth(),
+                                fallbackModels: incomingModels.isEmpty ? nil : incomingModels)
+                            newKeys = accepted
+                            e.poolKeys = accepted
+                            e.keyMasked = "\(accepted.count) 个 key"
+                            if incomingModels.isEmpty, !actualModels.isEmpty {
+                                incomingModels = actualModels
+                                e.models = actualModels
+                                e.model = actualModels.first
+                            }
+                        } else {
+                            for key in newKeys {
+                                _ = try writer.addAggregated(baseURL: newURL, key: key, models: incomingModels)
+                            }
                         }
                         if !incomingModels.isEmpty {
                             _ = try writer.updateAggregatedModels(baseURL: newURL, models: incomingModels)
@@ -1850,6 +1866,10 @@ public final class Core {
                         }
                     }
                     var merged = e
+                    if e.models == nil && e.model == nil {
+                        merged.models = local.models
+                        merged.model = local.model
+                    }
                     merged.ccProviderID = local.ccProviderID
                     merged.ccRenamedFrom = local.ccRenamedFrom
                     merged.ccRenamedTo = local.ccRenamedTo
@@ -1976,8 +1996,17 @@ public final class Core {
                     do {
                         let writer = CPAWriter(configPath: cfg)
                         var msg = ""
-                        for credential in keys {
-                            msg = try writer.addAggregated(baseURL: url, key: credential, models: models)
+                        if e.format == "cpa-multikey", e.key == nil, e.poolKeys == nil {
+                            // 旧 raw 包含当时被剔除的凭据，先重新筛选并保存真实 key 池。
+                            let result = try writer.addMulti(baseURL: url, keys: keys, proxy: px,
+                                                             fallbackModels: models)
+                            msg = result.0
+                            e.poolKeys = result.2
+                            e.keyMasked = "\(result.2.count) 个 key"
+                        } else {
+                            for credential in keys {
+                                msg = try writer.addAggregated(baseURL: url, key: credential, models: models)
+                            }
                         }
                         e.cpaConfigPath = cfg
                         entryLines.append("CPA: \(msg)")
@@ -3392,19 +3421,20 @@ public final class Core {
         return lines.isEmpty ? "已删除" : lines.joined(separator: "\n")
     }
 
-    /// 取条目可用于探测/验证的凭据:单 key 条目直接读 key;多 key 条目(cpa-multikey)
-    /// 账本里不落 key(只落 "N 个 key"),从 raw 恢复第一个 —— 编辑/重测/curl 复制
-    /// 都只需要一把有效凭据,CPA 侧组内会自行轮询全池
+    /// 取条目可用于探测/验证的凭据:单 key 直接读 key，多 key 优先读已接受的凭据池，
+    /// 仅旧账本回退 raw。编辑/重测/curl 复制只需一把凭据，CPA 侧会轮询全池。
     public func extractKey(_ e: HistoryEntry) -> String? {
         if let key = e.key, !key.isEmpty { return key }
+        if let keys = e.poolKeys { return keys.first }
         if let parsed = try? Parser.parse(e.raw) { return parsed.key }
         return nil
     }
 
-    /// 取条目对应的所有 key:单 key 条目走 extractKey;多 key 条目(cpa-multikey)用 extractAllKeys 从 raw 提全。
+    /// 取条目对应的所有 key:优先读取持久化凭据；旧版多 key 条目从 raw 恢复。
     /// 返回 nil 表示无法恢复任何 key,调用方应跳过删除并报告失败。
     private func extractAllKeys(for e: HistoryEntry) -> [String]? {
         if let key = e.key, !key.isEmpty { return [key] }
+        if let keys = e.poolKeys { return keys.isEmpty ? nil : keys }
         let fromRaw = Parser.extractAllKeys(e.raw)
         if fromRaw.isEmpty {
             return (try? Parser.parse(e.raw)).flatMap { $0.key.map { [$0] } }

@@ -51,12 +51,20 @@ func waitUntil(_ condition: () -> Bool) async -> Bool {
 }
 
 final class UpdateFixtureProtocol: URLProtocol {
+    static let successfulRelease = #"{"tag_name":"v999.0.0","assets":[{"name":"KeyDrop-v999.0.0.zip","browser_download_url":"https://github.com/g8cc/KeyDrop/releases/download/v999.0.0/KeyDrop-v999.0.0.zip"}]}"#
+    private static let responseLock = NSLock()
+    private static var releaseBody = successfulRelease
+    static var releaseResponse: String {
+        get { responseLock.lock(); defer { responseLock.unlock() }; return releaseBody }
+        set { responseLock.lock(); defer { responseLock.unlock() }; releaseBody = newValue }
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         let body = request.url?.host == "api.github.com"
-            ? #"{"tag_name":"v999.0.0","assets":[{"name":"KeyDrop-v999.0.0.zip","browser_download_url":"https://github.com/g8cc/KeyDrop/releases/download/v999.0.0/KeyDrop-v999.0.0.zip"}]}"#
+            ? Self.releaseResponse
             : "invalid zip fixture"
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
                                        headerFields: ["Content-Length": "\(body.utf8.count)"])!
@@ -137,6 +145,32 @@ Task { @MainActor in
     updateSession.invalidateAndCancel()
     updateDefaults.removePersistentDomain(forName: updateDefaultsName)
 
+    for invalidRelease in ["invalid JSON", "{}", #"{"tag_name":"invalid"}"#,
+                           #"{"tag_name":"v999.0.0","assets":[]}"#] {
+        let defaultsName = "KeyDropUpdaterRetryTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: defaultsName)!
+        let session = URLSession(configuration: configuration)
+        let retryUpdater = Updater(session: session, defaults: defaults)
+        UpdateFixtureProtocol.releaseResponse = invalidRelease
+        retryUpdater.checkForUpdates(force: true)
+        let failed = await waitUntil {
+            if case .failed = retryUpdater.state { return true }
+            return false
+        }
+        check(failed && defaults.double(forKey: "updateLastCheckAt") == 0,
+              "无效 HTTP 200 发布响应不启动 12 小时检查冷却")
+        UpdateFixtureProtocol.releaseResponse = UpdateFixtureProtocol.successfulRelease
+        retryUpdater.checkForUpdates()
+        let retried = await waitUntil {
+            if case .available = retryUpdater.state { return true }
+            return false
+        }
+        check(retried && defaults.double(forKey: "updateLastCheckAt") > 0,
+              "发布响应恢复后自动重试成功，再记录检查冷却")
+        session.invalidateAndCancel()
+        defaults.removePersistentDomain(forName: defaultsName)
+    }
+
     var terminalMaster: Int32 = -1
     var terminalSlave: Int32 = -1
     let originalInput = dup(STDIN_FILENO)
@@ -154,6 +188,16 @@ Task { @MainActor in
                               "--no-cc", "--no-grok", "--no-dsh", "--cpa"])
         check(result == 1 && (try? String(contentsOf: configURL, encoding: .utf8)) == originalConfig,
               "CLI 按 Esc 取消导入并保留目标配置")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            terminal.write(Data([0x0d, 0x1b]))
+        }
+        let firstPick = ModelPicker.pick(from: ["first-model"], title: "首轮选择")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            terminal.write(Data([0x0d]))
+        }
+        let secondPick = ModelPicker.pick(from: ["second-model"], title: "下一轮选择")
+        check(firstPick == ["first-model"] && secondPick == ["second-model"],
+              "完成选择后清空残留按键，下一轮不会被旧 Esc 误取消")
         dup2(originalInput, STDIN_FILENO)
         close(terminalMaster)
         close(terminalSlave)

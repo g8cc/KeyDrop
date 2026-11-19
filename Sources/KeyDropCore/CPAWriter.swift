@@ -272,8 +272,7 @@ public final class CPAWriter {
         guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
             // 条目无 models 段:在条目末尾(去尾随空行)追加 models: 头 + 带标记的模型项。
             // 不能走 mergeAggregatedModels —— 它只写 name+alias,会漏掉 image: true
-            let entryIndent = String(lines[entryRange.lowerBound].prefix(while: { $0 == " " || $0 == "\t" }))
-            let propIndent = entryIndent + "  "
+            let propIndent = String(repeating: " ", count: mappingIndent(in: lines, itemRange: entryRange))
             var insertAt = entryRange.upperBound
             while insertAt > entryRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
             let block = [
@@ -437,10 +436,11 @@ public final class CPAWriter {
     /// 多 key 写聚合条目到 `openai-compatibility:` 段下,同 baseURL 的 key 归一组,
     /// 共享一组 models 列表。CPA 加载后会在此组内轮询所有 api-key。
     /// 模型列表自动探测:探测失败返回空 models,条目可后续刷新。
-    /// 返回 (提示消息, 探测到的模型) —— 模型回传给历史条目,
+    /// 返回 (提示消息, 探测到的模型, 实际接受的凭据) —— 与账本保持同源,
     /// UI 才能按真实家族路由「打开应用」(曾因 models 空被误标 claude)
     func addMulti(baseURL: String, keys: [String], proxy: String? = nil,
-                  pickModels: (([String]) -> [String])? = nil) throws -> (String, [String]) {
+                  fallbackModels: [String]? = nil,
+                  pickModels: (([String]) -> [String])? = nil) throws -> (String, [String], [String]) {
         let operation = ImportOperation.current
         var seen = Set<String>()
         let uniqueKeys = keys.compactMap { raw -> String? in
@@ -522,13 +522,14 @@ public final class CPAWriter {
         }
         let writeMsg = try withCPASync {
             try operation?.advance(to: .writing)
-            return try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels,
+            // 旧账本重放可提供已保存的模型，不依赖探测是否触发选择器；已有精选仍优先。
+            return try addMultiLocked(baseURL: baseURL, keys: accepted, models: fallbackModels ?? probedModels,
                                picked: pickedModels, proxy: proxy)
         }
         // 回传条目最终 models(已有精选时=精选原列表,新建/补写时=探测结果):
         // 历史/UI/常驻入口与配置文件同源,绝不把探测全量当精选
         let suffix = rejected > 0 ? ",自动剔除 \(rejected) 个失效 key" : ""
-        return ("已写入 CPA 配置(\(configPath))\(suffix);\(writeMsg.0);CPA 运行时会自动热重载", writeMsg.1)
+        return ("已写入 CPA 配置(\(configPath))\(suffix);\(writeMsg.0);CPA 运行时会自动热重载", writeMsg.1, accepted)
     }
 
     /// 只读预判:该 baseURL 的聚合条目是否已有模型列表。有则本次粘贴不再弹勾选
@@ -634,15 +635,14 @@ public final class CPAWriter {
                   let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entryRange)
             else { return "" }
             var replaced = false
-            for i in entriesRange {
-                let t = lines[i].trimmingCharacters(in: .whitespaces)
-                guard t.hasPrefix("- api-key:") else { continue }
-                let scalar = String(t.dropFirst("- api-key:".count)).trimmingCharacters(in: .whitespaces)
-                if decodeYAMLScalar(scalar) == oldKey {
-                    let indent = String(lines[i].prefix(while: { $0 == " " || $0 == "\t" }))
-                    lines[i] = "\(indent)- api-key: \(yamlScalar(newKey))"
-                    replaced = true
-                }
+            for credential in credentialItems(in: lines, range: entriesRange) where credential.key == oldKey {
+                guard let property = mappingProperty("api-key", in: lines, itemRange: credential.item.range) else { continue }
+                let i = property.line
+                guard let propertyStart = lines[i].range(of: "api-key:")?.lowerBound else { continue }
+                // 原始 prefix 同时包含列表 dash 和其后的空格;压成 "- " 会改变映射缩进。
+                let prefix = String(lines[i][..<propertyStart])
+                lines[i] = "\(prefix)api-key: \(yamlScalar(newKey))"
+                replaced = true
             }
             guard replaced else { return "" }
             try atomicWrite(lines.joined(separator: "\n"))
@@ -663,23 +663,18 @@ public final class CPAWriter {
         return trimmed
     }
 
-    /// 读取条目首行 `- name:` 的值(stripYAMLValue 剥引号),缺失返回 nil
+    /// 读取条目的 name 属性,不依赖 YAML 字段顺序。
     private func entryName(in lines: [String], entryRange: Range<Int>) -> String? {
-        let first = lines[entryRange.lowerBound].trimmingCharacters(in: .whitespaces)
-        guard first.hasPrefix("- name:") else { return nil }
-        let v = stripYAMLValue(String(first.dropFirst("- name:".count))).trimmingCharacters(in: .whitespaces)
-        return v.isEmpty ? nil : v
+        guard let value = mappingProperty("name", in: lines, itemRange: entryRange)?.value,
+              !value.isEmpty else { return nil }
+        return value
     }
 
     /// 读取条目的 `base-url:` 值(剥引号),缺失返回 nil
     private func entryBaseURL(in lines: [String], entryRange: Range<Int>) -> String? {
-        for i in entryRange {
-            let t = lines[i].trimmingCharacters(in: .whitespaces)
-            guard t.hasPrefix("base-url:") else { continue }
-            let v = stripYAMLValue(String(t.dropFirst("base-url:".count))).trimmingCharacters(in: .whitespaces)
-            return v.isEmpty ? nil : v
-        }
-        return nil
+        guard let value = mappingProperty("base-url", in: lines, itemRange: entryRange)?.value,
+              !value.isEmpty else { return nil }
+        return value
     }
 
     /// 上游端点身份归一化:scheme/host 小写,保留端口与 path,去尾斜杠。
@@ -756,54 +751,12 @@ public final class CPAWriter {
     /// 按 trimmed 前缀一刀切会把条目截断在 models 首项,合并时误判「无已有 models」重复写入
     private func findAggregatedEntry(in lines: [String], providerName: String) -> Range<Int>? {
         guard let section = findNamedSection(in: lines, key: "openai-compatibility:") else { return nil }
-        var idx = section.start
-        while idx < section.end {
-            let l = lines[idx]
-            let t = l.drop(while: { $0 == " " || $0 == "\t" })
-            if t.hasPrefix("- name:") || t == "-" || t.hasPrefix("- ") {
-                let entryStart = idx
-                let indent = String(l.prefix(l.count - t.count))
-                let nameOnLine = t.hasPrefix("- name:")
-                    ? stripYAMLValue(String(t.dropFirst("- name:".count))).trimmingCharacters(in: .whitespaces)
-                    : nil
-                // 条目结束 = 下一个同缩进(或更浅)的 `- ` 行 / 反缩进到父级键;子序列深层项不算
-                var j = idx + 1
-                while j < section.end {
-                    let lj = lines[j]
-                    let tj = lj.drop(while: { $0 == " " || $0 == "\t" })
-                    if tj.isEmpty { j += 1; continue }
-                    let indj = String(lj.prefix(lj.count - tj.count))
-                    if tj.hasPrefix("- ") || tj == "-" {
-                        if indj.count <= indent.count { break }
-                    } else if indj.count < indent.count {
-                        break
-                    }
-                    j += 1
-                }
-                if nameOnLine == providerName {
-                    return entryStart..<j
-                }
-                idx = j
-            } else {
-                idx += 1
-            }
-        }
-        return nil
+        return aggregatedEntries(in: lines, section: section)
+            .first { entryName(in: lines, entryRange: $0.range) == providerName }?.range
     }
 
     private func stripYAMLValue(_ s: String) -> String {
-        let t = s.trimmingCharacters(in: .whitespaces)
-        if t.count >= 2 {
-            if t.hasPrefix("\"") && t.hasSuffix("\"") {
-                // 复用 decodeYAMLScalar 解转义:与写入端 yamlScalar("a\"b" → "a\"b")对称,
-                // 只剥引号不解会让含引号/反斜杠的模型名在去重时失配 → 重导入重复项
-                return decodeYAMLScalar(t)
-            }
-            if t.hasPrefix("'") && t.hasSuffix("'") {
-                return decodeYAMLScalar(t)
-            }
-        }
-        return t
+        decodeYAMLScalar(s)
     }
 
     // MARK: - aggregated write helpers
@@ -824,16 +777,8 @@ public final class CPAWriter {
         let keyRange = models.isEmpty ? range : (findAggregatedEntry(in: lines, providerName: providerName) ?? range)
 
         // 提取已有 keys
-        var existingKeys = Set<String>()
-        if let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: keyRange) {
-            for i in entriesRange {
-                let t = lines[i].trimmingCharacters(in: .whitespaces)
-                if t.hasPrefix("- api-key:") {
-                    let scalar = String(t.dropFirst("- api-key:".count)).trimmingCharacters(in: .whitespaces)
-                    existingKeys.insert(decodeYAMLScalar(scalar))
-                }
-            }
-        }
+        let existingKeys = Set(findAPIKeyEntriesSubrange(in: lines, entryRange: keyRange)
+            .map { credentialItems(in: lines, range: $0).map(\.key) } ?? [])
         let newKeys = keys.filter { !existingKeys.contains($0) }
         guard !newKeys.isEmpty else { return }
 
@@ -842,12 +787,10 @@ public final class CPAWriter {
             // 计算 entries 缩进:从第一条非空行推断(api-key-entries: 后紧跟空行时,
             // 首行 lowerBound 是空行,若据其取缩进会得到 "" → key 插到顶格损坏 YAML)
             let indent: String = {
-                for i in entriesRange {
-                    let l = lines[i]
-                    if l.trimmingCharacters(in: .whitespaces).isEmpty { continue }
-                    return String(l.prefix(while: { $0 == " " || $0 == "\t" }))
+                if let first = sequenceItems(in: lines, range: entriesRange).first {
+                    return String(lines[first.range.lowerBound].prefix(while: { $0 == " " || $0 == "\t" }))
                 }
-                return "      "
+                return String(repeating: " ", count: mappingIndent(in: lines, itemRange: keyRange) + 2)
             }()
             // 插入位置:最后一条非空 entry 之后(跳过尾随空行)
             var insertAt = entriesRange.upperBound
@@ -860,9 +803,8 @@ public final class CPAWriter {
             // 条目没有 api-key-entries: 段(用户手写的精简聚合条目,等着 KeyDrop 填 key):
             // 必须在条目末尾补建该段再插入。没有 else 分支时 keys 会被静默丢弃,
             // 却照常落盘并报告成功(账本记了 cpa tag,产物其实不存在)
-            let entryIndent = String(lines[keyRange.lowerBound].prefix(while: { $0 == " " || $0 == "\t" }))
-            let propIndent = entryIndent + "  "
-            let itemIndent = entryIndent + "    "
+            let propIndent = String(repeating: " ", count: mappingIndent(in: lines, itemRange: keyRange))
+            let itemIndent = propIndent + "  "
             var insertAt = keyRange.upperBound
             while insertAt > keyRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty {
                 insertAt -= 1
@@ -910,11 +852,7 @@ public final class CPAWriter {
             lines.insert(contentsOf: block, at: insertAt)
         } else {
             // 条目无 models 段:在条目末尾(去空行后)追加
-            let headerIndent: Int = {
-                let firstLine = lines[entryRange.lowerBound]
-                return firstLine.prefix(while: { $0 == " " || $0 == "\t" }).count
-            }()
-            let propIndent = String(repeating: " ", count: headerIndent + 2)
+            let propIndent = String(repeating: " ", count: mappingIndent(in: lines, itemRange: entryRange))
             var insertAt = entryRange.upperBound
             while insertAt > entryRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
             var block: [String] = ["\(propIndent)models:"]
@@ -942,16 +880,7 @@ public final class CPAWriter {
         var insertAt = section.end
         while insertAt > section.start + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
         // 缩进从现有条目推断
-        let existingIndent: String = {
-            for i in (section.start + 1)..<section.end {
-                let l = lines[i]
-                let t = l.drop(while: { $0 == " " || $0 == "\t" })
-                if t.hasPrefix("- name:") || t == "-" {
-                    return String(l.prefix(l.count - t.count))
-                }
-            }
-            return "  "
-        }()
+        let existingIndent = section.itemIndent ?? "  "
         lines.insert(contentsOf: aggregatedEntryLines(indent: existingIndent, name: providerName, baseURL: baseURL,
                                                       keys: keys, models: models, proxy: proxy), at: insertAt)
     }
@@ -1045,22 +974,15 @@ public final class CPAWriter {
                         guard let entryURL = entryBaseURL(in: lines, entryRange: entry.range),
                               normalizeUpstreamURL(entryURL) == upstream else { continue }
                     }
-                    guard let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entry.range),
-                          let hitLine = findAPIKeyLine(in: lines, range: entriesRange, keys: Array(targets)) else { continue }
-                    let t = lines[hitLine].trimmingCharacters(in: .whitespaces)
-                    let scalar = String(t.dropFirst("- api-key:".count)).trimmingCharacters(in: .whitespaces)
-                    let matchedKey = decodeYAMLScalar(scalar)
-                    // 删除后统计条目内「剩余真实 api-key 行」:只数 `- api-key:` 行,
-                    // 不能把空行/注释/别的字段算进来(否则删掉最后一把 key 会留下
-                    // 无子项的空 `api-key-entries:`,CPA 的 Go 解析器可能判 null 序列拒启)
-                    var remainingRealKeys = 0
-                    for i in entriesRange where i != hitLine {
-                        if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("- api-key:") { remainingRealKeys += 1 }
-                    }
-                    if remainingRealKeys == 0 {
-                        lines.removeSubrange(entry.range)   // 整条目移除,不留空头
+                    guard let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entry.range) else { continue }
+                    let credentials = credentialItems(in: lines, range: entriesRange)
+                    guard let hit = credentials.first(where: { targets.contains($0.key) }) else { continue }
+                    let matchedKey = hit.key
+                    if credentials.count == 1 {
+                        lines.removeSubrange(entry.range)
                     } else {
-                        lines.remove(at: hitLine)
+                        // key 的代理、头部等字段属于同一个子项,必须一起移除。
+                        lines.removeSubrange(hit.item.range)
                     }
                     removed.insert(matchedKey)
                     did = true
@@ -1080,43 +1002,23 @@ public final class CPAWriter {
         try remove(apiKeys: [apiKey])
     }
 
-    /// 在 openai-compatibility 段下枚举所有条目范围(每个 `- name:` 开头为一组)
+    /// 在 openai-compatibility 段下枚举所有条目范围。
     private func aggregatedEntries(in lines: [String], section: Section) -> [Item] {
-        var items: [Item] = []
-        var current: Range<Int>? = nil
-        for i in section.start..<section.end {
-            let l = lines[i]
-            let t = l.drop(while: { $0 == " " || $0 == "\t" })
-            let indent = String(l.prefix(l.count - t.count))
-            if (t.hasPrefix("- name:") || t == "-") && !indent.hasPrefix("    ") {
-                if let c = current { items.append(Item(range: c)) }
-                current = i..<(i + 1)
-            } else if current != nil {
-                current = current!.lowerBound..<(i + 1)
-            }
-        }
-        if let c = current { items.append(Item(range: c)) }
-        return items
+        splitItems(lines: lines, section: section)
     }
 
     /// 聚合条目范围内找 `api-key-entries:` 子段下的 `- api-key:` 行范围
     private func findAPIKeyEntriesSubrange(in lines: [String], entryRange: Range<Int>) -> Range<Int>? {
-        var entriesHeader: Int? = nil
-        for i in entryRange {
-            let t = lines[i].trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("api-key-entries:") {
-                entriesHeader = i
-                break
-            }
-        }
-        guard let header = entriesHeader else { return nil }
-        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
+        guard let property = mappingProperty("api-key-entries", in: lines, itemRange: entryRange) else { return nil }
+        let header = property.line
+        let headerIndent = mappingIndent(in: lines, itemRange: entryRange)
         var end = entryRange.upperBound
         for j in (header + 1)..<entryRange.upperBound {
-            let line = lines[j]
-            let curIndent = line.prefix(while: { $0 == " " || $0 == "\t" }).count
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty && curIndent <= headerIndent {
+            let trimmed = withoutYAMLComment(lines[j])
+            if trimmed.isEmpty { continue }
+            let indent = lines[j].prefix(while: { $0 == " " || $0 == "\t" }).count
+            // YAML 允许序列项与属性头同缩进(api-key-entries: 后接同列的 -)。
+            if indent < headerIndent || (indent == headerIndent && !isSequenceLine(trimmed)) {
                 end = j
                 break
             }
@@ -1124,42 +1026,31 @@ public final class CPAWriter {
         return (header + 1)..<end
     }
 
-    private func findAPIKeyLine(in lines: [String], range: Range<Int>, keys: [String]) -> Int? {
-        for i in range {
-            let t = lines[i].trimmingCharacters(in: .whitespaces)
-            guard t.hasPrefix("- api-key:") else { continue }
-            let scalar = String(t.dropFirst("- api-key:".count)).trimmingCharacters(in: .whitespaces)
-            let decoded = decodeYAMLScalar(scalar)
-            if keys.contains(decoded) { return i }
+    private func credentialItems(in lines: [String], range: Range<Int>) -> [(item: Item, key: String)] {
+        sequenceItems(in: lines, range: range).compactMap { item in
+            guard let key = mappingProperty("api-key", in: lines, itemRange: item.range)?.value else { return nil }
+            return (item, key)
         }
-        return nil
     }
 
     /// 找任意顶层命名段(如 `openai-compatibility:`),返回段范围
     private func findNamedSection(in lines: [String], key: String) -> Section? {
-        var start: Int? = nil
-        for (i, l) in lines.enumerated() {
-            if !l.hasPrefix(" ") && !l.hasPrefix("\t") && l.trimmingCharacters(in: .whitespaces) == key {
-                start = i
-                break
-            }
-        }
-        guard let s = start else { return nil }
+        guard let start = lines.indices.first(where: {
+            !lines[$0].hasPrefix(" ") && !lines[$0].hasPrefix("\t") && withoutYAMLComment(lines[$0]) == key
+        }) else { return nil }
         var end = lines.count
-        for i in (s + 1)..<lines.count {
-            let l = lines[i]
-            guard !l.isEmpty else { continue }
-            let t = l.trimmingCharacters(in: .whitespaces)
-            // 顶格注释行不是新段开头,跳过:否则段范围在这里被截断,
-            // 后续条目找不到导致重复建段、插入位置错乱
-            if t.hasPrefix("#") { continue }
-            let first = l.first!
-            if first != " " && first != "\t" {
+        for i in (start + 1)..<lines.count {
+            let trimmed = withoutYAMLComment(lines[i])
+            if trimmed.isEmpty { continue }
+            // 顶格序列仍属于本段;只有下一个顶层属性才结束该段。
+            if !lines[i].hasPrefix(" ") && !lines[i].hasPrefix("\t") && !isSequenceLine(trimmed) {
                 end = i
                 break
             }
         }
-        return Section(start: s, end: end, itemIndent: nil)
+        let first = sequenceItems(in: lines, range: (start + 1)..<end).first
+        let indent = first.map { String(lines[$0.range.lowerBound].prefix(while: { $0 == " " || $0 == "\t" })) }
+        return Section(start: start, end: end, itemIndent: indent)
     }
 
     // MARK: - internals
@@ -1171,36 +1062,7 @@ public final class CPAWriter {
     }
 
     private func findSection(in lines: [String]) -> Section? {
-        var start: Int? = nil
-        for (i, l) in lines.enumerated() {
-            if !l.hasPrefix(" ") && !l.hasPrefix("\t") && l.trimmingCharacters(in: .whitespaces) == "claude-api-key:" {
-                start = i
-                break
-            }
-        }
-        guard let s = start else { return nil }
-        var end = lines.count
-        for i in (s + 1)..<lines.count {
-            let l = lines[i]
-            guard !l.isEmpty else { continue }
-            // 同 findNamedSection:顶格注释不算段边界
-            if l.trimmingCharacters(in: .whitespaces).hasPrefix("#") { continue }
-            let first = l.first!
-            if first != " " && first != "\t" {
-                end = i
-                break
-            }
-        }
-        var itemIndent: String? = nil
-        for i in (s + 1)..<end {
-            let l = lines[i]
-            let t = l.drop(while: { $0 == " " || $0 == "\t" })
-            if t.hasPrefix("- ") || t == "-" {
-                itemIndent = String(l.prefix(l.count - t.count))
-                break
-            }
-        }
-        return Section(start: s, end: end, itemIndent: itemIndent)
+        findNamedSection(in: lines, key: "claude-api-key:")
     }
 
     private struct Item {
@@ -1208,48 +1070,90 @@ public final class CPAWriter {
     }
 
     private func splitItems(lines: [String], section: Section) -> [Item] {
-        var items: [Item] = []
-        var current: Range<Int>? = nil
-        for i in (section.start + 1)..<section.end {
-            let l = lines[i]
-            let t = l.drop(while: { $0 == " " || $0 == "\t" })
-            let indent = String(l.prefix(l.count - t.count))
-            if (t.hasPrefix("- ") || t == "-"), let base = section.itemIndent, indent == base {
-                if let c = current { items.append(Item(range: c)) }
-                current = i..<(i + 1)
-            } else if current != nil {
-                current = current!.lowerBound..<(i + 1)
-            }
+        sequenceItems(in: lines, range: (section.start + 1)..<section.end)
+    }
+
+    private func isSequenceLine(_ trimmed: String) -> Bool {
+        trimmed == "-" || trimmed.hasPrefix("- ") || trimmed.hasPrefix("-\t")
+    }
+
+    /// 按真实序列缩进划分完整子项,不依赖第一个属性名或固定空格数。
+    private func sequenceItems(in lines: [String], range: Range<Int>) -> [Item] {
+        let starts = range.filter { isSequenceLine(withoutYAMLComment(lines[$0])) }
+        guard let indent = starts.map({ lines[$0].prefix(while: { $0 == " " || $0 == "\t" }).count }).min() else { return [] }
+        let siblings = starts.filter { lines[$0].prefix(while: { $0 == " " || $0 == "\t" }).count == indent }
+        return siblings.enumerated().map { index, start in
+            Item(range: start..<(index + 1 < siblings.count ? siblings[index + 1] : range.upperBound))
         }
-        if let c = current { items.append(Item(range: c)) }
-        return items
+    }
+
+    private func mappingIndent(in lines: [String], itemRange: Range<Int>) -> Int {
+        let line = lines[itemRange.lowerBound]
+        let trimmed = withoutYAMLComment(line)
+        if isSequenceLine(trimmed), trimmed != "-" {
+            let afterDash = line.drop(while: { $0 == " " || $0 == "\t" }).dropFirst()
+            return line.count - afterDash.drop(while: { $0 == " " || $0 == "\t" }).count
+        }
+        for i in itemRange.dropFirst() where !withoutYAMLComment(lines[i]).isEmpty {
+            return lines[i].prefix(while: { $0 == " " || $0 == "\t" }).count
+        }
+        return line.prefix(while: { $0 == " " || $0 == "\t" }).count + 2
+    }
+
+    /// 只读序列项的直接属性,不会把 headers 等嵌套映射的同名属性当成凭据。
+    private func mappingProperty(_ key: String, in lines: [String], itemRange: Range<Int>) -> (line: Int, value: String)? {
+        let indent = mappingIndent(in: lines, itemRange: itemRange)
+        for i in itemRange {
+            var text = withoutYAMLComment(lines[i])
+            if i == itemRange.lowerBound, isSequenceLine(text) {
+                text = String(text.dropFirst()).trimmingCharacters(in: .whitespaces)
+            } else if lines[i].prefix(while: { $0 == " " || $0 == "\t" }).count != indent {
+                continue
+            }
+            guard text.hasPrefix(key + ":") else { continue }
+            let value = String(text.dropFirst(key.count + 1))
+            return (i, decodeYAMLScalar(value))
+        }
+        return nil
+    }
+
+    /// 注释只能从引号外、空白后的 # 开始;URL fragment 和带 # 的凭据保留。
+    private func withoutYAMLComment(_ line: String) -> String {
+        var quote: Character? = nil
+        var escaped = false
+        var previous: Character? = nil
+        for index in line.indices {
+            let character = line[index]
+            if escaped {
+                escaped = false
+            } else if quote == "\"" && character == "\\" {
+                escaped = true
+            } else if let current = quote {
+                if character == current {
+                    let next = line.index(after: index)
+                    if current == "'", next < line.endIndex, line[next] == "'" {
+                        escaped = true
+                    } else {
+                        quote = nil
+                    }
+                }
+            } else if (character == "\"" || character == "'"),
+                      previous == nil || previous!.isWhitespace || previous == ":" {
+                quote = character
+            } else if character == "#", previous == nil || previous!.isWhitespace {
+                return String(line[..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            previous = character
+        }
+        return line.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func itemContainsAPIKey(_ item: Item, in lines: [String], key: String) -> Bool {
-        for index in item.range {
-            var line = lines[index].trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.hasPrefix("-") {
-                line = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
-            }
-            guard line.hasPrefix("api-key:") else { continue }
-            let scalar = String(line.dropFirst("api-key:".count))
-                .trimmingCharacters(in: .whitespaces)
-            if decodeYAMLScalar(scalar) == key { return true }
-        }
-        return false
+        mappingProperty("api-key", in: lines, itemRange: item.range)?.value == key
     }
 
     private func decodeYAMLScalar(_ value: String) -> String {
-        guard value.count >= 2 else { return value }
-        if value.hasPrefix("\"") && value.hasSuffix("\"") {
-            let inner = String(value.dropFirst().dropLast())
-            return inner.replacingOccurrences(of: "\\\"", with: "\"")
-                .replacingOccurrences(of: "\\\\", with: "\\")
-        }
-        if value.hasPrefix("'") && value.hasSuffix("'") {
-            return String(value.dropFirst().dropLast()).replacingOccurrences(of: "''", with: "'")
-        }
-        return value
+        DSHWriter.decodeYAMLScalarValue(withoutYAMLComment(value))
     }
 
     private func yamlScalar(_ s: String) -> String {
@@ -1390,7 +1294,10 @@ public final class CPAWriter {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = ["-c",
             "import sys,yaml\n"
+            + "visited = set()\n"
             + "def walk(n):\n"
+            + "    if id(n) in visited: return\n"
+            + "    visited.add(id(n))\n"
             + "    if isinstance(n, yaml.MappingNode):\n"
             + "        seen = set()\n"
             + "        for k, v in n.value:\n"
@@ -1403,7 +1310,7 @@ public final class CPAWriter {
             + "    elif isinstance(n, yaml.SequenceNode):\n"
             + "        for v in n.value: walk(v)\n"
             + "try:\n"
-            + "    yaml.compose(sys.stdin)\n"
+            + "    walk(yaml.compose(sys.stdin))\n"
             + "except Exception as e:\n"
             + "    print(e, file=sys.stderr)\n"
             + "    sys.exit(1)"]

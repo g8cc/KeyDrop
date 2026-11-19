@@ -112,8 +112,7 @@ final class Updater {
                 self.setState(.failed("检查更新失败: HTTP \(http.statusCode)"))
                 return
             }
-            // 服务端已应答:记录检查时间,避免重复轮询(失败路径不写,留给下次启动重试)
-            self.defaults.set(Date().timeIntervalSince1970, forKey: self.lastCheckKey)
+            // 成功解析可用发布后才记录检查时间；HTTP 200 也可能是错误页或损坏响应。
             do {
                 let info = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let tag = info?["tag_name"] as? String else {
@@ -127,6 +126,7 @@ final class Updater {
                 }
                 let local = Self.currentVersion()
                 if Version.compare(version, local) != .orderedDescending {
+                    self.defaults.set(Date().timeIntervalSince1970, forKey: self.lastCheckKey)
                     self.setState(.upToDate)
                     return
                 }
@@ -144,6 +144,7 @@ final class Updater {
                 } else {
                     self.pendingDigest = nil
                 }
+                self.defaults.set(Date().timeIntervalSince1970, forKey: self.lastCheckKey)
                 self.setState(.available(version: version, url: url, notes: notes))
             } catch {
                 self.setState(.failed("检查更新失败: 解析错误"))

@@ -19,8 +19,12 @@ enum ModelPicker {
     }
 
     private static func runLoop(models: [String], preselected: Set<String>) -> [String]? {
+        pending.removeAll()
         guard let old = setRawMode() else { return nil }
-        defer { restoreMode(old) }
+        defer {
+            pending.removeAll()
+            restoreMode(old)
+        }
 
         var query = ""
         var index = 0

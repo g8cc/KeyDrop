@@ -6,6 +6,179 @@ import KeyDropCore
 /// replayArtifacts 按各条目的 targets 重放 —— 账本是源,产物是派生。
 enum LedgerTransferTests {
     static func run(_ h: Harness) {
+        h.runSuite("LedgerTransfer.feed retains omitted model selections") { t in
+            let env = try TestEnv("ledger-feed-omitted-models")
+            defer { env.cleanup() }
+            let core = Core()
+            var record = HistoryTests.entry("feed-omitted-models", ts: 1)
+            record.models = ["grok-fixture"]
+            record.model = "grok-fixture"
+            record.targets = ["grok"]
+            record.grokConfigPath = env.dir + "/grok.toml"
+            _ = try GrokBuildWriter(configPath: record.grokConfigPath)
+                .add(baseURL: record.url!, key: record.key!, models: record.models!)
+            try core.history.append(record)
+            var remote = record
+            remote.models = nil
+            remote.model = nil
+            remote.name = "New name"
+            remote.updatedAt = Date().timeIntervalSince1970 + 100
+            let payload = LedgerPayload(schemaVersion: 1, exportedAt: remote.updatedAt!, appVersion: "legacy",
+                                        entries: [remote], switches: nil)
+            let encrypted = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "fixture-passphrase")
+            _ = try core.importLedger(encrypted, passphrase: "fixture-passphrase", mode: .feed)
+            let saved = core.history.find(idPrefix: record.id)
+            t.equal(saved?.models, record.models, "未提供模型字段时账本保留实际同步的模型列表")
+            t.equal(saved?.model, record.model, "默认模型与配置一致")
+            _ = try core.delete(entryIDPrefix: record.id)
+            t.expect(!env.read("grok.toml").contains(record.key!), "删除仍可清理所绑定的模型")
+        }
+        h.runSuite("LedgerTransfer.pool credentials affect sync fingerprint") { t in
+            var first = HistoryTests.entry("pool-fingerprint", ts: 1)
+            first.key = nil
+            first.format = "cpa-multikey"
+            first.raw = "https://pool.example/v1\nsk-pool-original-fixture1111"
+            var second = first
+            second.raw = "https://pool.example/v1\nsk-pool-rotated-fixture2222"
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "只有多 key 凭据改变也必须触发自动同步")
+            first.poolKeys = ["sk-pool-original-fixture1111"]
+            second = first
+            second.poolKeys = ["sk-pool-rotated-fixture2222"]
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "显式凭据池变化参与同步指纹")
+        }
+        h.runSuite("LedgerTransfer.replay does not resurrect rejected pool keys") { t in
+            let env = try TestEnv("ledger-replay-filtered-pool")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .selectiveAuth)
+            let base = "http://127.0.0.1:\(server.port)/v1"
+            let accepted = "sk-accepted-pool-fixture1111"
+            let rejected = "sk-invalid-pool-fixture2222"
+            env.write("cpa-config.yaml", "port: 8317\n")
+            Prefs.shared.cpaResident = false
+            let core = Core()
+            let outcome = try core.add(raw: "\(base)\n\(accepted)\n\(rejected)", ccOverride: false,
+                                       grokOverride: false, cpaOverride: true, dshOverride: false,
+                                       models: ["gpt-5.6-sol"], force: true)
+            t.expect(!env.read("cpa-config.yaml").contains(rejected), "导入时已剔除认证失败的 key")
+            _ = core.replayArtifacts()
+            t.expect(!env.read("cpa-config.yaml").contains(rejected), "产物重放不得复活已剔除的 key")
+            t.equal(core.history.find(idPrefix: outcome.entry.id)?.keyMasked, "1 个 key", "账本数量与实际接受的 key 一致")
+            let saved = core.history.find(idPrefix: outcome.entry.id)!
+            t.equal(saved.poolKeys, [accepted], "实际接受的凭据持久化到独立字段")
+            let decoded = try JSONDecoder().decode(HistoryEntry.self, from: JSONEncoder().encode(saved))
+            t.equal(decoded.poolKeys, [accepted], "导出后仍保留筛选结果")
+            var legacy = saved
+            legacy.poolKeys = nil
+            try core.history.updateAll([legacy])
+            _ = core.replayArtifacts()
+            t.expect(!env.read("cpa-config.yaml").contains(rejected), "旧账本重放重新认证，不复活被拒绝的 key")
+            t.equal(core.history.find(idPrefix: saved.id)?.poolKeys, [accepted], "旧账本重放后保存认证结果")
+            let requests = server.countRequests("/v1/models")
+            _ = core.replayArtifacts()
+            t.equal(server.countRequests("/v1/models"), requests, "已有接受列表的重放不重复探测")
+        }
+        h.runSuite("LedgerTransfer.legacy replay keeps curated models") { t in
+            for (index, mode) in [MockHTTPServer.Mode.selectiveAuth, .chat524].enumerated() {
+                let env = try TestEnv("ledger-replay-legacy-models-\(index)")
+                defer { env.cleanup() }
+                let server = try MockHTTPServer(mode: mode)
+                let base = "http://127.0.0.1:\(server.port)/v1"
+                env.write("cpa-config.yaml", "port: 8317\n")
+                Prefs.shared.cpaResident = false
+                let core = Core()
+                var record = HistoryTests.entry("legacy-curated-models-\(index)", ts: 1)
+                record.format = "cpa-multikey"
+                record.url = base
+                record.raw = "\(base)\nsk-curated-pool-fixture1111\nsk-curated-pool-fixture2222"
+                record.key = nil
+                record.models = ["fixture-curated-model"]
+                record.model = record.models?.first
+                record.targets = ["cpa"]
+                try core.history.append(record)
+                _ = core.replayArtifacts()
+                t.contains(env.read("cpa-config.yaml"), "fixture-curated-model",
+                           "单模型探测或暂时网关故障时仍恢复账本中的模型选择")
+                t.equal(core.history.find(idPrefix: record.id)?.poolKeys?.count, 2,
+                        "非认证错误不丢弃原有凭据池")
+            }
+        }
+        h.runSuite("LedgerTransfer.feed filters legacy key pools") { t in
+            for scenario in 0..<3 {
+                let hasModels = scenario == 0
+                let env = try TestEnv("ledger-feed-legacy-pool-\(scenario)")
+                defer { env.cleanup() }
+                let server = try MockHTTPServer(mode: scenario == 2 ? .openAI : .selectiveAuth)
+                let base = "http://127.0.0.1:\(server.port)/v1"
+                let oldKey = "sk-previous-pool-fixture1111"
+                let accepted = "sk-accepted-pool-fixture2222"
+                let rejected = "sk-invalid-pool-fixture3333"
+                let expectedKeys = scenario == 2 ? [accepted, "sk-second-pool-fixture4444"] : [accepted]
+                env.write("cpa-config.yaml", "port: 8317\n")
+                Prefs.shared.cpaResident = false
+                let core = Core()
+                var record = HistoryTests.entry("feed-legacy-pool-\(scenario)", ts: 1)
+                record.format = "cpa-multikey"
+                record.url = base
+                record.raw = "\(base)\n\(oldKey)"
+                record.key = nil
+                record.poolKeys = [oldKey]
+                record.models = hasModels ? ["fixture-selected-model"] : nil
+                record.model = record.models?.first
+                record.targets = ["cpa"]
+                record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+                let modelYAML = hasModels ? "    models:\n      - name: fixture-selected-model\n        alias: \"\"\n" : ""
+                env.write("cpa-config.yaml", """
+                port: 8317
+                openai-compatibility:
+                  - name: pool
+                    base-url: \(base)
+                    api-key-entries:
+                      - api-key: \(oldKey)
+                """ + "\n" + modelYAML)
+                try core.history.append(record)
+                var remote = record
+                remote.poolKeys = nil
+                remote.raw = ([base] + (scenario == 2 ? expectedKeys : [rejected, accepted])).joined(separator: "\n")
+                remote.updatedAt = Date().timeIntervalSince1970 + 100
+                let payload = LedgerPayload(schemaVersion: 1, exportedAt: remote.updatedAt!,
+                                            appVersion: "legacy", entries: [remote], switches: nil)
+                let encrypted = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "fixture-passphrase")
+                _ = try core.importLedger(encrypted, passphrase: "fixture-passphrase", mode: .feed)
+                let config = env.read("cpa-config.yaml")
+                t.expect(config.contains(accepted) && !config.contains(rejected) && !config.contains(oldKey),
+                         "旧版 feed 筛除无效凭据并删除已轮换的旧 key")
+                let saved = core.history.find(idPrefix: record.id)!
+                t.equal(saved.poolKeys, expectedKeys, "旧版 feed 保存已接受的凭据池")
+                t.equal(core.extractKey(saved), accepted, "重测从已接受凭据池取 key，跳过 raw 中的首个失效 key")
+                t.equal(saved.keyMasked, "\(expectedKeys.count) 个 key", "同步后的显示数量与实际凭据池一致")
+                t.expect(!(saved.models ?? []).isEmpty && (saved.models ?? []).allSatisfy { config.contains($0) },
+                         "既有选择或本次探测到的模型与账本一致")
+            }
+        }
+        h.runSuite("LedgerTransfer.compaction clears persisted pool credentials") { t in
+            let env = try TestEnv("ledger-compact-pool")
+            defer { env.cleanup() }
+            let core = Core()
+            var deleted = HistoryTests.entry("deleted-pool", ts: 1)
+            deleted.key = nil
+            deleted.raw = "archived"
+            deleted.format = "cpa-multikey"
+            deleted.poolKeys = ["sk-deleted-pool-fixture1111"]
+            deleted.status = "deleted"
+            deleted.deletedAt = Date().timeIntervalSince1970 - 40 * 24 * 3600
+            try core.history.append(deleted)
+            var active = deleted
+            active.id = "active-pool"
+            active.status = "active"
+            active.deletedAt = nil
+            try core.history.append(active)
+            _ = core.compactLedger()
+            let saved = HistoryStore().find(idPrefix: deleted.id)!
+            t.expect(saved.poolKeys == nil && core.extractKey(saved) == nil, "审计桩清除凭据池，不留下可恢复 key")
+            t.equal(HistoryStore().find(idPrefix: active.id)?.poolKeys, active.poolKeys, "活跃凭据池保持完整")
+        }
         h.runSuite("LedgerTransfer.CPA deletion stays within provider") { t in
             let env = try TestEnv("ledger-delete-shared-cpa-key")
             defer { env.cleanup() }
@@ -115,6 +288,7 @@ enum LedgerTransferTests {
             record.format = "cpa-multikey"
             record.url = "https://pool.example/v1"
             record.raw = "\(record.url!)\n\(oldKey)\n\(retainedKey)"
+            record.poolKeys = [oldKey, retainedKey]
             record.key = nil
             record.models = ["old-model"]
             record.targets = ["cpa"]
@@ -135,6 +309,7 @@ enum LedgerTransferTests {
             var remote = record
             remote.url = "https://pool.example/v1/"
             remote.raw = "\(remote.url!)\n\(retainedKey)\n\(newKey)"
+            remote.poolKeys = [retainedKey, newKey]
             remote.models = ["new-model"]
             remote.updatedAt = Date().timeIntervalSince1970 + 100
             let payload = LedgerPayload(schemaVersion: 1, exportedAt: remote.updatedAt!, appVersion: "test",
@@ -188,6 +363,7 @@ enum LedgerTransferTests {
             record.format = "cpa-multikey"
             record.key = nil
             record.raw = "https://pool.example/v1\nsk-replay-pool-fixture1111\nsk-replay-pool-fixture2222"
+            record.poolKeys = ["sk-replay-pool-fixture1111", "sk-replay-pool-fixture2222"]
             record.url = "https://pool.example/v1"
             record.model = "pool-model"
             record.models = nil

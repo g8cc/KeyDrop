@@ -13,6 +13,47 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.rejects stale pool probe results") { t in
+            let env = try TestEnv("hist-stale-pool-probe")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            var tested = entry("stale-pool-probe", ts: 1)
+            tested.key = nil
+            tested.format = "cpa-multikey"
+            tested.targets = ["cpa"]
+            tested.model = "pool-model"
+            tested.raw = "https://pool.example/v1\nsk-original-pool1111\nsk-rotated-pool2222"
+            tested.poolKeys = ["sk-original-pool1111"]
+            tested.healthAt = 10
+            try store.append(tested)
+            let cli = HistoryStore()
+            guard var current = cli.find(idPrefix: tested.id) else { return t.expect(false, "fixture entry") }
+            current.poolKeys = ["sk-rotated-pool2222"]
+            try cli.update(current)
+            tested.health = "dead"
+            tested.modelProbeLog = ["pool-model": [ProbePoint(t: 20, ms: nil, ok: false)]]
+            try store.mergeHealth([tested], at: 20)
+            let saved = HistoryStore().find(idPrefix: tested.id)
+            t.equal(saved?.raw, tested.raw, "池轮换时 raw 保持不变")
+            t.equal(saved?.poolKeys, current.poolKeys, "旧探测不能恢复之前的凭据池")
+            t.equal(saved?.health, "ok", "显式凭据池变化后拒绝旧探测结果")
+            t.equal(saved?.healthAt, 10, "不写入旧配置的探测时间")
+            t.expect(saved?.probeLog == nil && saved?.modelProbeLog == nil, "不添加旧池的探测点")
+            current.health = "quota"
+            try store.mergeHealth([current], at: 30)
+            let latest = HistoryStore().find(idPrefix: tested.id)
+            t.equal(latest?.health, "quota", "当前池的探测可以正常合并")
+            t.equal(latest?.healthAt, 30, "当前池的探测时间可以前进")
+            let encoded = try JSONEncoder().encode(current)
+            t.equal(try JSONDecoder().decode(HistoryEntry.self, from: encoded).poolKeys,
+                    current.poolKeys, "新字段序列化往返保留凭据池")
+            var legacy = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+            legacy.removeValue(forKey: "poolKeys")
+            let oldData = try JSONSerialization.data(withJSONObject: legacy)
+            let decoded = try JSONDecoder().decode(HistoryEntry.self, from: oldData)
+            t.expect(decoded.poolKeys == nil, "旧账本缺少字段时按 nil 兼容")
+            t.equal(decoded.raw, current.raw, "旧账本保留恢复凭据用的原文")
+        }
         h.runSuite("History.lock failure prevents writes") { t in
             let env = try TestEnv("hist-lock-refusal")
             defer { env.cleanup() }

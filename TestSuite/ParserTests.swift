@@ -53,6 +53,28 @@ enum ParserTests {
             setenv("KEYDROP_LLM_ENDPOINT", "http://127.0.0.1:\(reconstructing.port)/v1", 1)
             let recovered = try Parser.parseWithFallback("密钥被换行拆开\nsk-\nfixture\nsource\n111111111")
             t.equal(recovered.key, "sk-fixturesource111111111", "LLM 仍可还原原文中被空白分隔的凭据")
+            let formattedSources = [
+                "API Key:\nsk-\nfixture\nsource\n111111111",
+                "API Key\nsk-\nfixture\nsource\n111111111",
+                "API Key:\r\nsk-\r\nfixture\t source\r\n111111111",
+                "API Key:\nsk-，fixture；source：111111111",
+                "API Key:\nsk-\nfixture\nsource\n111111111\nPlease copy this key",
+                "API Key:\nsk-\nfixture\n[source]\n111111111"
+            ]
+            for source in formattedSources {
+                let recovered = try Parser.parseWithFallback(source)
+                t.equal(recovered.key, "sk-fixturesource111111111", "英文标签及说明不应阻止恢复排版分隔的凭据")
+            }
+            for tail in ["-tail", "_tail", ".tail", "/tail", "+tail", "=tail", "9"] {
+                let source = "API Key:\nsk-\nfixture\nsource\n111111111" + tail
+                do {
+                    _ = try Parser.parseWithFallback(source)
+                    t.expect(false, "不能把仍有令牌字符的密钥前缀作为完整凭据: \(tail)")
+                } catch {
+                    t.expect(true, "恢复换行凭据也必须核对完整后缀")
+                }
+            }
+
         }
         h.runSuite("Parser.short prefixed key") { t in
             let key = "sk-123456"
