@@ -52,20 +52,42 @@ public enum LLMParser {
         var inSection = false
         for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let l = String(line)
-            let trimmed = l.trimmingCharacters(in: .whitespaces)
+            let trimmed = withoutYAMLComment(l).trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
             if !l.hasPrefix(" ") && !l.hasPrefix("\t") {
                 if trimmed == "api-keys:" {
                     inSection = true
                     continue
                 }
-                if inSection { break }
+                if inSection, !trimmed.hasPrefix("- ") { break }
             }
             if inSection, trimmed.hasPrefix("- ") {
-                let key = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                let scalar = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                let key = DSHWriter.decodeYAMLScalarValue(scalar)
                 if !key.isEmpty { return key }
             }
         }
         return ""
+    }
+
+    private static func withoutYAMLComment(_ line: String) -> String {
+        var quote: Character?
+        var escaped = false
+        var previous: Character?
+        for index in line.indices {
+            let character = line[index]
+            defer { previous = character }
+            if escaped { escaped = false; continue }
+            if character == "\\", quote == "\"" { escaped = true; continue }
+            if let current = quote {
+                if character == current { quote = nil }
+            } else if character == "\"" || character == "'" {
+                quote = character
+            } else if character == "#", previous == nil || previous?.isWhitespace == true {
+                return String(line[..<index])
+            }
+        }
+        return line
     }
 
     private static let systemPrompt = """
@@ -115,10 +137,10 @@ public enum LLMParser {
               let msg = first["message"] as? [String: Any],
               let content = msg["content"] as? String
         else { return nil }
-        return validate(content: content)
+        return validate(content: content, source: raw)
     }
 
-    private static func validate(content: String) -> LLMResult? {
+    private static func validate(content: String, source raw: String) -> LLMResult? {
         guard let start = content.firstIndex(of: "{"),
               let end = content.lastIndex(of: "}"),
               start < end
@@ -142,6 +164,19 @@ public enum LLMParser {
             }
         }
         guard let k = key else { return nil }
+        let source = Parser.stripPasteNoise(Parser.normalizeFullWidth(raw))
+        let separators = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+            .subtracting(CharacterSet(charactersIn: "-_./+="))
+        let compactSource = String(source.unicodeScalars.filter { !separators.contains($0) })
+        // 子串匹配会把完整 key 的截断前缀当作来源证据。核对 token 边界，
+        // 同时保留规则解码和空白拆分凭据的恢复能力。
+        let keyPattern = "(?<![A-Za-z0-9_./+=-])" + NSRegularExpression.escapedPattern(for: k)
+            + "(?![A-Za-z0-9_./+=-])"
+        guard Parser.extractAllKeys(source).contains(k)
+                || source.range(of: keyPattern, options: .regularExpression) != nil
+                || compactSource.range(of: keyPattern, options: .regularExpression) != nil else {
+            return nil
+        }
 
         var url: String? = nil
         if let u = rawURL, !u.isEmpty {

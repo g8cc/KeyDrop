@@ -3,6 +3,57 @@ import KeyDropCore
 
 enum ParserTests {
     static func run(_ h: Harness) {
+        h.runSuite("Parser.LLM 客户端 YAML 凭据") { t in
+            let previous = ProcessInfo.processInfo.environment["KEYDROP_LLM_KEY"]
+            setenv("KEYDROP_LLM_KEY", "", 1)
+            defer {
+                if let previous { setenv("KEYDROP_LLM_KEY", previous, 1) } else { unsetenv("KEYDROP_LLM_KEY") }
+            }
+            let fixtures: [(String, String)] = [
+                ("api-keys:\n  - sk-plain\n", "sk-plain"),
+                ("api-keys:\n  - \"sk-double\"\n", "sk-double"),
+                ("api-keys:\n  - 'sk-single'\n", "sk-single"),
+                ("api-keys: # client credentials\n  # first entry\n  - \"sk-hash#value\" # label\n", "sk-hash#value"),
+                ("api-keys:\n- sk-plain#value # label\nport: 8317\n", "sk-plain#value"),
+                ("api-keys:\n  - 'sk-single''quote' # label\n", "sk-single'quote")
+            ]
+            for (yaml, expected) in fixtures {
+                t.equal(LLMParser.clientKey(fromConfigText: yaml), expected, "按 YAML 标量读取客户端凭据")
+            }
+        }
+        h.runSuite("Parser.LLM 凭据核对") { t in
+            let variables = ["KEYDROP_LLM_PARSE", "KEYDROP_LLM_ENDPOINT", "KEYDROP_LLM_KEY"]
+            let previous = variables.map { ProcessInfo.processInfo.environment[$0] }
+            defer {
+                for (name, value) in zip(variables, previous) {
+                    if let value { setenv(name, value, 1) } else { unsetenv(name) }
+                }
+            }
+            let response = #"{"choices":[{"message":{"content":"{\"url\":\"https://fixture.example.com/v1\",\"key\":\"sk-invented111111111111\"}"}}]}"#
+            let server = try MockHTTPServer(chatResponse: response)
+            setenv("KEYDROP_LLM_PARSE", "1", 1)
+            setenv("KEYDROP_LLM_ENDPOINT", "http://127.0.0.1:\(server.port)/v1", 1)
+            setenv("KEYDROP_LLM_KEY", "sk-fixture-parser-client", 1)
+            let key = "sk-source11111111111111"
+            let parsed = try Parser.parseWithFallback("https://fixture.example.com/v1\n\(key)")
+            t.equal(parsed.key, key, "缺少可选名称不应覆盖已识别的凭据")
+            t.equal(server.countRequests("/v1/chat/completions"), 0, "规则成功的普通粘贴不请求 LLM")
+            do {
+                _ = try Parser.parseWithFallback("这段说明里没有任何凭据")
+                t.expect(false, "拒绝原文不存在的 LLM 凭据")
+            } catch {
+                t.expect(true, "拒绝原文不存在的 LLM 凭据")
+            }
+            let beforePartial = server.countRequests("/v1/chat/completions")
+            let partial = try Parser.parseWithFallback("https://fixture.example.com/v1\nsk-invented111111111111-tail\nmodel: gpt-\(String(repeating: "x", count: 55))")
+            t.equal(partial.key, "sk-invented111111111111-tail", "LLM 不能用原文凭据的截断前缀覆盖完整 key")
+            t.equal(server.countRequests("/v1/chat/completions"), beforePartial + 1, "疑似模型解析错误仍请求 LLM 核对")
+            let reconstructedResponse = #"{"choices":[{"message":{"content":"{\"url\":\"https://fixture.example.com/v1\",\"key\":\"sk-fixturesource111111111\"}"}}]}"#
+            let reconstructing = try MockHTTPServer(chatResponse: reconstructedResponse)
+            setenv("KEYDROP_LLM_ENDPOINT", "http://127.0.0.1:\(reconstructing.port)/v1", 1)
+            let recovered = try Parser.parseWithFallback("密钥被换行拆开\nsk-\nfixture\nsource\n111111111")
+            t.equal(recovered.key, "sk-fixturesource111111111", "LLM 仍可还原原文中被空白分隔的凭据")
+        }
         h.runSuite("Parser.short prefixed key") { t in
             let key = "sk-123456"
             let parsed = try Parser.parse("https://short-key.example.com\n\n\(key)")

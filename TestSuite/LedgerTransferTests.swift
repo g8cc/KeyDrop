@@ -6,6 +6,229 @@ import KeyDropCore
 /// replayArtifacts 按各条目的 targets 重放 —— 账本是源,产物是派生。
 enum LedgerTransferTests {
     static func run(_ h: Harness) {
+        h.runSuite("LedgerTransfer.CPA deletion stays within provider") { t in
+            let env = try TestEnv("ledger-delete-shared-cpa-key")
+            defer { env.cleanup() }
+            let core = Core()
+            env.write("cpa-config.yaml", """
+            port: 8317
+            claude-api-key:
+              - api-key: sk-shared-fixture1111
+                base-url: https://a.example/v1
+              - api-key: sk-shared-fixture1111
+                base-url: https://b.example/v1
+            openai-compatibility:
+              - name: a
+                base-url: https://a.example/v1
+                api-key-entries:
+                  - api-key: sk-shared-fixture1111
+              - name: b
+                base-url: https://b.example/v1
+                api-key-entries:
+                  - api-key: sk-shared-fixture1111
+            """)
+            var record = HistoryTests.entry("delete-shared-cpa-key", ts: 1)
+            record.url = "https://a.example/v1/"
+            record.key = "sk-shared-fixture1111"
+            record.targets = ["cpa"]
+            record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+            try core.history.append(record)
+            _ = try core.delete(entryIDPrefix: record.id)
+            let config = env.read("cpa-config.yaml")
+            t.expect(!config.contains("https://a.example/v1"), "清理目标地址的所有配置副本")
+            t.equal(config.components(separatedBy: "https://b.example/v1").count - 1, 2, "保留相同 key 在其他地址的配置")
+            t.equal(config.components(separatedBy: "sk-shared-fixture1111").count - 1, 2, "其他 provider 凭据不被误删")
+        }
+        h.runSuite("LedgerTransfer.feed retries CPA credential updates") { t in
+            let env = try TestEnv("ledger-feed-cpa-retry")
+            defer { env.cleanup() }
+            let core = Core()
+            var record = HistoryTests.entry("feed-cpa-only", ts: 1)
+            record.targets = ["cpa"]
+            record.key = "sk-feed-old-fixture1111"
+            record.models = ["old-model"]
+            record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              - name: x.com
+                base-url: https://x.com/v1
+                api-key-entries:
+                  - api-key: sk-feed-old-fixture1111
+                models:
+                  - name: old-model
+                    alias: ""
+            """)
+            try core.history.append(record)
+            let previousConfig = env.read("cpa-config.yaml")
+            var remote = record
+            remote.key = "sk-feed-new-fixture2222"
+            remote.models = ["new-model"]
+            remote.updatedAt = Date().timeIntervalSince1970 + 100
+            remote.targets = [] // This target belongs to the receiving machine.
+            let payload = LedgerPayload(schemaVersion: 1, exportedAt: remote.updatedAt!, appVersion: "test",
+                                        entries: [remote], switches: nil)
+            let encrypted = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "passphrase-fixture")
+            try FileManager.default.removeItem(atPath: record.cpaConfigPath!)
+            try FileManager.default.createDirectory(atPath: record.cpaConfigPath!, withIntermediateDirectories: false)
+            do {
+                _ = try core.importLedger(encrypted, passphrase: "passphrase-fixture", mode: .feed)
+                t.expect(false, "配置更新失败时同步必须返回失败")
+            } catch {
+                t.expect(true, "同步报告配置不可写")
+            }
+            t.equal(core.history.find(idPrefix: record.id)?.key, record.key, "失败时保留可重试的本机凭据")
+            try FileManager.default.removeItem(atPath: record.cpaConfigPath!)
+            env.write("cpa-config.yaml", previousConfig)
+            _ = try core.importLedger(encrypted, passphrase: "passphrase-fixture", mode: .feed)
+            let config = env.read("cpa-config.yaml")
+            t.expect(!config.contains(record.key!) && config.contains(remote.key!), "CPA 独立目标更新 key 并清理旧 key")
+            t.expect(config.contains("new-model") && !config.contains("old-model"), "同步目标模型与远端一致")
+            t.equal(core.history.find(idPrefix: record.id)?.key, remote.key, "重试成功后保存新凭据")
+        }
+        h.runSuite("LedgerTransfer.replay saves bindings without DSH") { t in
+            let env = try TestEnv("ledger-replay-no-dsh")
+            defer { env.cleanup() }
+            try CCSwitchWriterTests.createSchema(env)
+            setenv("DSH_HOME", env.dir + "/absent-dsh", 1)
+            defer { setenv("DSH_HOME", env.dir, 1) }
+            let core = Core()
+            var record = HistoryTests.entry("replay-without-dsh", ts: 1)
+            record.models = ["deepseek-test"]
+            record.targets = ["ccswitch-opencode", "dsh"]
+            try core.history.append(record)
+            let report = core.replayArtifacts().joined(separator: "\n")
+            t.contains(report, "DSH: 本机未安装", "报告跳过未安装的 DSH")
+            t.expect(core.history.find(idPrefix: record.id)?.ccProviderID != nil, "保存本轮已创建的 cc-switch 绑定")
+            let again = core.replayArtifacts().joined(separator: "\n")
+            t.contains(again, "cc-switch: 本机已有", "重试使用已保存的产物绑定")
+        }
+
+        h.runSuite("LedgerTransfer.feed preserves CPA key pools") { t in
+            let env = try TestEnv("ledger-feed-cpa-key-pool")
+            defer { env.cleanup() }
+            let core = Core()
+            let oldKey = "sk-pool-old-fixture1111"
+            let retainedKey = "sk-pool-retained-fixture2222"
+            let newKey = "sk-pool-new-fixture3333"
+            var record = HistoryTests.entry("feed-cpa-key-pool", ts: 1)
+            record.format = "cpa-multikey"
+            record.url = "https://pool.example/v1"
+            record.raw = "\(record.url!)\n\(oldKey)\n\(retainedKey)"
+            record.key = nil
+            record.models = ["old-model"]
+            record.targets = ["cpa"]
+            record.cpaConfigPath = env.dir + "/cpa-config.yaml"
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              - name: pool
+                base-url: https://pool.example/v1
+                api-key-entries:
+                  - api-key: \(oldKey)
+                  - api-key: \(retainedKey)
+                models:
+                  - name: old-model
+                    alias: ""
+            """)
+            try core.history.append(record)
+            var remote = record
+            remote.url = "https://pool.example/v1/"
+            remote.raw = "\(remote.url!)\n\(retainedKey)\n\(newKey)"
+            remote.models = ["new-model"]
+            remote.updatedAt = Date().timeIntervalSince1970 + 100
+            let payload = LedgerPayload(schemaVersion: 1, exportedAt: remote.updatedAt!, appVersion: "test",
+                                        entries: [remote], switches: nil)
+            let encrypted = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "pool-passphrase")
+            for _ in 0..<2 {
+                _ = try core.importLedger(encrypted, passphrase: "pool-passphrase", mode: .feed)
+            }
+            let config = env.read("cpa-config.yaml")
+            t.expect(!config.contains(oldKey), "删除多 key 池中已移除的凭据")
+            t.equal(config.components(separatedBy: retainedKey).count - 1, 1, "等价地址保留已有 key，重复同步不重复追加")
+            t.equal(config.components(separatedBy: newKey).count - 1, 1, "补入新 key，重复同步不重复追加")
+            t.expect(config.contains("new-model") && !config.contains("old-model"), "多 key 池同步新模型")
+            t.equal(core.history.find(idPrefix: record.id)?.raw, remote.raw, "成功后保存可恢复完整 key 池的源数据")
+        }
+
+        h.runSuite("LedgerTransfer.feed keeps Grok equivalent endpoints") { t in
+            let env = try TestEnv("ledger-feed-grok-equivalent-url")
+            defer { env.cleanup() }
+            let core = Core()
+            var record = HistoryTests.entry("feed-grok-equivalent-url", ts: 1)
+            record.url = "https://grok.example/v1"
+            record.models = ["grok-fixture"]
+            record.targets = ["grok"]
+            record.grokConfigPath = env.dir + "/grok.toml"
+            _ = try GrokBuildWriter(configPath: record.grokConfigPath)
+                .add(baseURL: record.url!, key: record.key!, models: record.models!)
+            try core.history.append(record)
+            var remote = record
+            remote.url = record.url! + "/"
+            remote.models = nil
+            remote.model = "grok-fixture"
+            remote.targets = []
+            remote.updatedAt = Date().timeIntervalSince1970 + 100
+            let payload = LedgerPayload(schemaVersion: 1, exportedAt: remote.updatedAt!, appVersion: "test",
+                                        entries: [remote], switches: nil)
+            let encrypted = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "grok-passphrase")
+            for _ in 0..<2 {
+                _ = try core.importLedger(encrypted, passphrase: "grok-passphrase", mode: .feed)
+            }
+            let config = env.read("grok.toml")
+            t.equal(config.components(separatedBy: "[model.").count - 1, 1, "地址仅尾斜杠变化不误删刚更新的模型表")
+            t.contains(config, record.key!, "远端单 model 字段仍能更新本机 Grok 绑定")
+        }
+
+        h.runSuite("LedgerTransfer.replay restores CPA key pools") { t in
+            let env = try TestEnv("ledger-replay-cpa-key-pool")
+            defer { env.cleanup() }
+            let core = Core()
+            var record = HistoryTests.entry("replay-cpa-key-pool", ts: 1)
+            record.format = "cpa-multikey"
+            record.key = nil
+            record.raw = "https://pool.example/v1\nsk-replay-pool-fixture1111\nsk-replay-pool-fixture2222"
+            record.url = "https://pool.example/v1"
+            record.model = "pool-model"
+            record.models = nil
+            record.targets = ["cpa"]
+            record.cpaConfigPath = nil
+            env.write("cpa-config.yaml", "port: 8317\n")
+            try core.history.append(record)
+            let report = core.replayArtifacts().joined(separator: "\n")
+            let config = env.read("cpa-config.yaml")
+            t.contains(report, "CPA:", "多 key 账本参与产物重放")
+            t.contains(config, "sk-replay-pool-fixture1111", "重放第一把 key")
+            t.contains(config, "sk-replay-pool-fixture2222", "重放第二把 key")
+            t.contains(config, "pool-model", "兼容单 model 的旧账本")
+            t.equal(core.history.find(idPrefix: record.id)?.cpaConfigPath, env.dir + "/cpa-config.yaml", "重放成功保存本机 CPA 绑定")
+        }
+
+        h.runSuite("LedgerTransfer.Grok key rotation cleans old credentials") { t in
+            for migrate in [false, true] {
+                let env = try TestEnv("ledger-grok-rotation-\(migrate)")
+                defer { env.cleanup() }
+                try CCSwitchWriterTests.createSchema(env)
+                let server = try MockHTTPServer()
+                let core = Core()
+                let base = "http://127.0.0.1:\(server.port)/v1"
+                let original = try core.add(raw: "\(base)\nsk-grok-old-fixture1111", ccOverride: false,
+                                            grokOverride: true, cpaOverride: false, dshOverride: false,
+                                            models: ["grok-4.6"], force: true)
+                _ = try core.editEntry(entryIDPrefix: original.entry.id,
+                                       models: migrate ? ["deepseek-test"] : nil,
+                                       key: "sk-grok-new-fixture2222", verify: false)
+                let config = env.read("grok-config.toml")
+                t.expect(!config.contains("sk-grok-old-fixture1111"), "换 key 时清理旧 Grok 凭据")
+                let saved = core.history.find(idPrefix: original.entry.id)
+                t.equal(saved?.key, "sk-grok-new-fixture2222", "账本保存已验证的新凭据")
+                if migrate {
+                    t.expect(saved?.targets.contains("grok") == false && !config.contains("[model."), "迁移后清理旧 Grok 模型")
+                } else {
+                    t.equal(config.components(separatedBy: "[model.").count - 1, 1, "原地轮换不生成重复模型表")
+                }
+            }
+        }
         h.runSuite("LedgerTransfer.加解密回环") { t in
             let payload = LedgerPayload(
                 schemaVersion: LedgerCrypto.currentSchemaVersion,

@@ -1795,17 +1795,28 @@ public final class Core {
                     continue
                 }
                 if remoteTS > localTS {
-                    // 产物同步失败绝不能静默:账本已记新 key 而 CPA 池还轮询旧 key 时,
-                    // 旧 key 会成为无账本指针的永久残留凭据。至少留痕
-                    do {
-                        if let oldPid = local.ccProviderID, let oldKey = local.key, !oldKey.isEmpty,
-                           let newKey = e.key, !newKey.isEmpty, oldKey != newKey,
-                           let cfg = prefs.resolvedCPAConfig() {
-                            let msg = try CPAWriter(configPath: cfg).rotateKey(baseURL: local.url ?? e.url ?? "", oldKey: oldKey, newKey: newKey)
-                            if !msg.isEmpty { AppLog.info("feed 同步 CPA key 轮换: \(msg)") }
+                    // 先同步本机已认领的产物。失败时保留旧账本，后续拉取可重试。
+                    let incomingModels = e.models ?? e.model.map { [$0] }
+                        ?? local.models ?? local.model.map { [$0] } ?? []
+                    if local.targets.contains("cpa") {
+                        guard let oldKeys = extractAllKeys(for: local), !oldKeys.isEmpty, let oldURL = local.url,
+                              let newKeys = extractAllKeys(for: e), !newKeys.isEmpty, let newURL = e.url,
+                              let cfg = local.cpaConfigPath ?? prefs.resolvedCPAConfig() else {
+                            throw ParseError.io("同步 CPA 缺少地址、凭据或配置路径，已保留本机记录")
                         }
-                    } catch {
-                        AppLog.error("feed 同步 CPA key 轮换失败(\(e.id.prefix(8))): \(error.localizedDescription)")
+                        let writer = CPAWriter(configPath: cfg)
+                        for key in newKeys {
+                            _ = try writer.addAggregated(baseURL: newURL, key: key, models: incomingModels)
+                        }
+                        if !incomingModels.isEmpty {
+                            _ = try writer.updateAggregatedModels(baseURL: newURL, models: incomingModels)
+                        }
+                        let sameUpstream = writer.normalizeUpstreamURL(oldURL) == writer.normalizeUpstreamURL(newURL)
+                        let incomingKeys = Set(newKeys)
+                        let staleKeys = oldKeys.filter { !sameUpstream || !incomingKeys.contains($0) }
+                        if !staleKeys.isEmpty {
+                            _ = try writer.remove(apiKeys: staleKeys, baseURL: oldURL)
+                        }
                     }
                     if let pid = local.ccProviderID {
                         let oldApp = local.targets.first(where: { $0.hasPrefix("ccswitch-") })
@@ -1813,34 +1824,29 @@ public final class Core {
                         var p = ParsedKey()
                         p.url = e.url
                         p.key = e.key
-                        p.model = e.models?.first
+                        p.model = incomingModels.first
                         p.name = e.name
-                        do {
-                            try cc.syncModelsAfterRefresh(p, providerID: pid, appType: oldApp,
-                                                          models: e.models ?? local.models ?? [],
-                                                          proxy: proxyForHealth())
-                        } catch {
-                            AppLog.error("feed 同步 cc 行更新失败(\(pid.prefix(8))): \(error.localizedDescription)")
-                        }
+                        try cc.syncModelsAfterRefresh(p, providerID: pid, appType: oldApp,
+                                                      models: incomingModels,
+                                                      proxy: proxyForHealth())
                     }
-                    if e.targets.contains("dsh"), let dk = e.key, !dk.isEmpty, let dURL = e.url {
+                    if local.targets.contains("dsh"), let dk = e.key, !dk.isEmpty, let dURL = e.url {
                         if DSHWriter.installed() {
-                            do {
-                                try DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: e.models ?? [])
-                            } catch {
-                                AppLog.error("feed 同步 DSH 写入失败(\(e.id.prefix(8))): \(error.localizedDescription)")
-                            }
+                            _ = try DSHWriter.add(providerID: e.id, key: dk, url: dURL, models: incomingModels)
                         } else {
                             AppLog.info("feed 同步: 本机未安装 DSH,跳过(\(e.id.prefix(8)))")
                         }
                     }
-                    if e.targets.contains("grok"), let gp = local.grokConfigPath,
+                    if local.targets.contains("grok"), let gp = local.grokConfigPath,
                        let gk = e.key, let gURL = e.url {
-                        do {
-                            try GrokBuildWriter(configPath: gp).sync(baseURL: gURL, key: gk,
-                                                                      models: e.models ?? [], removing: [])
-                        } catch {
-                            AppLog.error("feed 同步 Grok 写入失败(\(e.id.prefix(8))): \(error.localizedDescription)")
+                        let writer = GrokBuildWriter(configPath: gp)
+                        let previousModels = local.models ?? local.model.map { [$0] } ?? []
+                        _ = try writer.sync(baseURL: gURL, key: gk, models: incomingModels,
+                                            removing: previousModels,
+                                            staleKeys: local.key.flatMap { $0 != gk ? [$0] : nil } ?? [])
+                        if let oldURL = local.url, writer.normalizeURL(oldURL) != writer.normalizeURL(gURL),
+                           let oldKey = local.key {
+                            _ = try writer.remove(baseURL: oldURL, key: oldKey, models: previousModels)
                         }
                     }
                     var merged = e
@@ -1910,8 +1916,9 @@ public final class Core {
         var replayed = 0
         let px = proxyForHealth()
         for var e in history.snapshot() where e.status == "active" {
-            guard let url = e.url, let key = e.key, !key.isEmpty,
-                  let models = e.models, !models.isEmpty, !e.targets.isEmpty else { continue }
+            let models = e.models ?? e.model.map { [$0] } ?? []
+            guard let url = e.url, let keys = extractAllKeys(for: e), let key = keys.first, !key.isEmpty,
+                  !models.isEmpty, !e.targets.isEmpty else { continue }
             var entryLines: [String] = []
             var ccRebuilt = false
             // cc-switch
@@ -1967,8 +1974,11 @@ public final class Core {
             if e.targets.contains("cpa") {
                 if let cfg = prefs.resolvedCPAConfig() {
                     do {
-                        let msg = try CPAWriter(configPath: cfg)
-                            .addAggregated(baseURL: url, key: key, models: models)
+                        let writer = CPAWriter(configPath: cfg)
+                        var msg = ""
+                        for credential in keys {
+                            msg = try writer.addAggregated(baseURL: url, key: credential, models: models)
+                        }
                         e.cpaConfigPath = cfg
                         entryLines.append("CPA: \(msg)")
                         replayed += 1
@@ -1991,16 +2001,16 @@ public final class Core {
             }
             // dsh(未装 DSH 的机器曾凭空创建 ~/.dsh 并落明文凭据,审计 2026-11-13)
             if e.targets.contains("dsh") {
-                guard DSHWriter.installed() else {
+                if !DSHWriter.installed() {
                     entryLines.append("– DSH: 本机未安装,跳过")
-                    continue
-                }
-                do {
-                    _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
-                    entryLines.append("DSH: 已重放")
-                    replayed += 1
-                } catch {
-                    entryLines.append("⚠ DSH: \(error.localizedDescription)")
+                } else {
+                    do {
+                        _ = try DSHWriter.add(providerID: e.id, key: key, url: url, models: models)
+                        entryLines.append("DSH: 已重放")
+                        replayed += 1
+                    } catch {
+                        entryLines.append("⚠ DSH: \(error.localizedDescription)")
+                    }
                 }
             }
             guard !entryLines.isEmpty else { continue }
@@ -2733,7 +2743,7 @@ public final class Core {
         // 通过完整探测(与导入同口径),失败则整体拒绝 —— 不允许把没验证过的凭据
         // 写进任何产物。通过后本函数内所有验证与同步一律改用新 key。
         var effectiveKey = key
-        var previousKey = key
+        let previousKey = key
         var keyRotated = false
         if let newKey, !newKey.isEmpty, newKey != key {
             let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth(), styleHint: entry.apiStyle)
@@ -2855,7 +2865,7 @@ public final class Core {
                 let writer = GrokBuildWriter(configPath: entry.grokConfigPath)
                 // 换 key(站方轮换)必须传旧 key:removeModelSections 按 model+key 寻址,
                 // 不传则旧 key 的模型表永久残留并在 upsert 时制造 #尾号 重复表
-                let staleGrokKeys = (entry.key != nil && entry.key != effectiveKey) ? [entry.key!] : []
+                let staleGrokKeys = keyRotated ? [previousKey] : []
                 let msg = try writer.sync(
                     baseURL: url,
                     key: effectiveKey,
@@ -2885,7 +2895,7 @@ public final class Core {
                 if let path = entry.grokConfigPath {
                     do {
                         _ = try GrokBuildWriter(configPath: path).remove(
-                            baseURL: url, key: effectiveKey,
+                            baseURL: url, key: previousKey,
                             models: previousModels
                         )
                         entry.targets.removeAll { $0 == "grok" }
@@ -3161,7 +3171,7 @@ public final class Core {
             }
             // 旧配置路径漂移守卫:先从旧路径回收 key,防双配置残留无账本指针的凭据
             if let oldCfg = entry.cpaConfigPath, oldCfg != cfg {
-                do { _ = try CPAWriter(configPath: oldCfg).remove(apiKeys: [key]) }
+                do { _ = try CPAWriter(configPath: oldCfg).remove(apiKeys: [key], baseURL: url) }
                 catch { AppLog.warn("CPA 同步: 旧配置(\(oldCfg))key 回收失败: \(error.localizedDescription)") }
             }
             let alreadyHadCPA = entry.targets.contains("cpa")
@@ -3171,7 +3181,7 @@ public final class Core {
             if !entry.targets.contains("cpa") { entry.targets.append("cpa") }
             do { try history.update(entry) }
             catch {
-                if !alreadyHadCPA { try? CPAWriter(configPath: cfg).remove(apiKeys: [key]) }
+                if !alreadyHadCPA { try? CPAWriter(configPath: cfg).remove(apiKeys: [key], baseURL: url) }
                 throw ParseError.io("CPA 已写入但账本保存失败: \(error.localizedDescription)")
             }
             return "CPA: \(msg)"
@@ -3240,7 +3250,7 @@ public final class Core {
             if let cfg = entry.cpaConfigPath,
                let keys = extractAllKeys(for: entry), !keys.isEmpty {
                 do {
-                    let msg = try CPAWriter(configPath: cfg).remove(apiKeys: keys)
+                    let msg = try CPAWriter(configPath: cfg).remove(apiKeys: keys, baseURL: entry.url)
                     lines.append("✓ CPA: \(msg)")
                     remaining.removeAll { $0 == "cpa" }
                 } catch {

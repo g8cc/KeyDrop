@@ -52,6 +52,13 @@ final class Updater {
     private var downloadGeneration = UUID()
     private let lastCheckKey = "updateLastCheckAt"
     private let promptedVersionKey = "updatePromptedVersion"
+    private let sessionOverride: URLSession?
+    private let defaults: UserDefaults
+
+    init(session: URLSession? = nil, defaults: UserDefaults = .standard) {
+        sessionOverride = session
+        self.defaults = defaults
+    }
 
     static func currentVersion() -> String { Version.currentVersion() }
 
@@ -71,12 +78,12 @@ final class Updater {
         }
         // 注意:不在发起请求前写 lastCheckKey。旧实现先写时间戳,
         // 网络瞬时失败也会进入 12h 冷却,用户从此收不到自动更新提示。
-        state = .checking
+        setState(.checking)
 
         var req = URLRequest(url: apiURL)
         req.timeoutInterval = 10
         req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
-        Self.urlSession(proxy: Prefs.shared.proxy).dataTask(with: req) { [weak self] data, resp, err in
+        (sessionOverride ?? Self.urlSession(proxy: Prefs.shared.proxy)).dataTask(with: req) { [weak self] data, resp, err in
             guard let self else { return }
             if let err {
                 self.setState(.failed("检查更新失败: \(err.localizedDescription)"))
@@ -162,45 +169,43 @@ final class Updater {
         }
         let generation = UUID()
         downloadGeneration = generation
-        state = .downloading(version: version, progress: 0)
+        setState(.downloading(version: version, progress: 0))
         var req = URLRequest(url: url)
         req.timeoutInterval = 300
         req.setValue("KeyDrop-Updater/\(Self.currentVersion())", forHTTPHeaderField: "User-Agent")
-        let task = Self.urlSession(proxy: Prefs.shared.proxy).downloadTask(with: req) { [weak self] fileURL, resp, err in
-            // URLSession 回调在后台线程:downloadTask/progressTimer 都是主线程对象,
-            // 在后台写它们与 Timer 的读取构成数据竞争(且 Timer.invalidate 非线程安全)。
-            // 统一 hop 回 main 再处理。
+        let task = (sessionOverride ?? Self.urlSession(proxy: Prefs.shared.proxy)).downloadTask(with: req) { [weak self] fileURL, resp, err in
+            // URLSession 的临时文件仅在完成回调期间有效，必须先接管文件再切主线程。
+            let download = Result<URL, Error> {
+                if let err { throw UpdateError.downloadFailed(err.localizedDescription) }
+                guard let fileURL, let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                    throw UpdateError.downloadFailed("HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
+                }
+                let maxBytes = 150_000_000
+                let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+                guard let size = attributes[.size] as? Int,
+                      size <= maxBytes, http.expectedContentLength <= maxBytes else {
+                    throw UpdateError.downloadFailed("更新包超过 150MB，已取消")
+                }
+                let retained = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("KeyDropDownload-\(UUID().uuidString).zip")
+                try FileManager.default.moveItem(at: fileURL, to: retained)
+                return retained
+            }
             DispatchQueue.main.async {
-                guard let self else { return }
-                guard self.downloadGeneration == generation else {
-                    if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
+                guard let self, self.downloadGeneration == generation else {
+                    if case .success(let file) = download { try? FileManager.default.removeItem(at: file) }
                     return
                 }
                 self.downloadTask = nil
-                if let err {
-                    self.setState(.failed("下载失败: \(err.localizedDescription)"))
-                    return
-                }
-                guard let fileURL, let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                    self.setState(.failed("下载失败: HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))
-                    return
-                }
-                // 大小防护:异常/恶意响应不应写满磁盘。两道拦截:
-                // ① 响应头声明的大小;② 落盘后实测(downloadTask 无法边下边限流,这里兜底)
-                let maxBytes = 150_000_000
-                if http.expectedContentLength > maxBytes {
-                    self.setState(.failed("更新包过大(\(http.expectedContentLength / 1_000_000)MB),已取消"))
-                    return
-                }
-                if let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-                   let size = attrs[.size] as? Int, size > maxBytes {
-                    self.setState(.failed("更新包过大(\(size / 1_000_000)MB),已取消"))
-                    return
-                }
                 self.progressTimer?.invalidate()
                 self.progressTimer = nil
-                self.pendingArchive = (url: fileURL, version: version)
-                self.setState(.ready(version: version))
+                switch download {
+                case .success(let file):
+                    self.pendingArchive = (url: file, version: version)
+                    self.setState(.ready(version: version))
+                case .failure(let error):
+                    self.setState(.failed(error.localizedDescription))
+                }
             }
         }
         downloadTask = task
@@ -227,6 +232,7 @@ final class Updater {
         // 用户以为崩了会强杀进程,正好卡在「已移走旧包」的中间态)。
         // 放后台执行,状态更新由 setState 自己 hop 回 main。
         let digest = pendingDigest
+        pendingArchive = nil
         setState(.installing)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.install(archive: a.url, version: a.version, expectedDigest: digest)
@@ -234,8 +240,13 @@ final class Updater {
     }
 
     func cancelDownload() {
+        switch state {
+        case .downloading, .ready: break
+        default: return
+        }
         downloadGeneration = UUID()
         progressTimer?.invalidate()
+        progressTimer = nil
         downloadTask?.cancel()
         downloadTask = nil
         if let archive = pendingArchive {
@@ -254,7 +265,7 @@ final class Updater {
             try fm.createDirectory(atPath: tmp, withIntermediateDirectories: true)
             // version 来自 GitHub tag,可能含 / 等路径字符 → 先净化再拼路径
             let zipPath = tmp + "/KeyDrop-\(Self.sanitizePathComponent(version)).zip"
-            try fm.copyItem(atPath: archive.path, toPath: zipPath)
+            try fm.moveItem(atPath: archive.path, toPath: zipPath)
 
             // 在任何解压落盘前校验归档条目。解压后再检查只能发现越界,
             // 无法撤销恶意条目已经覆盖的文件,也无法阻止 zip bomb 先撑满磁盘。
@@ -338,6 +349,7 @@ final class Updater {
             }
         } catch {
             // 任何失败都清掉临时目录,不泄漏下载的 zip 与解压内容
+            try? fm.removeItem(at: archive)
             try? fm.removeItem(atPath: tmp)
             setState(.failed(error.localizedDescription))
         }
@@ -606,11 +618,12 @@ final class Updater {
     }
 
     private func setState(_ s: State) {
-        DispatchQueue.main.async {
-            self.state = s
-            self.onStateChange?(s)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.setState(s) }
+            return
         }
+        state = s
+        onStateChange?(s)
     }
 
-    private let defaults = UserDefaults.standard
 }

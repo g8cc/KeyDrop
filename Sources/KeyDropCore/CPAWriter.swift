@@ -684,7 +684,7 @@ public final class CPAWriter {
 
     /// 上游端点身份归一化:scheme/host 小写,保留端口与 path,去尾斜杠。
     /// host+port 相同而 path 不同的两个 base-url 是不同上游,绝不视为同一端点
-    private func normalizeUpstreamURL(_ s: String) -> String {
+    func normalizeUpstreamURL(_ s: String) -> String {
         let trimmed = s.trimmingCharacters(in: .whitespaces)
         guard let u = URL(string: trimmed) ?? URL(string: "https://\(trimmed)"),
               let host = u.host, !host.isEmpty else {
@@ -981,22 +981,23 @@ public final class CPAWriter {
 
     /// 删除 keys:同时清理 `claude-api-key:` 平铺段和 `openai-compatibility:` 聚合段。
     /// 平铺段命中 → 删整条目;聚合段命中 → 删单个 api-key 子项,删空则整条目移除。
-    func remove(apiKeys: [String]) throws -> String {
+    func remove(apiKeys: [String], baseURL: String? = nil) throws -> String {
         // API 模式无本地文件:是否「存在」由服务端决定,PUT 会在缺失时报错
         guard configAvailable() else {
             return "CPA config 不存在,跳过"
         }
         return try withCPASync {
-            return try removeLocked(apiKeys: apiKeys)
+            return try removeLocked(apiKeys: apiKeys, baseURL: baseURL)
         }
     }
 
-    /// 文件模式下调用方必须已持有 configPath 的 flock;API 模式无需 flock
-    private func removeLocked(apiKeys: [String]) throws -> String {
+    /// 调用方必须持有配置文件或管理端点的写锁。
+    private func removeLocked(apiKeys: [String], baseURL: String?) throws -> String {
         let content = try readConfigText()
         var lines = content.components(separatedBy: "\n")
         let targets = Set(apiKeys)
         var removed = Set<String>()   // 至少删掉一处 occurrence 的目标 key
+        let upstream = baseURL.map(normalizeUpstreamURL)
 
         // 每轮删一个命中(平铺段优先),直到两个段都不再含任何目标 key。
         // 同一个 key 可能同时存在于 claude-api-key 与 openai-compatibility 两处,
@@ -1009,6 +1010,10 @@ public final class CPAWriter {
             if let section = findSection(in: lines) {
                 let items = splitItems(lines: lines, section: section)
                 for item in items {
+                    if let upstream {
+                        guard let itemURL = entryBaseURL(in: lines, entryRange: item.range),
+                              normalizeUpstreamURL(itemURL) == upstream else { continue }
+                    }
                     guard let k = targets.first(where: { itemContainsAPIKey(item, in: lines, key: $0) }) else { continue }
                     var newSectionLines: [String] = [lines[section.start]]
                     var emitted = Set<Int>()
@@ -1036,6 +1041,10 @@ public final class CPAWriter {
             if let section = findNamedSection(in: lines, key: "openai-compatibility:") {
                 let entries = aggregatedEntries(in: lines, section: section)
                 for entry in entries {
+                    if let upstream {
+                        guard let entryURL = entryBaseURL(in: lines, entryRange: entry.range),
+                              normalizeUpstreamURL(entryURL) == upstream else { continue }
+                    }
                     guard let entriesRange = findAPIKeyEntriesSubrange(in: lines, entryRange: entry.range),
                           let hitLine = findAPIKeyLine(in: lines, range: entriesRange, keys: Array(targets)) else { continue }
                     let t = lines[hitLine].trimmingCharacters(in: .whitespaces)
@@ -1255,22 +1264,22 @@ public final class CPAWriter {
 
     // MARK: - 双轨 IO(API 模式 / 文件模式)
 
-    /// 文件模式才需要 flock 与本地 YAML 预检;API 模式下 CPA 服务端自带互斥与写入校验,
-    /// 且 KeyDrop 完全不触碰本地文件 —— flock 的锁文件也在 Documents 下,同样触发 TCC 弹窗
+    /// 所有模式都串行执行读改写，文件模式额外进行本地 YAML 预检。
     private func withCPASync<T>(_ body: () throws -> T) throws -> T {
-        if CPAAPI.apiMode { return try body() }
         return try withWriteLock {
-            try Self.validateYAML(path: configPath)
+            if !CPAAPI.apiMode { try Self.validateYAML(path: configPath) }
             return try body()
         }
     }
-    /// 写路径统一锁入口。API 模式不取本地文件锁:写入经 CPA 服务端 PUT 串行化,
-    /// KeyDrop 对 Documents 下的 config.yaml 系文件零触碰 —— 无条件 open
-    /// config.yaml.keydrop-lock 正是 API 模式下仍弹「文稿」授权的残余源头
-    /// (真实事故:2026-09-24,导入时 addAggregated 无条件取锁,重新编译使
-    /// TCC 授权作废后,这次 open 即触发弹窗)
-    private func withWriteLock<T>(_ body: () throws -> T) rethrows -> T {
-        if CPAAPI.apiMode { return try body() }
+    /// GET、内存修改和 PUT 共用一把跨进程锁。API 模式的锁放在 KeyDrop 目录，
+    /// 管理端点地址决定锁名，避免访问 CPA 配置目录触发文件授权。
+    private func withWriteLock<T>(_ body: () throws -> T) throws -> T {
+        if CPAAPI.apiMode {
+            let endpoint = try CPAAPI.baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let identity = SHA256.hash(data: Data(endpoint.utf8)).map { String(format: "%02x", $0) }.joined()
+            let home = ProcessInfo.processInfo.environment["KEYDROP_HOME"] ?? NSHomeDirectory() + "/.keydrop"
+            return try FileLock.withLock(home + "/locks/cpa-api-" + identity + ".lock", body)
+        }
         return try FileLock.withLock(FileLock.lockPath(for: configPath)) {
             try body()
         }

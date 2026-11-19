@@ -600,8 +600,6 @@ public final class HistoryStore {
                 // 否则条目凭空消失;脏条目(本次刚改)保持内存版,不回填文件旧版
                 !memIDs.contains(wItem.id) || (externalChanged && !dirtyIDs.contains(wItem.id))
             }
-            // 文件独有的 id 登记进 loadedIDs:后续 save 时若它再从文件消失,同样按「其他进程删除」处理
-            for e in items where !loadedIDs.contains(e.id) { loadedIDs.insert(e.id) }
             merged.sort { $0.ts > $1.ts }
         }
             // 合并可能带回文件独有的旧条目,重新执行上限(丢最旧)
@@ -794,11 +792,13 @@ public final class HistoryStore {
         try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
             refreshIfExternalChangeLocked()
             guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+            let previous = _items[i]
             var log = (_items[i].probeLog ?? []) + [ProbePoint(t: at, ms: ms, ok: ok, cpa: cpa)]
             if log.count > 30 { log = Array(log.suffix(30)) }
             _items[i].probeLog = log
             _items[i].updatedAt = Date().timeIntervalSince1970
-            try saveLockedNoFlock(dirtyIDs: [id])
+            do { try saveLockedNoFlock(dirtyIDs: [id]) }
+            catch { _items[i] = previous; throw error }
         }
     }
 
@@ -810,6 +810,7 @@ public final class HistoryStore {
         try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
             refreshIfExternalChangeLocked()
             guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
+            let previous = _items[i]
             var merged = _items[i].modelProbeLog ?? [:]
             for (m, pt) in points {
                 var arr = (merged[m] ?? []) + [pt]
@@ -818,7 +819,8 @@ public final class HistoryStore {
             }
             _items[i].modelProbeLog = merged
             _items[i].updatedAt = Date().timeIntervalSince1970
-            try saveLockedNoFlock(dirtyIDs: [id])
+            do { try saveLockedNoFlock(dirtyIDs: [id]) }
+            catch { _items[i] = previous; throw error }
         }
     }
 
@@ -827,12 +829,14 @@ public final class HistoryStore {
     public func updateAll(_ entries: [HistoryEntry]) throws {
         lock.lock()
         defer { lock.unlock() }
+        let previous = _items
         for e in entries {
             if let i = _items.firstIndex(where: { $0.id == e.id }) {
                 _items[i] = e
             }
         }
-        try saveLocked(dirtyIDs: Set(entries.map { $0.id }))
+        do { try saveLocked(dirtyIDs: Set(entries.map { $0.id })) }
+        catch { _items = previous; throw error }
     }
 
     public func find(idPrefix: String) -> HistoryEntry? {
@@ -890,12 +894,14 @@ public final class HistoryStore {
                 }
                 return  // 已有同 key 条目:不插入
             }
+            let previous = _items
             _items.insert(e, at: 0)
             // 与 append() 同走 applyCap:硬截 prefix(500) 会把尾部仍持有 cc-switch/CPA/Grok
             // 产物的 active 老条目直接丢掉,外部产物成孤儿(删不掉、对账不认领)
             _items = Self.applyCap(_items)
             // 内部直接用 NoFlock 版:外层已持 flock,再走 saveLocked 会二次 flock 自锁
-            try saveLockedNoFlock(dirtyIDs: [e.id])
+            do { try saveLockedNoFlock(dirtyIDs: [e.id]) }
+            catch { _items = previous; throw error }
         }
         return survivor
     }

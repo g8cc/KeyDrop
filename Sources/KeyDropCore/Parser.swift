@@ -108,7 +108,6 @@ public enum Parser {
         }
         let suspicious = (parsed.model?.count ?? 0) > 50
             || (parsed.model?.contains("http") == true)
-            || (parsed.name?.count ?? 0) < 3
         // 多 key 粘贴不做 LLM 改写:LLM 只会提取一把 key,还可能幻觉截断覆盖 parsed.key,
         // 批量导入也不该多等一次 LLM 往返(15s 超时)
         if suspicious, extractAllKeys(raw).count <= 1,

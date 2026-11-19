@@ -86,7 +86,7 @@ public final class GrokBuildWriter {
         }
     }
 
-    private func normalizeURL(_ value: String) -> String {
+    func normalizeURL(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
@@ -130,6 +130,7 @@ public final class GrokBuildWriter {
 
     private func decodeTomlString(_ value: String) -> String {
         let t = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count >= 2, t.first == "'", t.last == "'" { return String(t.dropFirst().dropLast()) }
         guard t.count >= 2, t.first == "\"", t.last == "\"" else { return t }
         let inner = String(t.dropFirst().dropLast())
         // 必须单遍扫描解码:链式 replacingOccurrences 会把「转义的反斜杠 + n」
@@ -152,8 +153,26 @@ public final class GrokBuildWriter {
         return out
     }
 
+    private func withoutComment(_ line: String) -> String {
+        var quote: Character?
+        var escaped = false
+        for index in line.indices {
+            let character = line[index]
+            if escaped { escaped = false; continue }
+            if quote == "\"", character == "\\" { escaped = true; continue }
+            if let delimiter = quote {
+                if character == delimiter { quote = nil }
+            } else if character == "\"" || character == "'" {
+                quote = character
+            } else if character == "#" {
+                return String(line[..<index]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return line.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func modelID(from line: String) -> String? {
-        let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let t = withoutComment(line)
         guard t.hasPrefix("[model."), t.hasSuffix("]") else { return nil }
         let raw = String(t.dropFirst("[model.".count).dropLast())
         guard !raw.isEmpty else { return nil }
@@ -178,14 +197,14 @@ public final class GrokBuildWriter {
             guard let id = modelID(from: lines[i]) else { i += 1; continue }
             var end = lines.count
             for j in (i + 1)..<lines.count {
-                let t = lines[j].trimmingCharacters(in: .whitespacesAndNewlines)
+                let t = withoutComment(lines[j])
                 if t.hasPrefix("[") && t.hasSuffix("]") { end = j; break }
             }
             var model = id
             var baseURL: String?
             var apiKey: String?
             for line in lines[(i + 1)..<end] {
-                let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                let t = withoutComment(line)
                 for field in ["model", "base_url", "api_key"] {
                     guard t.hasPrefix(field) else { continue }
                     let rest = t.dropFirst(field.count).trimmingCharacters(in: .whitespaces)

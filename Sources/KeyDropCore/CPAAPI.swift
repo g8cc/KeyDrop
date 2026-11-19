@@ -45,25 +45,27 @@ public enum CPAAPI {
     }()
 
     static var baseURL: URL {
-        let fallback = "http://127.0.0.1:8317"
-        let raw = Prefs.shared.cpaAPIBase ?? ""
-        let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let components = URLComponents(string: candidate.isEmpty ? fallback : candidate),
-              let scheme = components.scheme?.lowercased(),
-              (scheme == "http" || scheme == "https"),
-              components.host?.isEmpty == false,
-              components.user == nil,
-              components.password == nil,
-              components.fragment == nil,
-              let url = components.url else {
-            // 显式配置存在但解析失败:不能静默回落默认端口 —— 管理密钥会以 Bearer 头
-            // 发到用户没指定的地址。留痕让配置错误可被发现(仅未配置时才用 fallback)
-            if !candidate.isEmpty {
-                AppLog.error("CPAAPI: cpaAPIBase 配置非法(\(candidate.prefix(80))),回落 \(fallback)")
+        get throws {
+            let fallback = "http://127.0.0.1:8317"
+            let candidate = (Prefs.shared.cpaAPIBase ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard var components = URLComponents(string: candidate.isEmpty ? fallback : candidate),
+                  let scheme = components.scheme?.lowercased(),
+                  (scheme == "http" || scheme == "https"),
+                  components.host?.isEmpty == false,
+                  components.user == nil,
+                  components.password == nil,
+                  components.fragment == nil,
+                  components.port.map({ (1...65535).contains($0) }) ?? true else {
+                throw CPAAPIError.http(0, "管理 API 地址无效，请检查设置")
             }
-            return URL(string: fallback)!
+            components.scheme = scheme
+            components.host = components.host?.lowercased()
+            if (scheme == "http" && components.port == 80) || (scheme == "https" && components.port == 443) {
+                components.port = nil
+            }
+            guard let url = components.url else { throw CPAAPIError.http(0, "管理 API 地址无效，请检查设置") }
+            return url
         }
-        return url
     }
 
     /// 统一同步请求入口;返回 (状态码, 响应体)。
@@ -74,7 +76,7 @@ public enum CPAAPI {
         guard let key = Prefs.shared.cpaManagementKey, !key.isEmpty else {
             throw CPAAPIError.noKey
         }
-        guard var comp = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false),
+        guard var comp = URLComponents(url: try baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false),
               let scheme = comp.scheme?.lowercased(),
               (scheme == "http" || scheme == "https"),
               comp.host?.isEmpty == false else {

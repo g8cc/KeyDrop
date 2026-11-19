@@ -3,6 +3,33 @@ import KeyDropCore
 
 enum GrokBuildWriterTests {
     static func run(_ h: Harness) {
+        h.runSuite("WriterAudit.Grok TOML 注释") { t in
+            let env = try TestEnv("grok-comment-boundaries")
+            defer { env.cleanup() }
+            let writer = GrokBuildWriter(configPath: env.dir + "/grok.toml")
+            let fixture = """
+            [model."grok#main"] # provider
+            model = "grok#main" # selected model
+            base_url = 'https://grok.example.org/v1' # literal URL
+            api_key = 'sk-fixture#literal' # literal key
+            [tools] # unrelated table
+            command = "echo # keep"
+            """
+            env.write("grok.toml", fixture)
+            _ = try writer.add(baseURL: "https://grok.example.org/v1", key: "sk-fixture#literal", models: ["grok#main"])
+            t.equal(env.read("grok.toml").components(separatedBy: "[model.").count - 1, 1,
+                    "带注释的 TOML 表重导入仍只有一段")
+            _ = try writer.remove(baseURL: "https://grok.example.org/v1", key: "sk-fixture#literal", models: ["grok#main"])
+            t.expect(!env.read("grok.toml").contains("sk-fixture#literal"), "单引号凭据按内容匹配并删除")
+            t.contains(env.read("grok.toml"), "command = \"echo # keep\"", "删除保留带尾部注释的后续表")
+
+            env.write("grok.toml", fixture.replacingOccurrences(of: " # provider", with: "")
+                .replacingOccurrences(of: " # selected model", with: "")
+                .replacingOccurrences(of: "'https://grok.example.org/v1' # literal URL", with: "\"https://grok.example.org/v1\"")
+                .replacingOccurrences(of: "'sk-fixture#literal' # literal key", with: "\"sk-fixture#literal\""))
+            _ = try writer.remove(baseURL: "https://grok.example.org/v1", key: "sk-fixture#literal", models: ["grok#main"])
+            t.contains(env.read("grok.toml"), "[tools] # unrelated table", "普通模型表删除也遵守后续注释表边界")
+        }
         h.runSuite("GrokBuildWriter") { t in
             let env = try! TestEnv("grok-writer")
             defer { env.cleanup() }

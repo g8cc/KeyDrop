@@ -1,11 +1,108 @@
 import Foundation
 import KeyDropCore
 
+private final class ConcurrentCPAConfigServer {
+    private let listener: TCPServer
+    private let lock = NSLock()
+    private let secondRead = DispatchSemaphore(value: 0)
+    private var reads = 0
+    private var config = "port: 8317\n"
+    var port: Int { listener.port }
+    var configText: String {
+        lock.lock(); defer { lock.unlock() }
+        return config
+    }
+
+    init() throws {
+        listener = try TCPServer()
+        Thread.detachNewThread {
+            for _ in 0..<4 {
+                guard let client = self.listener.accept() else { return }
+                Thread.detachNewThread { self.handle(client) }
+            }
+        }
+    }
+
+    private func handle(_ client: SocketClient) {
+        defer { client.close() }
+        guard let request = client.readRequest() else { return }
+        let response: String
+        if request.hasPrefix("GET ") {
+            lock.lock()
+            response = config
+            reads += 1
+            let first = reads == 1
+            lock.unlock()
+            // A second unprotected GET reads the same snapshot before either PUT.
+            if first { _ = secondRead.wait(timeout: .now() + 0.5) }
+            else { secondRead.signal() }
+        } else {
+            var body = request.components(separatedBy: "\r\n\r\n").dropFirst().joined(separator: "\r\n\r\n")
+            let lengthLine = request.components(separatedBy: "\r\n")
+                .first { $0.lowercased().hasPrefix("content-length:") } ?? ""
+            let length = Int(lengthLine.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) ?? 0
+            if body.utf8.count < length { body += client.readBody(toLength: length - body.utf8.count) }
+            lock.lock()
+            config = body
+            lock.unlock()
+            response = "{}"
+        }
+        client.write("HTTP/1.1 200 OK\r\nContent-Length: \(response.utf8.count)\r\nConnection: close\r\n\r\n\(response)")
+    }
+}
+
 /// CPA 管理 API 双轨(v1.4.13 真实事故:CPA 数据目录在 ~/Documents 下,
 /// KeyDrop 每次导入/扫描/代理池绑定直接读写文件 → macOS TCC 反复弹「文稿」。
 /// 配置管理密钥后全部走 /v0/management/*,本地文件零触达;未配置回退文件模式)
 enum CPAAAPITests {
     static func run(_ h: Harness) {
+        h.runSuite("WriterAudit.CPA 非法管理地址") { t in
+            let env = try TestEnv("cpa-invalid-management-base")
+            defer { env.cleanup() }
+            Prefs.shared.cpaManagementKey = "test-key"
+            defer {
+                Prefs.shared.cpaManagementKey = nil
+                Prefs.shared.cpaAPIBase = nil
+            }
+            for address in ["file:///tmp/config", "https://fixture:secret@example.invalid", "https://example.invalid/#fragment",
+                            "https:///", "http://127.0.0.1:0", "http://127.0.0.1:65536"] {
+                Prefs.shared.cpaAPIBase = address
+                do {
+                    _ = try CPAAPI.request("GET", "v0/management/config.yaml")
+                    t.expect(false, "非法管理地址应在请求前拒绝")
+                } catch let error as CPAAPIError {
+                    t.contains(error.localizedDescription, "地址无效", "非法地址不会回落到默认服务")
+                }
+            }
+        }
+        h.runSuite("WriterAudit.CPA API 并发修改") { t in
+            let env = try TestEnv("cpa-api-concurrent-config")
+            defer { env.cleanup() }
+            let server = try ConcurrentCPAConfigServer()
+            Prefs.shared.cpaManagementKey = "test-key"
+            Prefs.shared.cpaAPIBase = "http://127.0.0.1:\(server.port)"
+            defer {
+                Prefs.shared.cpaManagementKey = nil
+                Prefs.shared.cpaAPIBase = nil
+            }
+            let resultLock = NSLock()
+            var errors: [String] = []
+            DispatchQueue.concurrentPerform(iterations: 2) { index in
+                do {
+                    _ = try CPAWriter(configPath: env.dir + "/untouched/config.yaml")
+                        .addImageChannel(baseURL: "https://writer-\(index).example/v1",
+                                         key: "sk-concurrent-fixture-\(index)", models: ["gpt-image-1"])
+                } catch {
+                    resultLock.lock()
+                    errors.append(error.localizedDescription)
+                    resultLock.unlock()
+                }
+            }
+            t.expect(errors.isEmpty, "并发导入均成功")
+            t.contains(server.configText, "sk-concurrent-fixture-0", "保留第一个并发配置修改")
+            t.contains(server.configText, "sk-concurrent-fixture-1", "保留第二个并发配置修改")
+            t.expect(!env.fileExists("untouched"), "API 模式未创建本地 CPA 配置目录")
+        }
         h.runSuite("CPAAPI") { t in
             guard let server = try? MockHTTPServer(mode: .cpaMgmt) else {
                 t.expect(false, "mock 启动失败")

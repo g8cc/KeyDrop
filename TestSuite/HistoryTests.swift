@@ -13,6 +13,59 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.lock failure prevents writes") { t in
+            let env = try TestEnv("hist-lock-refusal")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            let lockPath = FileLock.lockPath(for: env.dir + "/home/history.json")
+            try FileManager.default.createDirectory(atPath: lockPath, withIntermediateDirectories: true)
+            do {
+                try store.append(entry("lock-refused", ts: 1))
+                t.expect(false, "无法获取文件锁时应报告失败")
+            } catch {
+                t.expect(true, "返回文件锁错误")
+            }
+            t.expect(!env.fileExists("home/history.json") && store.snapshot().isEmpty, "无锁时不修改磁盘或内存账本")
+        }
+        h.runSuite("History.failed writes restore all memory paths") { t in
+            for operation in ["dedup", "probe", "model-probe", "batch"] {
+                let env = try TestEnv("hist-rollback-\(operation)")
+                defer { env.cleanup() }
+                let store = HistoryStore()
+                try store.append(entry("saved-entry", ts: 1))
+                let originalFile = env.read("home/history.json")
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .sortedKeys
+                let originalMemory = try encoder.encode(store.snapshot())
+                let corrupted = #"{"items":["#
+                env.write("home/history.json", corrupted)
+                do {
+                    switch operation {
+                    case "dedup":
+                        _ = try store.appendDedupByKey(entry("unsaved-entry", ts: 2))
+                    case "probe":
+                        try store.appendProbePoint(id: "saved-entry", ok: false, ms: 20, cpa: nil, at: 2)
+                    case "model-probe":
+                        try store.appendModelProbePoints(id: "saved-entry", points: ["model": ProbePoint(t: 2, ms: 20, ok: false)])
+                    default:
+                        var changed = store.snapshot()[0]
+                        changed.note = "unsaved edit"
+                        try store.updateAll([changed])
+                    }
+                    t.expect(false, "\(operation) 应报告写入失败")
+                } catch {
+                    t.contains(error.localizedDescription, "保留原文件", "\(operation) 报告损坏账本")
+                }
+                t.expect(try encoder.encode(store.snapshot()) == originalMemory, "\(operation) 写入失败后恢复完整内存快照")
+                t.equal(env.read("home/history.json"), corrupted, "\(operation) 保留磁盘原文")
+                env.write("home/history.json", originalFile)
+                try store.append(entry("retry-entry", ts: 3))
+                let recovered = HistoryStore().snapshot()
+                t.expect(recovered.count == 2 && recovered.first(where: { $0.id == "saved-entry" })?.note == nil
+                         && recovered.allSatisfy { $0.probeLog == nil && $0.modelProbeLog == nil },
+                         "\(operation) 后续保存不带入失败操作的数据")
+            }
+        }
         h.runSuite("History.refuses to overwrite unreadable ledger") { t in
             let env = try TestEnv("hist-invalid-write")
             defer { env.cleanup() }

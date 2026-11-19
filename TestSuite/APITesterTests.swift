@@ -29,7 +29,7 @@ final class MockHTTPServer {
         case dottedModels // /models → 200,7 个 stepfun 式模型(5 个含点、会被 looksLikeModel 域名规则误杀)
         case selectiveAuth // Authorization 含 invalid 的 key 返回 401,其余正常
         case selectiveModelQuota // /models 返回 4 模型(1 个 *-free + 3 限流);chat 仅 free 模型 200,其余 429 quota
-        case partialCatalog
+        case partialCatalog, modelPermissions
         case billingCentsOK    // /auth/key 404;new-api billing:hard_limit_usd=100($),total_usage=500(美分=$5)→ 有余额
         case billingCentsSpent // 同上但 total_usage=10000(美分=$100)→ 用尽
         case html200All        // 任意路径 200 + HTML 兜底页(SPA),chat 也不例外
@@ -63,9 +63,11 @@ final class MockHTTPServer {
         "acc-a.json": "{\"type\":\"xai\",\"email\":\"a@x.com\",\"proxy_url\":\"\"}"
     ]
     let mode: Mode
+    private let chatResponse: String?
 
-    init(mode: Mode = .openAI, proxy: Bool = false) throws {
+    init(mode: Mode = .openAI, proxy: Bool = false, chatResponse: String? = nil) throws {
         self.mode = mode
+        self.chatResponse = chatResponse
         listener = try TCPServer()
         Thread.detachNewThread { [weak self] in
             self?.serveLoop()
@@ -92,6 +94,10 @@ final class MockHTTPServer {
         mgmtLock.lock()
         requestCounts[target, default: 0] += 1
         mgmtLock.unlock()
+        if method == "POST", let chatResponse {
+            respond(client, 200, "OK", chatResponse)
+            return
+        }
         if mode == .stalledImportProbe {
             if target == "/v1/models" {
                 respond(client, 200, "OK", #"{"data":[{"id":"deepseek-test"}]}"#)
@@ -145,7 +151,7 @@ final class MockHTTPServer {
             handleMagpie(client, req, method, target)
             return
         }
-        if (mode == .selectiveModelQuota || mode == .partialCatalog), method == "POST", target.contains("/chat/completions"),
+        if [.selectiveModelQuota, .partialCatalog, .modelPermissions].contains(mode), method == "POST", target.contains("/chat/completions"),
            let r = headerOnly.lowercased().range(of: "content-length:"),
            let n = Int(headerOnly.lowercased()[r.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
                 .prefix(while: { $0.isNumber })), n > 0 {
@@ -171,6 +177,17 @@ final class MockHTTPServer {
            let m = re.firstMatch(in: req, range: NSRange(req.startIndex..., in: req)), m.numberOfRanges >= 2,
            let gr = Range(m.range(at: 1), in: req) {
             requestedModel = String(req[gr]).replacingOccurrences(of: "\\/", with: "/")
+        }
+
+        if mode == .modelPermissions {
+            if method == "GET", target.hasSuffix("/models") {
+                respond(client, 200, "OK", #"{"data":[{"id":"denied-model"},{"id":"available-model"}]}"#)
+            } else if method == "POST", target.contains("/chat/completions"), requestedModel == "available-model" {
+                respond(client, 200, "OK", #"{"choices":[{"message":{"content":"ok"}}]}"#)
+            } else {
+                respond(client, 403, "Forbidden", #"{"error":{"message":"This model is not allowed for this API key"}}"#)
+            }
+            return
         }
 
         if method == "GET" && target.hasPrefix("http://") {
@@ -624,6 +641,53 @@ final class SocketClient {
 
 enum APITesterTests {
     static func run(_ h: Harness) {
+        h.runSuite("APITester.模型权限顺序") { t in
+            let server = try MockHTTPServer(mode: .modelPermissions)
+            let base = "http://127.0.0.1:\(server.port)/v1"
+            for preferred in ["denied-model", "available-model"] {
+                let result = APITester.test(url: base, key: "sk-fixture-model-scope", timeout: 2, preferredModel: preferred)
+                t.expect(result.ok && !result.authFailed, "局部模型权限失败不应使有效 key 失效")
+                t.equal(result.workingModels, ["available-model"], "权限模型顺序不影响验证结果")
+            }
+            t.equal(server.countRequests("/v1/chat/completions"), 4, "两种顺序都验证完两个模型")
+            let invalid = try MockHTTPServer(mode: .chat401)
+            let result = APITester.test(url: "http://127.0.0.1:\(invalid.port)/v1", key: "sk-fixture-invalid", timeout: 2)
+            t.expect(!result.ok && result.authFailed, "明确认证失败仍保留失效状态")
+            t.equal(invalid.countRequests("/v1/chat/completions"), 1, "明确认证失败仍及时结束")
+        }
+        h.runSuite("APITester.空聊天响应") { t in
+            let emptyResponses = [
+                #"{"choices":[{"message":{}}]}"#,
+                #"{"choices":[{"message":{"role":"assistant","content":""}}]}"#,
+                "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"error\":{\"message\":\"upstream failed\"}}\n\n",
+                #"{"type":"message","content":[]}"#,
+                "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\n\ndata: {\"type\":\"message_stop\"}\n\n"
+            ]
+            for response in emptyResponses {
+                let server = try MockHTTPServer(chatResponse: response)
+                let base = "http://127.0.0.1:\(server.port)/v1"
+                let result = APITester.test(url: base, key: "sk-fixture-empty-response", timeout: 2)
+                t.expect(result.workingModels.isEmpty && result.reachabilityOnly, "空内容不能验证模型可用")
+                t.expect(!APITester.testModelChat(base: base, key: "sk-fixture-empty-response", model: "gpt-test", timeout: 2).ok,
+                         "显式模型验证同样拒绝空内容")
+            }
+            let successfulResponses = [
+                #"{"choices":[{"message":{"content":"ok"}}]}"#,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think\"}}]}\n\ndata: [DONE]\n\n",
+                #"{"choices":[{"message":{"tool_calls":[{"function":{"name":"lookup","arguments":"{}"}}]}}]}"#,
+                #"{"type":"message","content":[{"type":"text","text":"ok"}]}"#,
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me think\"}}\n\n",
+                #"{"type":"message","content":[{"type":"tool_use","name":"lookup","input":{}}]}"#
+            ]
+            for response in successfulResponses {
+                let server = try MockHTTPServer(chatResponse: response)
+                t.expect(APITester.testModelChat(base: "http://127.0.0.1:\(server.port)/v1", key: "sk-fixture-response", model: "gpt-test", timeout: 2).ok,
+                         "有效 JSON、流式内容与推理内容仍通过")
+            }
+        }
         h.runSuite("APITester.catalog is not chat evidence") { t in
             let server = try MockHTTPServer(mode: .catalogOnly)
             let base = "http://127.0.0.1:\(server.port)/v1"

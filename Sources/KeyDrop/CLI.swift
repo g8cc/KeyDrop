@@ -139,7 +139,7 @@ enum CLI {
                     appTypeForced: appType != nil,
                     proxy: proxy ?? ProcessInfo.processInfo.environment["KEYDROP_PROXY"]
                 ) { models in
-                    ModelPicker.pick(from: models, title: "测试通过,获取到 \(models.count) 个模型(空格勾选,可多选):") ?? models
+                    ModelPicker.pick(from: models, title: "测试通过,获取到 \(models.count) 个模型(空格勾选,可多选):") ?? []
                 }
                 print(outcome.lines.joined(separator: "\n"))
                 if outcome.ok { AppLog.info("CLI add ok: \(outcome.lines.joined(separator: "; "))") }
@@ -256,7 +256,7 @@ enum CLI {
             }
             do {
                 let msg = try Core.shared.refreshModels(entryIDPrefix: target, proxy: proxy) { models in
-                    ModelPicker.pick(from: models, title: "共 \(models.count) 个模型(空格勾选):") ?? models
+                    ModelPicker.pick(from: models, title: "共 \(models.count) 个模型(空格勾选):") ?? []
                 }
                 print(msg)
                 return 0

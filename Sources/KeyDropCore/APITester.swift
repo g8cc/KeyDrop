@@ -12,7 +12,7 @@ public struct APITestResult {
     public let quotaExhausted: Bool
     /// chat 端点确认不可用(429 限流无 quota 词 / 402 / 424 / 5xx)→ 移出可用列表
     public let chatDegraded: Bool
-    /// 多模型探测中确认可用的模型(chat 200/400/404)
+    /// 多模型探测中返回实际聊天内容的模型
     public let workingModels: [String]
     /// 多模型探测中确认额度耗尽的模型(逐个 429/402 + quota 词)。
     /// key 级判定不再被单个模型的 429 绑架:任一模型可用即 key 可用,
@@ -320,7 +320,7 @@ public enum APITester {
                 style = styleHint == "anthropic" ? "anthropic" : "openai"
                 // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
                 // chat 探测多模型(上限 4,free 字样模型优先):单个模型 429 不代表整 key 无额度。
-                // 任一模型 200/400/404 → key 可用;探测过的模型全部 quota → 才判无额度;
+                // 任一模型返回聊天内容 → key 可用;探测过的模型全部 quota → 才判无额度;
                 // 401/403 仅在没有任何可用模型时才判 key 失效(见下方 gatedModels 注释)。
                 // 真实事故:4 模型中首选 composer 429、
                 // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
@@ -355,8 +355,10 @@ public enum APITester {
                         // 站点按模型限权 —— 同一把 key,deepseek-v4.1 chat 200,而
                         // qwen3.8-flash 403;首选模型已探活时,403 只说明该模型不对这把
                         // key 开放,不是 key 死了。有可用模型就继续,403 只记账
-                        if working.isEmpty { authModel = (probe, st); break }
+                        if authModel == nil { authModel = (probe, st) }
                         gatedModels.append(probe)
+                        // 403 可能只限制当前模型，继续验证其余模型才能判断整把 key。
+                        if st == 401 && working.isEmpty { break }
                         continue
                     }
                     if let ms = chat.latencyMs { modelLatencies[probe] = ms }
@@ -383,7 +385,7 @@ public enum APITester {
                                          detail: cooldownDetail ?? "服务端限流冷却中",
                                          authFailed: false, skippedForCooldown: true)
                 }
-                if let (m, st) = authModel {
+                if let (m, st) = authModel, working.isEmpty {
                     return APITestResult(ok: false, style: style, models: models,
                                          detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(\(m) 认证失败/key 失效)",
                                          authFailed: true)
@@ -714,15 +716,46 @@ public enum APITester {
         func isError(_ obj: [String: Any]) -> Bool {
             obj["error"] != nil || (obj["type"] as? String) == "error"
         }
+        func hasText(_ value: Any?) -> Bool {
+            (value as? String)?.isEmpty == false
+        }
+        func hasContentBlock(_ block: [String: Any]) -> Bool {
+            switch block["type"] as? String {
+            case "text", "text_delta": return hasText(block["text"])
+            case "thinking", "thinking_delta": return hasText(block["thinking"])
+            case "tool_use": return hasText(block["name"])
+            case "input_json_delta": return hasText(block["partial_json"])
+            default: return false
+            }
+        }
+        func hasOutput(_ message: [String: Any]) -> Bool {
+            if hasText(message["content"]) || hasText(message["reasoning_content"]) || hasText(message["refusal"]) {
+                return true
+            }
+            if let blocks = message["content"] as? [[String: Any]], blocks.contains(where: hasContentBlock) {
+                return true
+            }
+            if let calls = message["tool_calls"] as? [[String: Any]] {
+                return calls.contains { call in
+                    guard let function = call["function"] as? [String: Any] else { return false }
+                    return hasText(function["name"]) || hasText(function["arguments"])
+                }
+            }
+            return false
+        }
         func isChat(_ obj: [String: Any]) -> Bool {
             if let choices = obj["choices"] as? [[String: Any]],
-               choices.contains(where: { $0["message"] is [String: Any] || $0["delta"] is [String: Any] }) {
+               choices.contains(where: { choice in
+                   let message = choice["message"] as? [String: Any] ?? choice["delta"] as? [String: Any] ?? [:]
+                   return hasOutput(message)
+               }) {
                 return true
             }
             switch obj["type"] as? String {
-            case "message": return obj["content"] is [[String: Any]]
-            case "message_start": return obj["message"] is [String: Any]
-            case "content_block_delta": return obj["delta"] is [String: Any]
+            case "message": return hasOutput(obj)
+            case "message_start": return hasOutput(obj["message"] as? [String: Any] ?? [:])
+            case "content_block_start": return hasContentBlock(obj["content_block"] as? [String: Any] ?? [:])
+            case "content_block_delta": return hasContentBlock(obj["delta"] as? [String: Any] ?? [:])
             default: return false
             }
         }

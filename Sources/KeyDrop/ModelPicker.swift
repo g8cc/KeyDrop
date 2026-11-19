@@ -8,7 +8,7 @@ enum ModelPicker {
         guard !models.isEmpty else { return nil }
         if !isTTY() {
             print("\(title) 非交互终端,将导入全部模型")
-            return nil
+            return models
         }
         print(title)
         return runLoop(models: models, preselected: preselected)
