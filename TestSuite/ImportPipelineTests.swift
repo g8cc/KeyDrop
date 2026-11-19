@@ -14,8 +14,84 @@ enum ImportPipelineTests {
 
     private static func db(_ env: TestEnv) -> DB { try! DB(path: env.dir + "/cc-switch.db") }
 
+    private final class LockedImportResult: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        var cancelled: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return value
+        }
+        func set(cancelled: Bool) {
+            lock.lock(); defer { lock.unlock() }
+            value = cancelled
+        }
+    }
+
     static func run(_ h: Harness) {
 
+        h.runSuite("导入管线.取消慢请求") { t in
+            for multi in [false, true] {
+                let (env, core) = makeEnv("pipe-cancel-network-\(multi)")
+                defer { env.cleanup() }
+                let server = try MockHTTPServer(mode: .stalledImportProbe)
+                defer { for _ in 0..<4 { server.releaseImportProbe.signal() } }
+                env.write("cpa-config.yaml", "port: 8317\n")
+                let original = env.read("cpa-config.yaml")
+                let historyIDs = core.history.snapshot().map(\.id)
+                let url = "http://127.0.0.1:\(server.port)/v1"
+                let keys = "sk-fixturecancel111111" + (multi ? "\nsk-fixturecancel222222" : "")
+                let operation = ImportOperation()
+                let done = DispatchGroup()
+                done.enter()
+                let result = LockedImportResult()
+                DispatchQueue.global().async {
+                    defer { done.leave() }
+                    do {
+                        _ = try core.add(raw: "\(url)\n\(keys)", ccOverride: !multi, grokOverride: false,
+                                         cpaOverride: multi, dshOverride: false, operation: operation)
+                        result.set(cancelled: false)
+                    } catch {
+                        result.set(cancelled: error is CancellationError)
+                    }
+                }
+                t.expect(server.importProbeStarted.wait(timeout: .now() + 4) == .success, "取消前真实请求已发出")
+                t.expect(operation.cancel(), "写入前允许取消")
+                let finished = done.wait(timeout: .now() + 2)
+                t.expect(finished == .success, "不等模拟服务释放就结束")
+                if finished == .timedOut {
+                    for _ in 0..<4 { server.releaseImportProbe.signal() }
+                    done.wait()
+                }
+                t.expect(result.cancelled, "网络取消返回明确结果")
+                t.expect(core.history.snapshot().map(\.id) == historyIDs && !env.fileExists("home/history.json"),
+                         "取消后内存账本没有新增记录，磁盘没有生成账本")
+                t.equal(env.read("cpa-config.yaml"), original, "取消后配置未改动")
+                t.equal(try db(env).scalar("SELECT count(*) FROM providers"), "0", "未写入 cc-switch")
+            }
+        }
+
+        h.runSuite("导入管线.阶段与写入边界") { t in
+            let (env, core) = makeEnv("pipe-import-stages")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer()
+            var stages: [ImportOperation.Stage] = []
+            var operation: ImportOperation?
+            var refusedDuringWrite = false
+            let token = ImportOperation { stage in
+                stages.append(stage)
+                if stage == .writing { refusedDuringWrite = operation?.cancel() == false }
+            }
+            operation = token
+            defer { operation = nil }
+            let result = try core.add(raw: "http://127.0.0.1:\(server.port)/v1\nsk-stages111111111",
+                                      ccOverride: true, grokOverride: false, cpaOverride: false,
+                                      dshOverride: false, operation: token) { options in
+                Array(options.prefix(1))
+            }
+            t.expect(result.ok && refusedDuringWrite, "进入写入后取消不打断配置")
+            t.equal(stages, [.parsing, .verifying, .choosingModels, .verifying, .writing], "阶段按实际顺序显示")
+            t.expect(core.history.find(idPrefix: result.entry.id) != nil, "写入阶段完成账本")
+        }
         h.runSuite("导入管线.DSH 专用") { t in
             let (env, core) = makeEnv("pipe-dsh-only")
             defer { env.cleanup() }

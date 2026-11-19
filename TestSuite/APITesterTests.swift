@@ -4,9 +4,12 @@ import KeyDropCore
 /// 极简 HTTP 服务:固定 200 JSON 响应 / 或 404;支持作为 HTTP 代理转发
 final class MockHTTPServer {
     private let listener: TCPServer
+    let importProbeStarted = DispatchSemaphore(value: 0)
+    let releaseImportProbe = DispatchSemaphore(value: 0)
     var port: Int { listener.port }
 
     enum Mode {
+        case stalledImportProbe
         case nativeAnthropic, nativeLimited, nativeInvalid, nativeBadModel, nativeMultiple, nativeRetry, emptyChat, errorChat
         case catalogOnly
         case openAI    // 200 {"data":[{id}]}
@@ -89,6 +92,16 @@ final class MockHTTPServer {
         mgmtLock.lock()
         requestCounts[target, default: 0] += 1
         mgmtLock.unlock()
+        if mode == .stalledImportProbe {
+            if target == "/v1/models" {
+                respond(client, 200, "OK", #"{"data":[{"id":"deepseek-test"}]}"#)
+            } else {
+                importProbeStarted.signal()
+                _ = releaseImportProbe.wait(timeout: .now() + 8)
+                respond(client, 200, "OK", #"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#)
+            }
+            return
+        }
         if mode == .emptyChat || mode == .errorChat {
             respond(client, 200, "OK", mode == .emptyChat ? "" : #"{"error":{"message":"upstream failed"}}"#)
             return

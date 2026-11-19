@@ -52,27 +52,47 @@ public final class Core {
         appType: String? = nil,
         appTypeForced: Bool = false,
         proxy: String? = nil,
+        operation: ImportOperation? = nil,
         pickModels: (([String]) -> [String])? = nil
     ) throws -> AddOutcome {
         var stage = "parse"
+        let choose: (([String]) -> [String])? = pickModels.map { picker in
+            { options in
+                if let operation {
+                    do {
+                        try operation.advance(to: .choosingModels)
+                        try operation.checkCancellation()
+                    }
+                    catch { return [] }
+                }
+                let selection = picker(options)
+                if !selection.isEmpty { try? operation?.advance(to: .verifying) }
+                return selection
+            }
+        }
         do {
-            let outcome = try addImpl(raw: raw, ccOverride: ccOverride, grokOverride: grokOverride,
-                                      cpaOverride: cpaOverride, dshOverride: dshOverride,
-                                      models: models, force: force, appType: appType,
-                                      appTypeForced: appTypeForced, proxy: proxy,
-                                      pickModels: pickModels, stage: &stage)
+            let outcome = try ImportOperation.$current.withValue(operation) {
+                try operation?.advance(to: .parsing)
+                return try addImpl(raw: raw, ccOverride: ccOverride, grokOverride: grokOverride,
+                                   cpaOverride: cpaOverride, dshOverride: dshOverride,
+                                   models: models, force: force, appType: appType,
+                                   appTypeForced: appTypeForced, proxy: proxy,
+                                   pickModels: choose, stage: &stage)
+            }
             for line in outcome.lines where line.contains("✗") || line.contains("失败") {
                 ImportFailureLog.record(ParseError.io(line), stage: ImportFailureLog.stage(forLine: line))
             }
             return outcome
         } catch {
+            try operation?.checkCancellation()
             ImportFailureLog.record(error, stage: stage)
             throw error
         }
     }
 
     /// Explicit import for credentials that must be exercised by the real DSH client.
-    public func addDSHOnly(raw: String, models override: [String]? = nil) throws -> AddOutcome {
+    public func addDSHOnly(raw: String, models override: [String]? = nil, operation: ImportOperation? = nil) throws -> AddOutcome {
+        try operation?.advance(to: .parsing)
         guard raw.utf8.count <= 1_000_000 else { throw ParseError.io("粘贴内容过大") }
         let parsed = try Parser.parse(raw)
         guard let url = parsed.url else { throw ParseError.noURL }
@@ -107,6 +127,7 @@ public final class Core {
         entry.failStreak = nil
         entry.latencyMs = nil
         entry.apiStyle = nil
+        try operation?.advance(to: .writing)
         let route = try DSHWriter.add(providerID: entry.id, key: key, url: url, models: models)
         do {
             if existing != nil {
@@ -134,6 +155,7 @@ public final class Core {
         appTypeForced: Bool, proxy: String?, pickModels: (([String]) -> [String])?,
         stage: inout String
     ) throws -> AddOutcome {
+        let operation = ImportOperation.current
         let appType = appType ?? Core.defaultAppType
         AppLog.info("add 开始(force=\(force))")
         defer { AppLog.info("add 结束") }
@@ -170,6 +192,7 @@ public final class Core {
                 }
             }
             guard !proxies.isEmpty else { throw ParseError.io("未识别到有效的代理节点") }
+            try operation?.advance(to: .writing)
             let (msg, clashFile) = try ClashWriter.add(proxies: proxies)
             let entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
@@ -213,6 +236,7 @@ public final class Core {
         // ClashWriter.add 的错误(目录不可写等)必须直接抛给用户,
         // 不能被误归因为「订阅拉取失败」
         if let proxies = subProxies, !proxies.isEmpty {
+            try operation?.advance(to: .writing)
             let (msg, clashFile) = try ClashWriter.add(proxies: proxies)
             let entry = HistoryEntry(
                 id: UUID().uuidString.lowercased(),
@@ -229,6 +253,7 @@ public final class Core {
             return AddOutcome(entry: entry, lines: subLines, ok: true)
         }
 
+        try operation?.checkCancellation()
         var parsed: ParsedKey
         do {
             parsed = try Parser.parseWithFallback(raw)
@@ -298,7 +323,7 @@ public final class Core {
             guard let cfg = prefs.resolvedCPAConfig() else {
                 throw ParseError.io("检测到多 key,需要写入 CPA 但未找到 config.yaml")
             }
-            prefs.cpaConfigPath = cfg
+            try operation?.advance(to: .verifying)
             // 多 key 粘贴此前直接落「探测全量」(真实反馈:midjok.lol 1 URL + 2 key
             // 导入 26 个模型,含 audio/realtime/codex-auto-review,用户没得选)。
             // 显式 --model 优先,否则走与单 key 同一套勾选弹窗
@@ -310,6 +335,7 @@ public final class Core {
                 : pickModels
             let (msg, probedModels) = try CPAWriter(configPath: cfg)
                 .addMulti(baseURL: url, keys: allKeys, proxy: proxyURL, pickModels: chooser)
+            prefs.cpaConfigPath = cfg
             var multiLines = [msg]
             // 常驻模型来源 = 条目最终 models(已有精选时即精选列表);
             // 空(探测失败且无既有列表)传 nil 回退收集其它条目的精选
@@ -339,6 +365,7 @@ public final class Core {
 
         var name = parsed.name?.isEmpty == false ? parsed.name! : cc.defaultName(for: url)
         stage = "verify"
+        if !force { try operation?.advance(to: .verifying) }
         parsed.name = name
 
         let requestedModels = (models ?? parsed.models ?? parsed.model.map { [$0] } ?? [])
@@ -369,6 +396,7 @@ public final class Core {
             let test = APITester.test(url: url, key: key, proxy: proxyURL,
                                       preferredModel: parsed.model, importedModels: parsed.models)
             probedTest = test
+            try operation?.checkCancellation()
             let hasProxy = proxyURL?.isEmpty == false
             var explicitSelectedModels: [String]? = nil
             var explicitCanRescue = false
@@ -382,6 +410,7 @@ public final class Core {
                     var failures: [String] = []
                     let alreadyWorking = Set(test.ok ? test.workingModels : [])
                     for model in requestedChatModels {
+                        try operation?.checkCancellation()
                         // 探测阶段已 chat 验证过的模型不再重复打一遍(每个模型最多 2 路径×12s)
                         if alreadyWorking.contains(model) {
                             verified.append(model)
@@ -438,7 +467,7 @@ public final class Core {
                     }
                 }
             }
-            noteProxyWorked(needsProxy: test.needsProxy || explicitNeedsProxy, used: proxyURL)
+            try operation?.checkCancellation()
             if !test.ok && !explicitCanRescue {
                 throw ParseError.io("测试失败,未写入。\(test.detail)\(urlReusedNote.map { "\n(\($0))" } ?? "")\n(确认真实或 --force 跳过测试)")
             }
@@ -470,6 +499,7 @@ public final class Core {
                     var verified: [String] = []
                     var failures: [String] = []
                     for m in picked {
+                        try operation?.checkCancellation()
                         let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy, styleHint: test.style)
                         if check.ok {
                             verified.append(m)
@@ -632,6 +662,8 @@ public final class Core {
 
         var anyOK = false
         stage = "write"
+        try operation?.advance(to: .writing)
+        noteProxyWorked(needsProxy: probedNeedsProxy, used: proxyURL)
         var anyTarget = false
 
         if useCC && resolvedAppType != "grok" {
@@ -2204,13 +2236,18 @@ public final class Core {
         return URLSession(configuration: config)
     }()
 
-    public static func fetchSubscriptionProxies(url: String) throws -> [ClashProxy] {
+    public static func fetchSubscriptionProxies(url: String, operation: ImportOperation? = nil) throws -> [ClashProxy] {
+        let operation = operation ?? ImportOperation.current
+        try operation?.advance(to: .fetchingSubscription)
         guard let u = URL(string: url),
               let scheme = u.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               u.host?.isEmpty == false
         else { throw ParseError.io("无效的订阅 URL") }
-        let o = NetSync.run(session: subscriptionSession, url: u, timeout: 20)
+        let o = ImportOperation.$current.withValue(operation) {
+            NetSync.run(session: subscriptionSession, url: u, timeout: 20)
+        }
+        try operation?.checkCancellation()
         if let e = o.error {
             if (e as? URLError)?.code == .cancelled {
                 throw ParseError.io("订阅请求超时(20s)")

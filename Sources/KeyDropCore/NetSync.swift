@@ -18,6 +18,9 @@ enum NetSync {
     }
 
     static func run(session: URLSession, request: URLRequest, timeout: TimeInterval) -> Outcome {
+        let operation = ImportOperation.current
+        let cancelled = Outcome(data: nil, response: nil, error: URLError(.cancelled))
+        if operation?.isCancelled == true { return cancelled }
         let sem = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var data: Data?
@@ -30,6 +33,15 @@ enum NetSync {
             lock.unlock()
             sem.signal()
         }
+        let registration = operation?.register {
+            task.cancel()
+            sem.signal()
+        }
+        if operation != nil, registration == nil {
+            task.cancel()
+            return cancelled
+        }
+        defer { if let registration { operation?.unregister(registration) } }
         task.resume()
         if sem.wait(timeout: .now() + timeout) == .timedOut {
             // cancel 后 URLSession 保证 completion 仍会被调用一次(带 cancelled error),
@@ -37,6 +49,7 @@ enum NetSync {
             task.cancel()
             _ = sem.wait(timeout: .now() + 5)
         }
+        if operation?.isCancelled == true { return cancelled }
         lock.lock(); defer { lock.unlock() }
         return Outcome(data: data, response: response, error: error)
     }
@@ -56,6 +69,7 @@ enum NetSync {
     static func isUnreachable(_ o: Outcome) -> Bool {
         guard let e = o.error as? URLError else { return false }
         switch e.code {
+        case .cancelled: return ImportOperation.current?.isCancelled == true
         case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed,
              .networkConnectionLost, .notConnectedToInternet,
              .internationalRoamingOff, .dataNotAllowed,

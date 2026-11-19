@@ -441,6 +441,7 @@ public final class CPAWriter {
     /// UI 才能按真实家族路由「打开应用」(曾因 models 空被误标 claude)
     func addMulti(baseURL: String, keys: [String], proxy: String? = nil,
                   pickModels: (([String]) -> [String])? = nil) throws -> (String, [String]) {
+        let operation = ImportOperation.current
         var seen = Set<String>()
         let uniqueKeys = keys.compactMap { raw -> String? in
             let key = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -461,16 +462,23 @@ public final class CPAWriter {
         let queue = DispatchQueue.global(qos: .userInitiated)
         for (i, key) in uniqueKeys.enumerated() {
             sem.wait()
+            if operation?.isCancelled == true {
+                sem.signal()
+                break
+            }
             group.enter()
             queue.async {
                 defer { sem.signal(); group.leave() }
-                let test = APITester.test(url: baseURL, key: key, proxy: proxy)
+                let test = ImportOperation.$current.withValue(operation) {
+                    APITester.test(url: baseURL, key: key, proxy: proxy)
+                }
                 resultLock.lock()
                 results[i] = test
                 resultLock.unlock()
             }
         }
         group.wait()
+        try operation?.checkCancellation()
         var rejected = 0
         var accepted: [String] = []
         var probedModels: [String] = []
@@ -513,7 +521,8 @@ public final class CPAWriter {
             pickedModels = picked
         }
         let writeMsg = try withCPASync {
-            try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels,
+            try operation?.advance(to: .writing)
+            return try addMultiLocked(baseURL: baseURL, keys: accepted, models: probedModels,
                                picked: pickedModels, proxy: proxy)
         }
         // 回传条目最终 models(已有精选时=精选原列表,新建/补写时=探测结果):

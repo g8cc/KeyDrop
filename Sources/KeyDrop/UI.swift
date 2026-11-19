@@ -129,11 +129,14 @@ final class AppState: ObservableObject {
     @Published var refreshingID: String?
     @Published var isBusy = false
     @Published var busyLabel = ""
+    @Published private(set) var importCanCancel = false
+    private var importOperation: ImportOperation?
+    private var importID: UUID?
     @Published var modelPickerShown = false
     @Published var modelPickerOptions: [String] = []
     @Published var modelPickerPreselected: Set<String> = []
-    var modelPickerResult: (([String]) -> Void)?
-    private var modelPickerResolved = false
+    private var modelPickerResult: (([String]) -> Void)?
+    private var modelPickerID: UUID?
     @Published var clashPreviewShown = false
     @Published var clashPreviewProxies: [ClashProxy] = []
     /// 预览弹窗里被勾选的节点下标。默认全选,但用户可以只留自己要的几个
@@ -224,24 +227,21 @@ final class AppState: ObservableObject {
             && (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://"))
             && !trimmed.contains(" ")
         if maybeSub {
+            let operation = beginImport()
             isBusy = true
             busyLabel = "拉取订阅…"
             setStatus("正在拉取订阅…", ok: true)
             Task { @MainActor in
-                // 拉 sub 是探测:失败/空结果都不是最终结论,必须回落到普通 key 导入。
-                // 注意交接:continueAddKey 有 guard !isBusy,必须先把外层的 busy 标志交还给
-                // 它(否则回退路径会被静默吞掉,用户粘贴普通链接点导入毫无反应)
-                var proxies: [ClashProxy]? = nil
-                do {
-                    proxies = try await runOffPool {
-                        try Core.fetchSubscriptionProxies(url: trimmed)
-                    }
-                } catch {
-                    proxies = []
+                let proxies = try? await runOffPool {
+                    try Core.fetchSubscriptionProxies(url: trimmed, operation: operation)
+                }
+                if operation.isCancelled {
+                    finishImport()
+                    setStatus("已取消导入", ok: true)
+                    return
                 }
                 if let list = proxies, !list.isEmpty {
-                    isBusy = false
-                    busyLabel = ""
+                    finishImport()
                     input = ""
                     openClashPreview(list)
                     setStatus("检测到订阅,请确认导入", ok: true)
@@ -270,38 +270,68 @@ final class AppState: ObservableObject {
         return proxyCount > 0 && proxyCount * 2 >= lines.count
     }
 
+    private func beginImport() -> ImportOperation {
+        let id = UUID()
+        importID = id
+        importCanCancel = true
+        let operation = ImportOperation { [weak self] stage in
+            DispatchQueue.main.async {
+                guard let self, self.importID == id, self.importOperation?.isCancelled == false else { return }
+                switch stage {
+                case .fetchingSubscription: self.busyLabel = "拉取订阅…"
+                case .parsing: self.busyLabel = "解析内容…"
+                case .verifying: self.busyLabel = "验证接口…"
+                case .choosingModels: self.busyLabel = "等待选择模型…"
+                case .writing:
+                    self.busyLabel = "写入配置…"
+                    self.importCanCancel = false
+                }
+            }
+        }
+        importOperation = operation
+        return operation
+    }
+
+    func cancelImport() {
+        guard importOperation?.cancel() == true else { return }
+        importCanCancel = false
+        busyLabel = "正在取消…"
+        modelPickerResult?([])
+    }
+
+    private func finishImport() {
+        importID = nil
+        importOperation = nil
+        importCanCancel = false
+        isBusy = false
+        busyLabel = ""
+    }
+
     @MainActor
     func continueAddKey(raw: String, assumeBusy: Bool = false, dshOnly: Bool = false) async {
         if !dshOnly && !useCC && !useGrok && !useCPA && !useDSH {
-            if assumeBusy { isBusy = false; busyLabel = "" }
+            if assumeBusy { finishImport() }
             setStatus("请先开启 cc-switch、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
             return
         }
-        if assumeBusy {
-            // 订阅回退路径:busy 标志由调用方持有并直接交接,不重复置位
-            busyLabel = "解析并测试中…"
-            setStatus("解析并测试中…", ok: true)
-        } else {
-            guard !isBusy else { return }
-            isBusy = true
-            busyLabel = "解析并测试中…"
-            setStatus("解析并测试中…", ok: true)
-        }
-        defer {
-            isBusy = false
-            busyLabel = ""
-        }
+        guard assumeBusy || !isBusy else { return }
+        let operation = (assumeBusy ? importOperation : nil) ?? beginImport()
+        isBusy = true
+        busyLabel = "解析内容…"
+        setStatus("正在导入…", ok: true)
+        defer { finishImport() }
         do {
             let outcome = try await runOffPool { () throws -> AddOutcome in
-                if dshOnly { return try Core.shared.addDSHOnly(raw: raw) }
+                if dshOnly { return try Core.shared.addDSHOnly(raw: raw, operation: operation) }
                 return try Core.shared.add(
                     raw: raw,
                     ccOverride: Prefs.shared.useCC,
                     grokOverride: Prefs.shared.useGrok,
                     cpaOverride: Prefs.shared.useCPA,
-                    dshOverride: Prefs.shared.useDSH
+                    dshOverride: Prefs.shared.useDSH,
+                    operation: operation
                 ) { options in
-                    self.pickModelsSync(options)
+                    self.pickModelsSync(options, operation: operation)
                 }
             }
             input = ""
@@ -310,6 +340,8 @@ final class AppState: ObservableObject {
             historyVersion += 1
             notify(summary: outcome.ok ? "KeyDrop 添加成功" : "KeyDrop 部分失败",
                    body: outcome.lines.joined(separator: "\n"))
+        } catch where error is CancellationError || operation.isCancelled {
+            setStatus("已取消导入", ok: true)
         } catch {
             let msg = error.localizedDescription
             AppLog.error("导入失败: \(msg)")
@@ -332,17 +364,19 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func pickModelsSync(_ options: [String]) -> [String] {
+    private func pickModelsSync(_ options: [String], operation: ImportOperation? = nil) -> [String] {
+        let id = UUID()
         let sem = DispatchSemaphore(value: 0)
         var result: [String] = []
         DispatchQueue.main.async {
-            self.modelPickerResolved = false
+            guard operation?.isCancelled != true else { sem.signal(); return }
+            self.modelPickerID = id
             self.modelPickerOptions = options
             // 单选项(如解析到的模型验证失败回退)自动预选,用户只需确认
             self.modelPickerPreselected = options.count == 1 ? Set(options) : []
             self.modelPickerResult = { picked in
-                guard !self.modelPickerResolved else { return }
-                self.modelPickerResolved = true
+                guard self.modelPickerID == id else { return }
+                self.modelPickerID = nil
                 result = picked
                 self.modelPickerShown = false
                 self.modelPickerResult = nil
@@ -354,8 +388,8 @@ final class AppState: ObservableObject {
             // 120s:模型选择器没有用户响应时尽快放弃,
             // 避免后台线程和信号量被长时间占用(原先 300s 太久)
             DispatchQueue.main.async {
-                guard !self.modelPickerResolved else { return }
-                self.modelPickerResolved = true
+                guard self.modelPickerID == id else { return }
+                self.modelPickerID = nil
                 self.modelPickerShown = false
                 self.modelPickerResult = nil
             }
@@ -369,12 +403,17 @@ final class AppState: ObservableObject {
     }
 
     func cancelModelPicker() {
-        modelPickerResult?([])
+        guard let resolve = modelPickerResult else { return }
+        if importOperation != nil {
+            cancelImport()
+        } else {
+            resolve([])
+        }
     }
 
     /// Sheet 手势关闭时确保释放等待中的信号量
     func handleModelPickerDismiss() {
-        if !modelPickerResolved, modelPickerResult != nil {
+        if !modelPickerShown {
             cancelModelPicker()
         }
     }
@@ -2455,6 +2494,10 @@ struct PanelView: View {
             .keyboardShortcut(.return, modifiers: .command)
             .buttonStyle(.borderedProminent)
             .disabled(state.isBusy || state.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            if state.importCanCancel {
+                Button("取消导入") { state.cancelImport() }
+            }
 
             Button("仅导入 DSH") { state.importDSHOnly() }
                 .disabled(state.isBusy || state.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
