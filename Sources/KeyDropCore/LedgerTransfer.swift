@@ -99,14 +99,43 @@ public enum LedgerCrypto {
         return SymmetricKey(data: out)
     }
 
-    /// 账本变更指纹:内容(id/key/url/status/models/name/note)哈希。
-    /// 探测点/健康等高频变化不参与 —— 自动推送只在真实内容变化时触发。
+    /// 只计算会影响同步内容和产物重放的字段，排除高频探测状态与时间戳。
+    /// 使用 UTF-8 长度前缀保留字段、列表及 nil 边界，避免名称/备注中的分隔符碰撞。
     public static func ledgerFingerprint(_ entries: [HistoryEntry]) -> String {
-        let joined = entries
-            .sorted { $0.id < $1.id }
-            .map { "\($0.id)|\($0.key ?? "")|\($0.poolKeys?.joined(separator: ",") ?? ($0.format == "cpa-multikey" ? $0.raw : ""))|\($0.url ?? "")|\($0.status)|\($0.models?.joined(separator: ",") ?? "")|\($0.name ?? "")|\($0.note ?? "")|\($0.targets.joined(separator: ","))" }
-            .joined(separator: "\n")
-        return SHA256.hash(data: Data(joined.utf8)).map { String(format: "%02x", $0) }.joined()
+        var hash = SHA256()
+        func appendScalar(_ value: String?) {
+            guard let value else {
+                hash.update(data: Data("-:".utf8))
+                return
+            }
+            let bytes = Data(value.utf8)
+            hash.update(data: Data("\(bytes.count):".utf8))
+            hash.update(data: bytes)
+        }
+        func appendList(_ values: [String]?) {
+            guard let values else { appendScalar(nil); return }
+            appendScalar(String(values.count))
+            for value in values { appendScalar(value) }
+        }
+        appendScalar("keydrop-ledger-fingerprint-v2")
+        appendScalar(String(entries.count))
+        for entry in entries.sorted(by: { $0.id < $1.id }) {
+            appendScalar(entry.id)
+            appendScalar(entry.format)
+            appendScalar(entry.key)
+            appendList(entry.poolKeys)
+            // 旧账本未显式记录凭据时，重放仍会从 raw 提取。
+            appendScalar(entry.key == nil && entry.poolKeys == nil ? entry.raw : nil)
+            appendScalar(entry.url)
+            appendScalar(entry.status)
+            appendScalar(entry.model)
+            appendList(entry.models)
+            appendScalar(entry.apiStyle)
+            appendScalar(entry.name)
+            appendScalar(entry.note)
+            appendList(entry.targets)
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// 加密账本载荷 → 导出文件字节(JSON 信封)。口令不足 8 位拒绝。

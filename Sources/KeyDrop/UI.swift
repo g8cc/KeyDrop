@@ -1097,6 +1097,17 @@ final class AppState: ObservableObject {
 
 // MARK: - History row
 
+/// 一个监控点同时记录上游和可选 CPA 链路；任一路径明确失败都不能算通过。
+enum MonitorPresentation {
+    static func passed(_ point: ProbePoint) -> Bool { point.ok && point.cpa != false }
+
+    static func uptimePercent(_ log: [ProbePoint]) -> Int? {
+        guard !log.isEmpty else { return nil }
+        let count = log.filter(passed).count
+        return Int((Double(count) / Double(log.count) * 100).rounded())
+    }
+}
+
 struct HistoryRow: View {
     /// 单模型监控格条:该模型的采集轨迹;未采集显示浅灰待采格。
     /// 两种状态都用固定格宽 → 总宽恒定,不随模型名长短/记录数变化(用户反馈:有的宽有的窄)
@@ -1107,17 +1118,16 @@ struct HistoryRow: View {
             MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6, context: "\(providerContext) · \(m)")
                 .help("\(providerContext) · \(m) · 尚无探测记录")
         } else {
-            let okc = log.filter { $0.ok }.count
-            let up = Int((Double(okc) / Double(log.count) * 100).rounded())
+            let up = MonitorPresentation.uptimePercent(log) ?? 0
             MonitorSparkline(log: log, slots: 14, height: 14, cellWidth: 6, context: "\(providerContext) · \(m)")
-                .help("\(providerContext) · \(m) · 绿=通过 <3s，橙=通过 3–8s，紫=通过 ≥8s，红=失败")
+                .help("\(providerContext) · \(m) · 绿=通过 <3s，橙=通过 3–8s，紫=通过 ≥8s，蓝=通过但无耗时，红=上游或 CPA 链路失败")
             Text("\(up)%")
                 .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                 .foregroundStyle(up >= 95
                     ? Color(red: 0.22, green: 0.58, blue: 0.40)
                     : (up >= 80 ? Color.orange : Color.red))
                 .frame(width: 34, alignment: .trailing)
-                .help("\(providerContext) · \(m) · 已采样探测通过率 \(up)%")
+                .help("\(providerContext) · \(m) · 已采样探测通过率 \(up)%（CPA 链路失败计为失败）")
         }
     }
 
@@ -1214,7 +1224,7 @@ struct HistoryRow: View {
         let dotColor: Color = {
             switch availability {
             case .available, .proxyAvailable: return Color(red: 0.28, green: 0.68, blue: 0.42)
-            case .retry, .quota: return Color(red: 0.93, green: 0.68, blue: 0.20)
+            case .retry, .quota, .chainError: return Color(red: 0.93, green: 0.68, blue: 0.20)
             case .error, .dead: return Color(red: 0.86, green: 0.28, blue: 0.24)
             case .dshOnly, .unverified, .reachable, .inactive: return Color.secondary.opacity(0.65)
             }
@@ -1243,7 +1253,7 @@ struct HistoryRow: View {
                     .padding(.top, 4)
                     .help(dotTip)
 
-                if availability == .dshOnly || availability == .proxyAvailable || availability == .retry || availability == .error || availability == .unverified || availability == .reachable {
+                if availability == .dshOnly || availability == .proxyAvailable || availability == .retry || availability == .chainError || availability == .error || availability == .unverified || availability == .reachable {
                     Text(availability.label)
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
@@ -2944,9 +2954,7 @@ struct MonitorSparkline: View {
     }
 
     private var uptimePercent: Int? {
-        guard !log.isEmpty else { return nil }
-        let ok = log.filter { $0.ok }.count
-        return Int((Double(ok) / Double(log.count) * 100).rounded())
+        MonitorPresentation.uptimePercent(log)
     }
 
 }
@@ -3000,7 +3008,7 @@ struct StatusCell: View {
     static let pending   = Color.secondary.opacity(0.13)               // 灰:未采集
 
     static func cellColor(_ p: ProbePoint) -> Color {
-        if !p.ok { return fail }
+        if !MonitorPresentation.passed(p) { return fail }
         guard let ms = p.ms else { return okUntimed }
         if ms < 3000 { return okFast }
         if ms < 8000 { return okSlow }
@@ -3012,11 +3020,12 @@ struct StatusCell: View {
         f.dateFormat = "MM-dd HH:mm:ss"
         let time = f.string(from: Date(timeIntervalSince1970: p.t))
         let up = uptime.map { " · uptime \($0)%" } ?? ""
-        if p.ok, let ms = p.ms {
+        let cpa = p.cpa.map { $0 ? " · CPA 链路通过" : " · CPA 链路失败" } ?? ""
+        if p.ok, let ms = p.ms, ms.isFinite, ms >= 0, ms < 1e9 {
             let speed = ms < 3000 ? "" : (ms < 8000 ? "(慢)" : "(很慢)")
-            return "\(time) · 通过\(speed) · \(Int(ms)) ms\(up)"
+            return "\(time) · 上游通过\(speed) · \(Int(ms)) ms\(cpa)\(up)"
         }
-        return "\(time) · \(p.ok ? "通过（未记录延迟）" : "探测失败")\(up)"
+        return "\(time) · \(p.ok ? "上游通过（未记录延迟）" : "上游探测失败")\(cpa)\(up)"
     }
 }
 
@@ -3160,7 +3169,7 @@ struct StatusLegend: View {
                 .font(.system(size: 9.5))
                 .foregroundStyle(.secondary)
         }
-        .help("格条颜色 = 通过与否 + 延迟快慢两维;uptime 只数通过与否,全黄/全紫也是 100%")
+        .help("格条颜色 = 通过与否 + 延迟快慢；CPA 链路失败计为失败。全黄/全紫表示通过但较慢，通过率仍为 100%")
     }
 }
 

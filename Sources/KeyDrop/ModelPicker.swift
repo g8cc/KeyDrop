@@ -28,7 +28,8 @@ enum ModelPicker {
 
         var query = ""
         var index = 0
-        var selected = preselected
+        var viewportStart = 0
+        var selected = preselected.intersection(models)
         let hint = "空格 勾选/取消 · ↑↓ 移动 · 输入 过滤 · a 全选 · Enter 确认 · Esc 取消"
 
         func filtered() -> [String] {
@@ -45,8 +46,12 @@ enum ModelPicker {
             var out = "\u{1B}[2J\u{1B}[H"
             out += "搜索: \(query)_\n"
             out += hint + "\n\n"
-            let shown = Array(list.prefix(20))
-            for (i, m) in shown.enumerated() {
+            if index < viewportStart { viewportStart = index }
+            if index >= viewportStart + 20 { viewportStart = index - 19 }
+            viewportStart = min(viewportStart, max(0, list.count - 20))
+            let shown = list.dropFirst(viewportStart).prefix(20)
+            for (offset, m) in shown.enumerated() {
+                let i = viewportStart + offset
                 let mark = selected.contains(m) ? "[x]" : "[ ]"
                 if i == index {
                     out += "\u{1B}[7m\(mark) \(m)\u{1B}[0m\n"
@@ -70,7 +75,9 @@ enum ModelPicker {
             switch key {
             case "\u{1B}": return nil
             case "\r", "\n":
-                var result = Array(selected)
+                // 按探测顺序输出，保持第一个模型作为默认项；同时过滤未知预选与重复项。
+                var remaining = selected
+                var result = models.filter { remaining.remove($0) != nil }
                 if result.isEmpty {
                     let list = filtered()
                     if list.indices.contains(index) { result = [list[index]] }

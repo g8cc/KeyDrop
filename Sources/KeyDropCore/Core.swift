@@ -107,7 +107,7 @@ public final class Core {
         guard !models.isEmpty else { throw ParseError.io("DSH 专用导入需要填写可用于对话的完整模型 ID") }
 
         let existing = history.findActiveByKey(key)
-        if let existing, existing.url != url || !Set(existing.targets).isSubset(of: ["dsh"]) {
+        if let existing, existing.isCredentialPool || existing.url != url || !Set(existing.targets).isSubset(of: ["dsh"]) {
             throw ParseError.duplicate(id: existing.id, message: "同一凭据已绑定其他地址或同步目标，请先处理旧记录")
         }
         var entry = existing ?? HistoryEntry(
@@ -290,8 +290,22 @@ public final class Core {
             throw ParseError.noKeyFound("解析未得到 key。")
         }
 
+        let allKeys = Parser.extractAllKeys(raw)
+        // 池内成员不可再被单 key 导入覆盖；多 key 任一成员重叠也必须先处理旧记录。
+        // 在写产物前检查整个集合，不能只查解析得到的第一把 key。
+        if allKeys.count > 1 {
+            let incomingKeys = Set(allKeys)
+            if let existing = history.snapshot().first(where: {
+                $0.status == "active" && !incomingKeys.isDisjoint(with: $0.credentialKeys)
+            }) {
+                throw ParseError.duplicate(id: existing.id, message: "部分凭据已属于既有记录，请编辑原记录或移除重复凭据后重试")
+            }
+        }
         var dup: HistoryEntry? = nil
         if let d = history.findActiveByKey(key) {
+            if d.isCredentialPool {
+                throw ParseError.duplicate(id: d.id, message: "该凭据属于多 key 池，请编辑原池；单 key 导入不能覆盖整个池")
+            }
             if d.isDSHOnly {
                 throw ParseError.duplicate(id: d.id, message: "这是 DSH 专用记录，请通过「仅导入 DSH」更新")
             }
@@ -313,7 +327,6 @@ public final class Core {
             }
         }
 
-        let allKeys = Parser.extractAllKeys(raw)
         if allKeys.count > 1 {
             stage = "multikey_cpa"
             let useCPA = cpaOverride ?? prefs.useCPA
@@ -359,7 +372,26 @@ public final class Core {
                 status: "active"
             )
             entry.poolKeys = acceptedKeys
-            try history.append(entry)
+            do {
+                if let existing = try history.appendDedupByKey(entry) {
+                    throw ParseError.duplicate(id: existing.id, message: "探测期间另一进程已认领池内凭据，请移除重复凭据后重试")
+                }
+            } catch {
+                // 网络探测期间可能有另一端导入。只回滚本次未被其他活跃记录认领的凭据，
+                // 保留胜出者的 CPA key，不能留下无人负责清理的新池成员。
+                let owned = Set(history.snapshot().filter {
+                    $0.status == "active" && $0.targets.contains("cpa") &&
+                        Parser.normalizeURL($0.url ?? "") == Parser.normalizeURL(url)
+                }.flatMap(\.credentialKeys))
+                let unclaimed = acceptedKeys.filter { !owned.contains($0) }
+                if !unclaimed.isEmpty {
+                    do { _ = try CPAWriter(configPath: cfg).remove(apiKeys: unclaimed, baseURL: url) }
+                    catch let rollbackError {
+                        throw ParseError.io("账本保存失败: \(error.localizedDescription);CPA 回滚失败: \(rollbackError.localizedDescription)")
+                    }
+                }
+                throw error
+            }
             do { try prefs.save() } catch { multiLines.append("⚠ 偏好保存失败: \(error.localizedDescription)") }
             return AddOutcome(entry: entry, lines: multiLines, ok: true)
         }
@@ -917,10 +949,7 @@ public final class Core {
         // 新导入条目的模型在监控里全灰到第一次扫描/刷新)
         var importPoints: [String: ProbePoint] = [:]
         if let t = probedTest {
-            let lat = t.modelLatencies ?? [:]
-            let now = Date().timeIntervalSince1970
-            for m in t.workingModels { importPoints[m] = ProbePoint(t: now, ms: lat[m], ok: true) }
-            for m in t.quotaModels { importPoints[m] = ProbePoint(t: now, ms: lat[m], ok: false) }
+            importPoints = t.modelProbePoints(at: Date().timeIntervalSince1970)
         }
         for m in chatVerifiedModels where importPoints[m] == nil {
             // 显式要求且不在站点目录里的模型(逐个 chat 验证过的)也记 ok 点
@@ -1228,24 +1257,10 @@ public final class Core {
                 updated.healthDetail = decision.detail
                 updated.healthAt = now
                 updated.latencyMs = test.ok ? test.latencyMs : e.latencyMs
-                // 模型级监控:已探测的模型(通过/限流)各自记账 —— provider 导入多个模型,
-                // 每个模型都应有独立轨迹(用户确认的粒度)。degraded 模型 detail 里只有
-                // 一个名字,也标失败
-                var modelPoints: [String: ProbePoint] = [:]
-                if test.ok {
-                    let lat = test.modelLatencies ?? [:]
-                    for m in test.workingModels {
-                        modelPoints[m] = ProbePoint(t: now, ms: lat[m], ok: true)
-                    }
-                    for m in test.quotaModels {
-                        modelPoints[m] = ProbePoint(t: now, ms: lat[m], ok: false)
-                    }
-                } else if updated.health != "ok" {
-                    // key 级失败且防抖后仍判失败(死 key / 网关持续 5xx / 网络不通):
-                    // 本轮所有模型都不可用,全部记红格 —— 否则 key 挂掉期间模型条整体
-                    // 冻结成灰,看起来像「还没轮到测」,掩盖了死亡时间轴(真实反馈)。
-                    // 首败防抖轮(updated.health == "ok")不记,避免一次抖动把模型条
-                    // 染红而 key 级却绿着,两套信号互相矛盾
+                // 部分可用时也记录已确认失败的模型,防止旧绿格一直保留。
+                var modelPoints = test.ok ? test.modelProbePoints(at: now) : [:]
+                if !test.ok, updated.health != "ok" {
+                    // 整体失败沿用原行为;首次网络抖动经防抖后不把所有模型染红。
                     for m in e.models ?? (e.model.map { [$0] } ?? []) {
                         modelPoints[m] = ProbePoint(t: now, ms: nil, ok: false)
                     }
@@ -1351,7 +1366,8 @@ public final class Core {
                 guard let url = e.url, let key = e.key, !key.isEmpty else { return }
                 let px = self.proxyForHealth()
                 let test = APITester.test(url: url, key: key, timeout: 10, proxy: px,
-                                          preferredModel: e.model, importedModels: e.models, styleHint: e.apiStyle)
+                                          preferredModel: e.model, importedModels: e.models,
+                                          probePool: e.models ?? e.model.map { [$0] }, styleHint: e.apiStyle)
                 guard !test.skippedForCooldown else { return }
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 // 再确认目标仍缺失。用户可能在网络探测期间重新导入。
@@ -1367,13 +1383,15 @@ public final class Core {
                 } else {
                     note = "cc-switch provider 缺失(探测失败,key 状态未知);恢复后可手动重新导入"
                 }
+                let now = Date().timeIntervalSince1970
                 let point = test.reachabilityOnly ? nil : ProbePoint(
-                    t: Date().timeIntervalSince1970, ms: test.latencyMs,
+                    t: now, ms: test.latencyMs,
                     ok: health.health == "ok" || health.health == "proxy-ok")
                 do {
                     guard try self.history.mergeCCReconciliation(tested: e, health: health.health,
                                                                   detail: health.detail, authFailed: test.authFailed,
-                                                                  note: note, point: point) else { return }
+                                                                  note: note, point: point,
+                                                                  modelPoints: test.modelProbePoints(at: now)) else { return }
                     if test.authFailed || e.ccMissing != true {
                         outLock.lock()
                         out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」\(note)")
@@ -1765,9 +1783,20 @@ public final class Core {
         var added = 0, skippedExisting = 0, skippedSameKey = 0, skippedTombstone = 0
         var updatedFromFeed = 0, skippedLocalNewer = 0, tombstonePropagated = 0
         let snapshotNow = history.snapshot()
-        var localActiveKeys = Set(snapshotNow.filter { $0.status == "active" }.compactMap { $0.key })
-        // 本机墓碑(已删除)条目的 key:拉取/导入不得复活本机明确删除过的凭据
-        let localTombstoneKeys = Set(snapshotNow.filter { $0.status == "deleted" }.compactMap { $0.key })
+        var activeKeysByID = Dictionary(snapshotNow.filter { $0.status == "active" }
+            .map { ($0.id, Set($0.credentialKeys)) }, uniquingKeysWith: { $0.union($1) })
+        // 本机墓碑与本批即将传播的墓碑均先建立凭据集合，避免 payload 的先后顺序复活 key。
+        var localTombstoneKeys = Set(snapshotNow.filter { $0.status == "deleted" }.flatMap(\.credentialKeys))
+        if mode == .feed {
+            for tombstone in payload.entries where tombstone.status == "deleted" {
+                if let local = snapshotNow.first(where: { $0.id == tombstone.id }),
+                   local.status == "active",
+                   tombstone.deletedAt != nil || (local.updatedAt ?? 0) < (tombstone.updatedAt ?? 0) {
+                    localTombstoneKeys.formUnion(local.credentialKeys)
+                    localTombstoneKeys.formUnion(tombstone.credentialKeys)
+                }
+            }
+        }
         var feedChanged: [HistoryEntry] = []
         for var e in payload.entries {
             let local = history.find(idPrefix: e.id)
@@ -1778,9 +1807,26 @@ public final class Core {
                     // 健康更新不阻止显式删除。清理失败则保留绑定，下一次拉取可重试。
                     _ = try deleteEntry(local, deletedAt: deletedAt ?? Date().timeIntervalSince1970)
                     tombstonePropagated += 1
+                    activeKeysByID.removeValue(forKey: local.id)
+                    feedChanged.removeAll { $0.id == local.id }
                 } else {
                     skippedTombstone += 1
                 }
+                continue
+            }
+            let incomingKeys = Set(e.credentialKeys)
+            if !incomingKeys.isDisjoint(with: localTombstoneKeys) {
+                if mode == .feed, let local, local.status == "deleted",
+                   (e.updatedAt ?? 0) <= (local.updatedAt ?? 0) {
+                    skippedLocalNewer += 1
+                } else {
+                    skippedTombstone += 1
+                }
+                continue
+            }
+            let otherActiveKeys = activeKeysByID.filter { $0.key != e.id }.values
+            if otherActiveKeys.contains(where: { !incomingKeys.isDisjoint(with: $0) }) {
+                skippedSameKey += 1
                 continue
             }
             if mode == .feed, let local {
@@ -1882,7 +1928,9 @@ public final class Core {
                         merged.targets.append(t)
                     }
                     merged.updatedAt = Date().timeIntervalSince1970
+                    feedChanged.removeAll { $0.id == merged.id }
                     feedChanged.append(merged)
+                    activeKeysByID[merged.id] = Set(merged.credentialKeys)
                     updatedFromFeed += 1
                 } else {
                     skippedLocalNewer += 1
@@ -1890,10 +1938,6 @@ public final class Core {
                 continue
             }
             if history.find(idPrefix: e.id) != nil { skippedExisting += 1; continue }
-            if let k = e.key, !k.isEmpty {
-                if localActiveKeys.contains(k) { skippedSameKey += 1; continue }
-                if localTombstoneKeys.contains(k) { skippedTombstone += 1; continue }
-            }
             // 清来源机器的本地产物绑定:账本是可迁移的,产物绑定是机器本地的
             e.ccProviderID = nil
             e.ccRenamedFrom = nil
@@ -1901,10 +1945,12 @@ public final class Core {
             e.cpaConfigPath = nil
             e.grokConfigPath = nil
             e.ccMissing = nil
-            try history.append(e)
+            if try history.appendDedupByKey(e) != nil {
+                skippedSameKey += 1
+                continue
+            }
             added += 1
-            // 同批导入内的后续条目也要去重(导出文件理论上不会有重复 key,防御性兜底)
-            if let k = e.key { localActiveKeys.insert(k) }
+            activeKeysByID[e.id] = incomingKeys
         }
         // feed 模式的 LWW 替换条目整批落盘(含维护者墓碑传播);开关仅 migrate 应用
         // (订阅者自己的偏好自主,不被维护者的导出覆盖)
@@ -2160,7 +2206,9 @@ public final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
         let px = proxyForHealth()
-        let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
+        let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model,
+                                  importedModels: entry.models, probePool: entry.models ?? entry.model.map { [$0] },
+                                  styleHint: entry.apiStyle)
         if test.skippedForCooldown { return "暂缓探测: " + test.detail }
         noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
@@ -2171,6 +2219,7 @@ public final class Core {
                 found.healthDetail = h.detail
                 found.healthAt = Date().timeIntervalSince1970
                 found.failStreak = nil   // 手动重测成功即清零(审计 2026-11-14 P2)
+                recordProbeResult(test, for: found)
                 historyUpdateLogged(found)
             }
             let label = test.reachabilityOnly ? "网关可达" : (test.quotaExhausted ? "额度用尽" : "✓ 可用")
@@ -2180,6 +2229,7 @@ public final class Core {
             found.health = h.health
             found.healthDetail = h.detail
             found.healthAt = Date().timeIntervalSince1970
+            recordProbeResult(test, for: found)
             historyUpdateLogged(found)
         }
         return "✗ 不可用: \(test.detail)"
@@ -2357,6 +2407,24 @@ public final class Core {
         return out.joined(separator: "; ")
     }
 
+    /// 所有手动重测分支共享监控落盘,包括失败和改选后的第二次探测。
+    private func recordProbeResult(_ test: APITestResult, for entry: HistoryEntry) {
+        guard !test.skippedForCooldown, !test.reachabilityOnly else { return }
+        let now = entry.healthAt ?? Date().timeIntervalSince1970
+        var points = test.modelProbePoints(at: now)
+        if !test.ok {
+            for model in entry.models ?? (entry.model.map { [$0] } ?? []) where points[model] == nil {
+                points[model] = ProbePoint(t: now, ms: nil, ok: false)
+            }
+        }
+        do {
+            try history.appendProbePoint(id: entry.id, ok: test.ok && !test.quotaExhausted && !test.chatDegraded, ms: test.latencyMs, cpa: nil, at: now)
+            try history.appendModelProbePoints(id: entry.id, points: points)
+        } catch {
+            AppLog.warn("探测点写入失败: \(error.localizedDescription)")
+        }
+    }
+
     public func refreshModels(
         entryIDPrefix: String,
         proxy: String? = nil,
@@ -2371,7 +2439,8 @@ public final class Core {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
         let test = APITester.test(url: url, key: key, proxy: effProxy,
-                                  preferredModel: entry.model, importedModels: entry.models, styleHint: entry.apiStyle)
+                                  preferredModel: entry.model, importedModels: entry.models,
+                                  probePool: entry.models ?? entry.model.map { [$0] }, styleHint: entry.apiStyle)
         if test.ok { entry.apiStyle = test.style }
         if test.skippedForCooldown, pickModels == nil { throw ParseError.io(test.detail) }
         // 端点报错但 /models 拿到了清单 ≠ 不能改选:恰恰是勾选的那个模型 503/429 才最需要
@@ -2387,6 +2456,7 @@ public final class Core {
             entry.health = h.health
             entry.healthDetail = h.detail
             entry.healthAt = Date().timeIntervalSince1970
+            recordProbeResult(test, for: entry)
             historyUpdateLogged(entry)
             let deadMark = (test.authFailed || test.detail.contains("401") || test.detail.contains("403"))
                 ? "(key 已失效,已移入待删除区)" : ""
@@ -2417,28 +2487,14 @@ public final class Core {
             }
             entry.healthAt = Date().timeIntervalSince1970
             entry.failStreak = nil   // 手动重测成功即清零
-            // 手动重测同样进监控图(所有探测路径统一入档);probeLog 由 history.update
-            // 保留,不怕后续整条覆盖
-            do {
-                if !test.reachabilityOnly {
-                    try history.appendProbePoint(id: entry.id, ok: entry.healthColor.ok,
-                                                 ms: test.latencyMs, cpa: nil,
-                                                 at: entry.healthAt ?? Date().timeIntervalSince1970)
-                }
-                var mps: [String: ProbePoint] = [:]
-                let lat = test.modelLatencies ?? [:]
-                for m in test.workingModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: true) }
-                for m in test.quotaModels { mps[m] = ProbePoint(t: entry.healthAt ?? Date().timeIntervalSince1970, ms: lat[m], ok: false) }
-                try history.appendModelProbePoints(id: entry.id, points: mps)
-            } catch {
-                AppLog.warn("探测点写入失败: \(error.localizedDescription)")
-            }
+            recordProbeResult(test, for: entry)
         } else if !test.skippedForCooldown {
             // 改选路径:先如实记下本次失败,选完再重探覆盖(别停在旧模型的 503 上)
             let h = Self.healthFor(test)
             entry.health = h.health
             entry.healthDetail = h.detail
             entry.healthAt = Date().timeIntervalSince1970
+            recordProbeResult(test, for: entry)
         }
         let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
         let currentModels = Set(previousModels)
@@ -2656,19 +2712,32 @@ public final class Core {
         // 是死是活无从判断。全挂也保留用户的选择(清单是端点自己 /models 给的),
         // 只如实标 err 并留痕,下次扫描会重测
         var retestNote: String? = nil
-        if repickAfterFail {
+        if repickAfterFail || filtered != previousModels {
+            // 新选择必须用其自身的调用结果，目录里的其他模型成功不能替它背书。
+            if filtered != previousModels {
+                entry.viaCPAOk = nil
+                entry.viaCPAAt = nil
+            }
             let retest = APITester.test(url: url, key: key, proxy: effProxy,
-                                        preferredModel: filtered.first, importedModels: filtered, styleHint: entry.apiStyle)
+                                        preferredModel: filtered.first, importedModels: filtered,
+                                        probePool: filtered, styleHint: entry.apiStyle)
             let h = Self.healthFor(retest)
             if !retest.skippedForCooldown {
                 if retest.ok { entry.apiStyle = retest.style }
                 entry.health = h.health
                 entry.healthDetail = h.detail
                 entry.healthAt = Date().timeIntervalSince1970
+                entry.failStreak = retest.ok ? nil : 1
+                recordProbeResult(retest, for: entry)
+            } else if filtered != previousModels {
+                entry.health = nil
+                entry.healthAt = nil
+                entry.healthDetail = retest.detail
             }
-            retestNote = retest.ok
+            let confirmed = h.health == "ok" || h.health == "proxy-ok"
+            retestNote = confirmed
                 ? "✓ 改选的模型实测可用: \(h.detail)"
-                : "⚠ 已改选 \(filtered.count) 个模型,当前仍不可用: \(h.detail)(下次扫描自动重测)"
+                : "⚠ 已改选 \(filtered.count) 个模型,尚未验证可用: \(h.detail)(下次扫描自动重测)"
         }
 
         var syncWarn: String? = nil
@@ -2718,8 +2787,8 @@ public final class Core {
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
         let r = retestNote.map { "\n\($0)" } ?? ""
-        if repickAfterFail {
-            // 首探就是失败的,绝不能冒充「✓ 可用」
+        if retestNote != nil {
+            // 以新选择的复测结果报告，不能沿用旧模型的成功提示。
             return "已改选 \(filtered.count) 个模型(端点: \(test.detail))\(w)\(dshNote)\(cpaNote)\(r)"
         }
         return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
@@ -2774,7 +2843,10 @@ public final class Core {
         var effectiveKey = key
         let previousKey = key
         var keyRotated = false
-        if let newKey, !newKey.isEmpty, newKey != key {
+        if let newKey = newKey?.trimmingCharacters(in: .whitespacesAndNewlines), !newKey.isEmpty, newKey != key {
+            if let owner = history.findActiveByKey(newKey) {
+                throw ParseError.duplicate(id: owner.id, message: "新凭据已属于活跃记录，不能通过轮换重复认领")
+            }
             let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth(), styleHint: entry.apiStyle)
             guard test.ok else {
                 throw ParseError.io("新 key 验证失败,未做任何修改: \(test.detail)")
@@ -2782,10 +2854,16 @@ public final class Core {
             entry.apiStyle = test.style
             effectiveKey = newKey
             keyRotated = true
-            entry.key = newKey
-            entry.keyMasked = newKey.count > 8
-                ? String(newKey.prefix(6)) + "…" + String(newKey.suffix(4))
-                : String(repeating: "*", count: max(newKey.count, 6))
+            if entry.isCredentialPool {
+                entry.poolKeys = entry.credentialKeys.map { $0 == previousKey ? newKey : $0 }
+                entry.key = nil
+                entry.keyMasked = "\(entry.poolKeys!.count) 个 key"
+            } else {
+                entry.key = newKey
+                entry.keyMasked = newKey.count > 8
+                    ? String(newKey.prefix(6)) + "…" + String(newKey.suffix(4))
+                    : String(repeating: "*", count: max(newKey.count, 6))
+            }
             entry.health = "ok"
             entry.healthDetail = "key 已轮换,新 key 已通过完整探测"
             entry.healthAt = Date().timeIntervalSince1970
@@ -2845,6 +2923,25 @@ public final class Core {
         // 什么都没传也会走完整同步流程;name == "" 也漏判
         if (models ?? []).isEmpty && (name ?? "").isEmpty && !keyRotated && note == nil {
             return "无变更"
+        }
+
+        // 池轮换先确认 CPA 成功，再同步其他目标并保存账本；失败不能把旧池抛弃。
+        var poolRotationWriter: CPAWriter?
+        if keyRotated, entry.isCredentialPool, entry.targets.contains("cpa") {
+            let cfg: String?
+            if CPAAPI.apiMode {
+                cfg = entry.cpaConfigPath ?? prefs.resolvedCPAConfig()
+            } else {
+                cfg = entry.cpaConfigPath.flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+                    ?? prefs.resolvedCPAConfig()
+            }
+            guard let cfg else { throw ParseError.io("未找到 CPA 配置，凭据池未轮换") }
+            let writer = CPAWriter(configPath: cfg)
+            let message = try writer.rotateKey(baseURL: url, oldKey: previousKey, newKey: effectiveKey)
+            guard !message.isEmpty else { throw ParseError.io("CPA 组内未找到旧 key，凭据池未轮换") }
+            poolRotationWriter = writer
+            entry.cpaConfigPath = cfg
+            lines.append("✓ CPA: " + message)
         }
 
         let routedAppType = Self.routeAppType(
@@ -2984,7 +3081,7 @@ public final class Core {
                 do {
                     let writer = CPAWriter(configPath: cfg)
                     var cpaLines: [String] = []
-                    if keyRotated {
+                    if keyRotated, poolRotationWriter == nil {
                         let msg = try writer.rotateKey(baseURL: url, oldKey: previousKey, newKey: effectiveKey)
                         if !msg.isEmpty {
                             cpaLines.append(msg)
@@ -3017,7 +3114,16 @@ public final class Core {
             do { try history.appendModelProbePoints(id: entry.id, points: editModelPoints) }
             catch { AppLog.warn("编辑验证点写入失败: \(error.localizedDescription)") }
         }
-        try history.update(entry)
+        do { try history.update(entry) }
+        catch {
+            if let writer = poolRotationWriter {
+                do { _ = try writer.rotateKey(baseURL: url, oldKey: effectiveKey, newKey: previousKey) }
+                catch let rollbackError {
+                    throw ParseError.io("账本保存失败: \(error.localizedDescription);CPA 轮换回滚失败: \(rollbackError.localizedDescription)")
+                }
+            }
+            throw error
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -3424,22 +3530,14 @@ public final class Core {
     /// 取条目可用于探测/验证的凭据:单 key 直接读 key，多 key 优先读已接受的凭据池，
     /// 仅旧账本回退 raw。编辑/重测/curl 复制只需一把凭据，CPA 侧会轮询全池。
     public func extractKey(_ e: HistoryEntry) -> String? {
-        if let key = e.key, !key.isEmpty { return key }
-        if let keys = e.poolKeys { return keys.first }
-        if let parsed = try? Parser.parse(e.raw) { return parsed.key }
-        return nil
+        e.credentialKeys.first
     }
 
     /// 取条目对应的所有 key:优先读取持久化凭据；旧版多 key 条目从 raw 恢复。
     /// 返回 nil 表示无法恢复任何 key,调用方应跳过删除并报告失败。
     private func extractAllKeys(for e: HistoryEntry) -> [String]? {
-        if let key = e.key, !key.isEmpty { return [key] }
-        if let keys = e.poolKeys { return keys.isEmpty ? nil : keys }
-        let fromRaw = Parser.extractAllKeys(e.raw)
-        if fromRaw.isEmpty {
-            return (try? Parser.parse(e.raw)).flatMap { $0.key.map { [$0] } }
-        }
-        return fromRaw
+        let keys = e.credentialKeys
+        return keys.isEmpty ? nil : keys
     }
 
     public func list(limit: Int = 20) -> String {

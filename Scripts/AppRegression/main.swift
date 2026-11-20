@@ -19,6 +19,40 @@ func check(_ condition: @autoclosure () -> Bool, _ message: String) {
     if condition() { print("✓ \(message)") } else { failures += 1; print("✗ \(message)") }
 }
 
+func capturePickerOutput(_ body: () -> [String]?) throws -> ([String]?, String) {
+    let path = testDir + "/picker-\(UUID().uuidString).log"
+    FileManager.default.createFile(atPath: path, contents: nil)
+    let output = try FileHandle(forWritingTo: URL(fileURLWithPath: path))
+    let savedOutput = dup(STDOUT_FILENO)
+    fflush(stdout)
+    dup2(output.fileDescriptor, STDOUT_FILENO)
+    defer {
+        fflush(stdout)
+        dup2(savedOutput, STDOUT_FILENO)
+        close(savedOutput)
+        try? output.close()
+        try? FileManager.default.removeItem(atPath: path)
+    }
+    let result = body()
+    fflush(stdout)
+    return (result, try String(contentsOfFile: path, encoding: .utf8))
+}
+
+let failedCPA = ProbePoint(t: Date().timeIntervalSince1970, ms: 120, ok: true, cpa: false)
+let passedUpstream = ProbePoint(t: failedCPA.t, ms: 120, ok: true)
+let passedCPA = ProbePoint(t: failedCPA.t, ms: 120, ok: true, cpa: true)
+let failedUpstream = ProbePoint(t: failedCPA.t, ms: nil, ok: false, cpa: true)
+check(StatusCell.cellColor(failedCPA) == StatusCell.fail, "CPA 链路失败的监控格不能显示绿色")
+check(StatusCell.hoverText(failedCPA, uptime: 0).contains("上游通过") &&
+      StatusCell.hoverText(failedCPA, uptime: 0).contains("CPA 链路失败"),
+      "监控格提示区分上游通过和 CPA 链路失败")
+check(MonitorPresentation.uptimePercent([failedCPA, passedCPA]) == 50 &&
+      MonitorPresentation.uptimePercent([failedCPA]) == 0,
+      "CPA 失败点不计入监控通过率，避免错误显示 100%")
+check(MonitorPresentation.passed(passedUpstream) && MonitorPresentation.passed(passedCPA) &&
+      !MonitorPresentation.passed(failedUpstream) && MonitorPresentation.uptimePercent([]) == nil,
+      "未采集、直连通过和任一路径失败保持正确语义")
+
 let view = NSHostingView(rootView: PanelView(state: AppState()))
 let window = MainWindow.make(contentView: view)
 check(!(window is NSPanel), "使用普通 NSWindow")
@@ -198,6 +232,28 @@ Task { @MainActor in
         let secondPick = ModelPicker.pick(from: ["second-model"], title: "下一轮选择")
         check(firstPick == ["first-model"] && secondPick == ["second-model"],
               "完成选择后清空残留按键，下一轮不会被旧 Esc 误取消")
+        let manyModels = (1...25).map { String(format: "model-%02d", $0) }
+        do {
+            let (lastPick, output) = try capturePickerOutput {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+                    let down = Array(repeating: [UInt8]("\u{1B}[B".utf8), count: 24).flatMap { $0 }
+                    terminal.write(Data(down + [0x0d]))
+                }
+                return ModelPicker.pick(from: manyModels, title: "长列表选择")
+            }
+            let finalFrame = output.components(separatedBy: "\u{1B}[2J\u{1B}[H").last ?? ""
+            check(lastPick == ["model-25"] && finalFrame.contains("\u{1B}[7m[ ] model-25"),
+                  "超过 20 个模型后选择窗口跟随光标，当前项保持可见")
+            let (allPicked, _) = try capturePickerOutput {
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+                    terminal.write(Data([0x61, 0x0d]))
+                }
+                return ModelPicker.pick(from: manyModels, title: "按探测顺序多选")
+            }
+            check(allPicked == manyModels, "CLI 多选保留探测顺序，不随机改变默认模型")
+        } catch {
+            check(false, "可捕获隔离终端输出: \(error.localizedDescription)")
+        }
         dup2(originalInput, STDIN_FILENO)
         close(terminalMaster)
         close(terminalSlave)

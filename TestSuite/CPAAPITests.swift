@@ -56,6 +56,127 @@ private final class ConcurrentCPAConfigServer {
 /// 配置管理密钥后全部走 /v0/management/*,本地文件零触达;未配置回退文件模式)
 enum CPAAAPITests {
     static func run(_ h: Harness) {
+        h.runSuite("CPAAPI.model audit reads and replaces YAML variants") { t in
+            let variants: [(String, String)] = [
+                ("reordered", "    models:\n      - alias: preserve-alias\n        name: 'model-a' # selected\n"),
+                ("commented", "    models: # curated\n# a comment within the model list\n      - name: model-a\n        alias: preserve-alias\n"),
+                ("indentless", "    models:\n    - name: model-a\n      alias: preserve-alias\n"),
+                ("spaced", "    models:\n      -   name: model-a\n          alias: preserve-alias\n"),
+                ("standalone", "    models:\n      -\n          alias: preserve-alias\n          name: model-a\n"),
+                ("quoted", "    models:\n      - name: \"model-a\" # quoted model ID\n        alias: preserve-alias\n")
+            ]
+            for (label, modelLines) in variants {
+                let env = try TestEnv("model-audit-replace-\(label)")
+                defer { env.cleanup() }
+                let fixture = "port: 8317\nopenai-compatibility:\n  - name: models\n    base-url: https://models.example/v1\n" + modelLines
+                    + "    api-key-entries:\n      - api-key: sk-model-fixture1111\n  - name: untouched\n    base-url: https://untouched.example/v1\n    models:\n      - name: untouched-model\n"
+                env.write("cpa-config.yaml", fixture)
+                let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+                t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-a"], "\(label) 读取真实模型 ID")
+                do {
+                    _ = try writer.updateAggregatedModels(baseURL: "https://models.example/v1", models: ["model-b"])
+                    let config = env.read("cpa-config.yaml")
+                    t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-b"], "\(label) 更新后只剩本次选择")
+                    t.expect(!config.contains("model-a"), "\(label) 移除旧模型")
+                    t.contains(config, "sk-model-fixture1111", "\(label) 保留凭据池")
+                    t.contains(config, "untouched-model", "\(label) 不修改相邻 provider")
+                } catch {
+                    t.expect(false, "\(label) 合法 YAML 更新失败: \(error.localizedDescription)")
+                }
+            }
+        }
+        h.runSuite("CPAAPI.model audit image updates are idempotent") { t in
+            let variants: [(String, String)] = [
+                ("reordered", "    models:\n      - alias: preserve-alias\n        name: model-a\n        image: false\n"),
+                ("commented", "    models: # curated image models\n# comment before image model\n      - name: model-a\n        alias: preserve-alias\n"),
+                ("indentless", "    models:\n    - name: model-a\n      alias: preserve-alias\n"),
+                ("spaced", "    models:\n      -   name: model-a\n          alias: preserve-alias\n          image: false\n"),
+                ("standalone", "    models:\n      -\n          name: model-a\n          alias: preserve-alias\n"),
+                ("image-first", "    models:\n      - image: false\n        name: model-a\n        alias: preserve-alias\n")
+            ]
+            for (label, modelLines) in variants {
+                let env = try TestEnv("model-audit-image-\(label)")
+                defer { env.cleanup() }
+                env.write("cpa-config.yaml", "port: 8317\nopenai-compatibility:\n  - name: models.example-image\n    base-url: https://models.example/v1\n"
+                          + modelLines + "    api-key-entries:\n      - api-key: sk-model-fixture1111\n")
+                let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+                do {
+                    _ = try writer.addImageChannel(baseURL: "https://models.example/v1", key: "sk-model-fixture1111", models: ["model-a"])
+                    let first = env.read("cpa-config.yaml")
+                    t.equal(first.components(separatedBy: "name: model-a").count - 1, 1, "\(label) 不重复追加模型")
+                    t.expect(!first.contains("image: false"), "\(label) 原模型 image 标记原位更新")
+                    t.contains(first, "preserve-alias", "\(label) 保留用户别名")
+                    _ = try writer.addImageChannel(baseURL: "https://models.example/v1", key: "sk-model-fixture1111", models: ["model-a"])
+                    t.equal(env.read("cpa-config.yaml"), first, "\(label) 重复导入幂等")
+                    _ = try writer.addImageChannel(baseURL: "https://models.example/v1", key: "sk-model-fixture1111", models: ["model-b"])
+                    t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-a", "model-b"], "\(label) 新模型追加为同级子项")
+                } catch {
+                    t.expect(false, "\(label) 合法图片模型更新失败: \(error.localizedDescription)")
+                }
+            }
+        }
+        h.runSuite("CPAAPI.model audit models may be the first property") { t in
+            let env = try TestEnv("model-audit-first-property")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", """
+            port: 8317
+            openai-compatibility:
+              - models:
+                  - name: model-a
+                    alias: preserve-alias
+                name: models.example-image
+                base-url: https://models.example/v1
+                api-key-entries:
+                  - api-key: sk-model-fixture1111
+            """)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-a"], "首属性 models 可以读取")
+            _ = try writer.addImageChannel(baseURL: "https://models.example/v1", key: "sk-model-fixture1111", models: ["model-a"])
+            t.equal(env.read("cpa-config.yaml").components(separatedBy: "models:").count - 1, 1, "不重复追加 models 属性")
+            _ = try writer.updateAggregatedModels(baseURL: "https://models.example/v1", models: ["model-b"])
+            t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-b"], "替换首属性 models 下的列表")
+        }
+        h.runSuite("CPAAPI.model audit expands explicit empty lists") { t in
+            for operation in ["replace", "image"] {
+                let env = try TestEnv("model-audit-empty-\(operation)")
+                defer { env.cleanup() }
+                env.write("cpa-config.yaml", """
+                port: 8317
+                openai-compatibility:
+                  - name: models.example-image
+                    base-url: https://models.example/v1
+                    models: [] # no selected models yet
+                    api-key-entries:
+                      - api-key: sk-model-fixture1111
+                """)
+                let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+                do {
+                    if operation == "replace" {
+                        _ = try writer.updateAggregatedModels(baseURL: "https://models.example/v1", models: ["model-a"])
+                    } else {
+                        _ = try writer.addImageChannel(baseURL: "https://models.example/v1", key: "sk-model-fixture1111", models: ["model-a"])
+                    }
+                    t.equal(writer.entryModels(baseURL: "https://models.example/v1"), ["model-a"], "\(operation) 空列表可扩展")
+                    t.equal(env.read("cpa-config.yaml").components(separatedBy: "models:").count - 1, 1, "\(operation) 不重复建段")
+                } catch {
+                    t.expect(false, "\(operation) 空列表扩展失败: \(error.localizedDescription)")
+                }
+            }
+        }
+        h.runSuite("CPAAPI.model audit preserves curated models during key merge") { t in
+            let env = try TestEnv("model-audit-curated")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .openAI)
+            let url = "http://127.0.0.1:\(server.port)/v1"
+            env.write("cpa-config.yaml", "port: 8317\nopenai-compatibility:\n  - name: manual\n    base-url: \(url)\n    models: # curated\n      - alias: favorite-model\n        name: model-a\n    api-key-entries:\n      - api-key: sk-previous-fixture1111\n")
+            Prefs.shared.cpaResident = false
+            let core = Core()
+            _ = try core.add(raw: "\(url)\nsk-new-model-fixture2222", ccOverride: false, grokOverride: false,
+                             cpaOverride: true, dshOverride: false, models: ["model-b"], force: true)
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            t.equal(writer.entryModels(baseURL: url), ["model-a"], "新凭据合并时识别并保留手写精选模型")
+            t.contains(env.read("cpa-config.yaml"), "sk-new-model-fixture2222", "新凭据仍成功合并")
+        }
         h.runSuite("CPAAPI.cross-review spaced credential indentation") { t in
             let env = try TestEnv("cross-review-spaced-key")
             defer { env.cleanup() }

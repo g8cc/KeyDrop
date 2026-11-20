@@ -48,6 +48,83 @@ enum LedgerTransferTests {
             t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
                      "显式凭据池变化参与同步指纹")
         }
+        h.runSuite("LedgerTransfer.sync fingerprint preserves field boundaries") { t in
+            var first = HistoryTests.entry("fingerprint-boundaries", ts: 1)
+            first.name = "provider|label"
+            first.note = "note"
+            var second = first
+            second.name = "provider"
+            second.note = "label|note"
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "名称与备注中含分隔符时不能漏掉实际修改")
+            first.models = ["fixture-a,fixture-b"]
+            second = first
+            second.models = ["fixture-a", "fixture-b"]
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "模型元素边界参与指纹")
+            first.models = nil
+            first.model = "legacy-model-a"
+            second = first
+            second.model = "legacy-model-b"
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "旧账本只有单模型字段时仍检测模型变更")
+            second = first
+            second.apiStyle = "anthropic"
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "协议变化影响重放和探测，必须同步")
+            second = first
+            second.format = "dsh-only"
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "导入类型变化必须同步")
+            first.key = nil
+            first.poolKeys = nil
+            first.raw = ""
+            second = first
+            second.poolKeys = []
+            t.expect(LedgerCrypto.ledgerFingerprint([first]) != LedgerCrypto.ledgerFingerprint([second]),
+                     "旧凭据未知与已确认空凭据池语义不同")
+            let another = HistoryTests.entry("fingerprint-order", ts: 2)
+            t.equal(LedgerCrypto.ledgerFingerprint([first, another]),
+                    LedgerCrypto.ledgerFingerprint([another, first]), "账本排序不触发上传")
+            second = first
+            second.health = "err"
+            second.healthAt = 100
+            second.updatedAt = 100
+            second.probeLog = [ProbePoint(t: 100, ms: 12, ok: false)]
+            t.equal(LedgerCrypto.ledgerFingerprint([first]), LedgerCrypto.ledgerFingerprint([second]),
+                    "高频探测状态和时间变化仍不触发上传")
+        }
+        h.runSuite("WebDAV.automatic push detects delimiter edits") { t in
+            let env = try TestEnv("webdav-auto-push-boundaries")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .webdav)
+            let core = Core()
+            Prefs.shared.webdavURL = "http://127.0.0.1:\(server.port)/dav/keydrop"
+            Prefs.shared.webdavUser = "fixture"
+            Prefs.shared.webdavPass = "fixture"
+            Prefs.shared.webdavExportPass = "fixture-passphrase"
+            var record = HistoryTests.entry("webdav-delimiter-edits", ts: 1)
+            record.name = "provider|label"
+            record.note = "note"
+            try core.history.append(record)
+            _ = try core.webdavPush(force: false)
+            record.name = "provider"
+            record.note = "label|note"
+            try core.history.update(record)
+            let result = try core.webdavPush(force: false)
+            t.contains(result, "已推送", "实际内容修改必须上传")
+            server.mgmtLock.lock()
+            let pushes = server.davPushCount
+            let stored = server.davStore["/dav/keydrop/KeyDrop-ledger.keydrop"] ?? Data()
+            server.mgmtLock.unlock()
+            t.equal(pushes, 2, "远端收到第二次修改")
+            let payload = try JSONDecoder().decode(LedgerPayload.self,
+                from: LedgerCrypto.open(stored, passphrase: "fixture-passphrase"))
+            let remote = payload.entries.first { $0.id == record.id }
+            t.equal(remote?.name, record.name, "加密快照保存新名称")
+            t.equal(remote?.note, record.note, "加密快照保存新备注")
+            t.contains(try core.webdavPush(force: false), "跳过推送", "内容没变仍跳过加密与上传")
+        }
         h.runSuite("LedgerTransfer.replay does not resurrect rejected pool keys") { t in
             let env = try TestEnv("ledger-replay-filtered-pool")
             defer { env.cleanup() }

@@ -163,6 +163,31 @@ enum HistoryTests {
             e.format = "dsh-only"
             t.equal(e.availability, .dshOnly, "仅 DSH 验证")
         }
+        h.runSuite("History.CPA chain failures affect availability and uptime") { t in
+            var e = entry("cpa-monitor-status", ts: 1)
+            e.health = "ok"
+            e.healthAt = 10
+            e.targets = ["cpa"]
+            e.viaCPAOk = false
+            e.viaCPAAt = 10
+            t.expect(!e.healthColor.ok, "已知 CPA 链路失败不能显示 provider 绿点")
+            t.equal(HistorySections([e]).okCount, 0, "链路失败不计入可用数量")
+            t.equal(HistorySections([e]).warnCount, 1, "链路失败仍计入异常横幅")
+            t.contains(e.availability.label, "CPA", "明确区分上游可用与 CPA 链路失败")
+            let points = [ProbePoint(t: 9, ms: 10, ok: true, cpa: true),
+                          ProbePoint(t: 10, ms: 10, ok: true, cpa: false)]
+            e.probeLog = points
+            e.modelProbeLog = ["fixture-model": points]
+            t.equal(e.uptimePercent, 50, "总览通过率与实际链路一致")
+            t.equal(e.modelUptimes["fixture-model"], 50, "模型通过率与格子颜色一致")
+            e.targets = []
+            t.expect(e.healthColor.ok, "已经移除 CPA 目标时旧 CPA 结果不影响直连状态")
+            e.targets = ["cpa"]
+            e.viaCPAOk = nil
+            t.expect(e.healthColor.ok, "没测 CPA 不伪造链路失败")
+            e.probeLog = [ProbePoint(t: 11, ms: nil, ok: true)]
+            t.equal(e.uptimePercent, 100, "未测链路的直连通过率保持原语义")
+        }
         h.runSuite("History.protocol compatibility") { t in
             let env = try TestEnv("hist-protocol")
             defer { env.cleanup() }

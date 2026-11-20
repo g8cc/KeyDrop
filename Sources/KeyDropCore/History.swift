@@ -43,6 +43,34 @@ public struct HistoryEntry: Codable {
     public var key: String?
     /// 多 key 导入经过认证筛选后实际写入的凭据；nil 表示旧账本尚未确认。
     public var poolKeys: [String]? = nil
+
+    public var isCredentialPool: Bool { poolKeys != nil || format == "cpa-multikey" }
+
+    /// 凭据身份、删除和重放共用这一来源。显式空池不能回退 raw 中被拒绝的 key。
+    /// 兼容旧版池轮换留下的 key + poolKeys/raw:单 key 是原池首项的替换值，
+    /// 其余成员仍属于本条目，旧首项不得在重放时复活。
+    public var credentialKeys: [String] {
+        let explicitKey = key?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var candidates: [String]
+        if let poolKeys {
+            candidates = poolKeys
+        } else if isCredentialPool || explicitKey?.isEmpty != false {
+            candidates = Parser.extractAllKeys(raw)
+            if candidates.isEmpty, let parsed = try? Parser.parse(raw), let key = parsed.key {
+                candidates = [key]
+            }
+        } else {
+            candidates = []
+        }
+        if let explicitKey, !explicitKey.isEmpty {
+            candidates = isCredentialPool ? [explicitKey] + candidates.dropFirst() : [explicitKey]
+        }
+        var seen = Set<String>()
+        return candidates.compactMap {
+            let value = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !value.isEmpty && seen.insert(value).inserted ? value : nil
+        }
+    }
     public var keyMasked: String
     public var targets: [String]
     public var ccProviderID: String?
@@ -94,7 +122,7 @@ public struct HistoryEntry: Codable {
     /// 只按已采集格算(灰格不拉低),nil=尚无采集数据
     public var uptimePercent: Int? {
         guard let log = probeLog, !log.isEmpty else { return nil }
-        let ok = log.filter { $0.ok }.count
+        let ok = log.filter { $0.ok && $0.cpa != false }.count
         return Int((Double(ok) / Double(log.count) * 100).rounded())
     }
 
@@ -102,7 +130,7 @@ public struct HistoryEntry: Codable {
     public var modelUptimes: [String: Int] {
         var out: [String: Int] = [:]
         for (m, log) in modelProbeLog ?? [:] where !log.isEmpty {
-            let ok = log.filter { $0.ok }.count
+            let ok = log.filter { $0.ok && $0.cpa != false }.count
             out[m] = Int((Double(ok) / Double(log.count) * 100).rounded())
         }
         return out
@@ -175,7 +203,7 @@ public struct HistoryEntry: Codable {
     public var isDSHOnly: Bool { format == "dsh-only" }
 
     public enum Availability: Equatable {
-        case unverified, reachable, available, proxyAvailable, retry, quota, error, dead, dshOnly, inactive
+        case unverified, reachable, available, proxyAvailable, retry, quota, error, chainError, dead, dshOnly, inactive
 
         public var label: String {
             switch self {
@@ -186,6 +214,7 @@ public struct HistoryEntry: Codable {
             case .retry: return "最近一次探测失败，待复测"
             case .quota: return "额度用尽或所选模型均探测失败"
             case .error: return "探测失败"
+            case .chainError: return "上游通过，CPA 链路探测失败"
             case .dead: return "接口拒绝认证"
             case .dshOnly: return "DSH 专用，请在 DSH 内验证"
             case .inactive: return "记录已停用"
@@ -205,6 +234,7 @@ public struct HistoryEntry: Codable {
             if allConfiguredModelsLimited { return .quota }
             if (failStreak ?? 0) > 0 { return .retry }
             guard healthAt != nil else { return .unverified }
+            if targets.contains("cpa"), viaCPAOk == false { return .chainError }
             return health == "proxy-ok" ? .proxyAvailable : .available
         default: return .unverified
         }
@@ -691,7 +721,7 @@ public final class HistoryStore {
     private static func sameProbeConfiguration(_ current: HistoryEntry, _ tested: HistoryEntry) -> Bool {
         current.status == "active" && !current.isDSHOnly &&
             current.format == tested.format && current.url == tested.url && current.key == tested.key &&
-            (current.key != nil || (current.raw == tested.raw && current.poolKeys == tested.poolKeys)) &&
+            current.credentialKeys == tested.credentialKeys &&
             current.model == tested.model && current.models == tested.models &&
             current.targets.contains("cpa") == tested.targets.contains("cpa") &&
             current.cpaConfigPath == tested.cpaConfigPath
@@ -700,7 +730,8 @@ public final class HistoryStore {
     /// 只在被测配置仍有效时，合并对账产生的字段，保留同时发生的用户编辑。
     @discardableResult
     func mergeCCReconciliation(tested: HistoryEntry, health: String, detail: String,
-                               authFailed: Bool, note: String, point: ProbePoint?) throws -> Bool {
+                               authFailed: Bool, note: String, point: ProbePoint?,
+                               modelPoints: [String: ProbePoint] = [:]) throws -> Bool {
         lock.lock()
         defer { lock.unlock() }
         return try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
@@ -732,6 +763,13 @@ public final class HistoryStore {
             updated.updatedAt = max(current.updatedAt ?? 0, now)
             if let point {
                 updated.probeLog = Array(((updated.probeLog ?? []) + [point]).suffix(30))
+            }
+            if !modelPoints.isEmpty {
+                var log = updated.modelProbeLog ?? [:]
+                for (model, point) in modelPoints {
+                    log[model] = Array(((log[model] ?? []) + [point]).suffix(30))
+                }
+                updated.modelProbeLog = log
             }
             _items[i] = updated
             do { try saveLockedNoFlock(dirtyIDs: [current.id]) }
@@ -866,7 +904,7 @@ public final class HistoryStore {
         let wantKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !wantKey.isEmpty else { return nil }
         return snapshot().first {
-            $0.status == "active" && ($0.key ?? "") == wantKey
+            $0.status == "active" && $0.credentialKeys.contains(wantKey)
         }
     }
 
@@ -875,9 +913,10 @@ public final class HistoryStore {
     /// 对方,各建一条重复记录。这里在 flock 临界区内对文件做最终查重:
     /// 命中文件中的 active 同 key 条目 → 返回它(不插入);未命中 → 插入并返回 nil
     public func appendDedupByKey(_ e: HistoryEntry) throws -> HistoryEntry? {
+        let incomingKeys = Set(e.credentialKeys)
         func isDup(_ other: HistoryEntry) -> Bool {
-            guard let k = e.key?.trimmingCharacters(in: .whitespacesAndNewlines), !k.isEmpty else { return false }
-            return other.status == "active" && (other.key ?? "") == k && other.id != e.id
+            other.status == "active" && other.id != e.id &&
+                !incomingKeys.isDisjoint(with: other.credentialKeys)
         }
         lock.lock(); defer { lock.unlock() }
         refreshIfExternalChangeLocked()

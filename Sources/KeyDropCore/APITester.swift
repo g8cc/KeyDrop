@@ -18,6 +18,8 @@ public struct APITestResult {
     /// key 级判定不再被单个模型的 429 绑架:任一模型可用即 key 可用,
     /// 限流模型交给调用方排除/提示(真实事故:免费模型可用但首选模型 429,整 key 误入额度区)
     public let quotaModels: [String]
+    /// 本轮实际探测失败的模型;不包含因冷却而跳过的模型。
+    public let failedModels: [String]
     /// 首个可用模型的 chat 探测端到端延迟(毫秒)。实战监控用:慢网关也是"可用",
     /// 延迟让用户对体感有预期
     public let latencyMs: Double?
@@ -28,7 +30,7 @@ public struct APITestResult {
     public let transientFailure: Bool
     public let reachabilityOnly: Bool
     public let skippedForCooldown: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false, skippedForCooldown: Bool = false) {
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], failedModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false, skippedForCooldown: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -39,11 +41,21 @@ public struct APITestResult {
         self.chatDegraded = chatDegraded
         self.workingModels = workingModels
         self.quotaModels = quotaModels
+        self.failedModels = failedModels
         self.latencyMs = latencyMs
         self.modelLatencies = modelLatencies
         self.transientFailure = transientFailure
         self.reachabilityOnly = reachabilityOnly
         self.skippedForCooldown = skippedForCooldown
+    }
+
+    /// 只将真实请求的结果转成监控点;冷却/仅目录可达不会制造模型结果。
+    public func modelProbePoints(at time: TimeInterval) -> [String: ProbePoint] {
+        guard !skippedForCooldown, !reachabilityOnly else { return [:] }
+        var points: [String: ProbePoint] = [:]
+        for model in workingModels { points[model] = ProbePoint(t: time, ms: modelLatencies?[model], ok: true) }
+        for model in quotaModels + failedModels { points[model] = ProbePoint(t: time, ms: modelLatencies?[model], ok: false) }
+        return points
     }
 }
 
@@ -222,7 +234,7 @@ public enum APITester {
                                      detail: via.detail + " | 需代理(本轮跳过直连)",
                                      authFailed: false, needsProxy: true,
                                      quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
-                                     workingModels: via.workingModels, quotaModels: via.quotaModels,
+                                     workingModels: via.workingModels, quotaModels: via.quotaModels, failedModels: via.failedModels,
                                      latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
                                      transientFailure: false, reachabilityOnly: via.reachabilityOnly)
             }
@@ -236,7 +248,7 @@ public enum APITester {
                                  detail: via.detail, authFailed: via.authFailed,
                                  needsProxy: true, quotaExhausted: via.quotaExhausted,
                                  chatDegraded: via.chatDegraded, workingModels: via.workingModels,
-                                 quotaModels: via.quotaModels, latencyMs: via.latencyMs,
+                                 quotaModels: via.quotaModels, failedModels: via.failedModels, latencyMs: via.latencyMs,
                                  modelLatencies: via.modelLatencies,
                                  transientFailure: via.transientFailure && direct.transientFailure)
         }
@@ -259,7 +271,7 @@ public enum APITester {
                                  detail: via.detail + " | 直连失败,需代理,经代理验证通过",
                                  authFailed: false, needsProxy: true,
                                  quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
-                                 workingModels: via.workingModels, quotaModels: via.quotaModels,
+                                 workingModels: via.workingModels, quotaModels: via.quotaModels, failedModels: via.failedModels,
                                  latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
                                  reachabilityOnly: via.reachabilityOnly)
         }
@@ -335,6 +347,7 @@ public enum APITester {
                 }
                 var working: [String] = []
                 var quotaModels: [String] = []
+                var failedModels: [String] = []
                 var degradedModel: (String, Int)? = nil
                 var authModel: (String, Int)? = nil
                 var gatedModels: [String] = []
@@ -357,6 +370,7 @@ public enum APITester {
                         // key 开放,不是 key 死了。有可用模型就继续,403 只记账
                         if authModel == nil { authModel = (probe, st) }
                         gatedModels.append(probe)
+                        failedModels.append(probe)
                         // 403 可能只限制当前模型，继续验证其余模型才能判断整把 key。
                         if st == 401 && working.isEmpty { break }
                         continue
@@ -364,11 +378,13 @@ public enum APITester {
                     if let ms = chat.latencyMs { modelLatencies[probe] = ms }
                     if chat.quota != nil { quotaModels.append(probe); continue }
                     if let st = chat.degraded {
+                        failedModels.append(probe)
                         if degradedModel == nil { degradedModel = (probe, st) }
                         if let detail = chat.detail { lastErr = detail }
                         continue
                     }
                     if chat.networkError {
+                        failedModels.append(probe)
                         // 全部 chat 路径超时/无响应:模型不可达,绝不能计入 working
                         // (归入 degraded,与 5xx「服务不可用」同向)
                         if degradedModel == nil { degradedModel = (probe, 0) }
@@ -385,10 +401,13 @@ public enum APITester {
                                          detail: cooldownDetail ?? "服务端限流冷却中",
                                          authFailed: false, skippedForCooldown: true)
                 }
+                let realModels = Set(models + (probePool ?? []) + (preferredModel.map { [$0] } ?? []))
+                let reportedFailures = failedModels.filter { realModels.contains($0) }
                 if let (m, st) = authModel, working.isEmpty {
                     return APITestResult(ok: false, style: style, models: models,
                                          detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(\(m) 认证失败/key 失效)",
-                                         authFailed: true)
+                                         authFailed: true, quotaModels: quotaModels.filter { realModels.contains($0) },
+                                         failedModels: reportedFailures, modelLatencies: modelLatencies)
                 }
                 // models 为空时探测用的是占位 "test",不得混进返回模型列表;有真实模型才重排
                 let hasRealModels = !models.isEmpty
@@ -396,27 +415,32 @@ public enum APITester {
                     let q = quotaModels.isEmpty ? "" : ",其中 \(quotaModels.count) 个模型限流(\(quotaModels.prefix(3).joined(separator: "、"))\(quotaModels.count > 3 ? " 等" : ""))"
                     let g = gatedModels.isEmpty ? "" : ",\(gatedModels.count) 个模型本 key 无权限(\(gatedModels.prefix(2).joined(separator: "、"))\(gatedModels.count > 2 ? " 等" : ""))"
                     let probedModels = Set(working + quotaModels)
+                    let catalog = Set(models)
                     let reordered = hasRealModels
-                        ? (working + models.filter { !probedModels.contains($0) } + quotaModels)
+                        ? (working.filter { catalog.contains($0) } + models.filter { !probedModels.contains($0) } + quotaModels.filter { catalog.contains($0) })
                         : models
                     return APITestResult(ok: true, style: style, models: reordered,
                                          detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q + g,
                                          authFailed: false,
-                                         workingModels: hasRealModels ? working : [], quotaModels: hasRealModels ? quotaModels : [],
+                                         workingModels: working.filter { realModels.contains($0) },
+                                         quotaModels: quotaModels.filter { realModels.contains($0) }, failedModels: reportedFailures,
                                          latencyMs: firstWorkingLatency,
-                                         modelLatencies: hasRealModels && !modelLatencies.isEmpty ? modelLatencies : nil)
+                                         modelLatencies: modelLatencies.isEmpty ? nil : modelLatencies)
                 }
                 if let (m, st) = degradedModel {
                     if st == 0 { sawTransient = true }
                     let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
                     return APITestResult(ok: false, style: style, models: models,
                                          detail: "GET \(ep) → 200, 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)" + (lastErr == "无" ? "" : " | \(lastErr)"),
-                                         authFailed: false)
+                                         authFailed: false, quotaModels: quotaModels.filter { realModels.contains($0) },
+                                         failedModels: reportedFailures, modelLatencies: modelLatencies,
+                                         transientFailure: failedModels.count > 0 && modelLatencies.isEmpty && st == 0)
                 }
-                if !quotaModels.isEmpty, hasRealModels {
+                if !quotaModels.isEmpty, !realModels.isEmpty {
                     return APITestResult(ok: true, style: style, models: models,
                                          detail: "GET \(ep) → 200, 但探测的 \(quotaModels.count) 个模型均 quota exhausted(无额度)",
-                                         authFailed: false, quotaExhausted: true, quotaModels: quotaModels)
+                                         authFailed: false, quotaExhausted: true, quotaModels: quotaModels.filter { realModels.contains($0) },
+                                         failedModels: reportedFailures, modelLatencies: modelLatencies)
                 }
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "GET \(ep) → 200，未验证对话模型",

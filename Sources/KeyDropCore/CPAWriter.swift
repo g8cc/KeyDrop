@@ -246,14 +246,14 @@ public final class CPAWriter {
                 for m in modelList {
                     // 每次插入都可能位移行号,逐项重新定位条目范围
                     let fresh = findAggregatedEntry(in: lines, providerName: providerName) ?? entryRange
-                    markImageModel(&lines, entryRange: fresh, model: m)
+                    try markImageModel(&lines, entryRange: fresh, model: m)
                 }
             } else {
                 try appendAggregatedEntry(&lines, providerName: providerName, baseURL: url,
                                           keys: [k], models: modelList, proxy: proxy)
                 for m in modelList {
                     guard let fresh = findAggregatedEntry(in: lines, providerName: providerName) else { break }
-                    markImageModel(&lines, entryRange: fresh, model: m)
+                    try markImageModel(&lines, entryRange: fresh, model: m)
                 }
             }
             try atomicWrite(lines.joined(separator: "\n"))
@@ -267,82 +267,43 @@ public final class CPAWriter {
     /// - models 段存在但无此子项 → 段尾追加 name+alias+image: true
     /// - 条目无 models 段 → 条目末尾新建 models: 段带标记项
     /// 幂等:同 key 重复 image-add 只会重写 image: true 行,不产生重复项
-    /// (子项判重按 `- name:` 行精确匹配,`entryModels` 同源读 name)
-    private func markImageModel(_ lines: inout [String], entryRange: Range<Int>, model: String) {
-        guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
-            // 条目无 models 段:在条目末尾(去尾随空行)追加 models: 头 + 带标记的模型项。
-            // 不能走 mergeAggregatedModels —— 它只写 name+alias,会漏掉 image: true
+    /// 子项按直接 name 属性判重,与 entryModels 共用解析口径。
+    private func markImageModel(_ lines: inout [String], entryRange: Range<Int>, model: String) throws {
+        guard let property = mappingProperty("models", in: lines, itemRange: entryRange),
+              let range = mappingSequenceRange("models", in: lines, itemRange: entryRange) else {
             let propIndent = String(repeating: " ", count: mappingIndent(in: lines, itemRange: entryRange))
             var insertAt = entryRange.upperBound
             while insertAt > entryRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
-            let block = [
+            lines.insert(contentsOf: [
                 "\(propIndent)models:",
                 "\(propIndent)  - name: \(yamlScalar(model))",
                 "\(propIndent)    alias: \(yamlScalar(model))",
                 "\(propIndent)    image: true",
-            ]
-            lines.insert(contentsOf: block, at: insertAt)
+            ], at: insertAt)
             return
         }
-        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
-        // 遍历 models 子项找 name == model
-        var i = header + 1
-        while i < entryRange.upperBound {
-            let line = lines[i]
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { i += 1; continue }
-            let curIndent = line.prefix(while: { $0 == " " || $0 == "\t" }).count
-            if curIndent <= headerIndent { break } // 出了 models 段
-            if trimmed.hasPrefix("- name:") {
-                let nm = stripYAMLValue(String(trimmed.dropFirst("- name:".count))).trimmingCharacters(in: .whitespaces)
-                if nm == model {
-                    // 找到子项:确定其行范围(到下一条同级或更浅缩进的非空行为止)
-                    var end = entryRange.upperBound
-                    var j = i + 1
-                    while j < entryRange.upperBound {
-                        let lj = lines[j]
-                        let tj = lj.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if tj.isEmpty { j += 1; continue }
-                        let ij = lj.prefix(while: { $0 == " " || $0 == "\t" }).count
-                        if ij <= curIndent { end = j; break }
-                        j += 1
-                    }
-                    let imgIndent = String(repeating: " ", count: curIndent + 2)
-                    if let imgLine = (i+1..<end).first(where: {
-                        lines[$0].trimmingCharacters(in: .whitespaces).hasPrefix("image:")
-                    }) {
-                        lines[imgLine] = "\(imgIndent)image: true"
-                    } else {
-                        // 插到子项末尾(end 前进至最后一条非空子项行之后)
-                        var ins = end
-                        while ins > i + 1, lines[ins - 1].trimmingCharacters(in: .whitespaces).isEmpty { ins -= 1 }
-                        lines.insert("\(imgIndent)image: true", at: ins)
-                    }
-                    return
-                }
+        try expandEmptyModelsHeader(&lines, header: property.line)
+        if let existing = modelItems(in: lines, range: range).first(where: { $0.name == model }) {
+            if let image = mappingProperty("image", in: lines, itemRange: existing.item.range),
+               let propertyStart = lines[image.line].range(of: "image:")?.lowerBound {
+                // image 可以是模型子项的首属性;保留 dash 与属性缩进。
+                lines[image.line] = String(lines[image.line][..<propertyStart]) + "image: true"
+            } else {
+                let indent = String(repeating: " ", count: mappingIndent(in: lines, itemRange: existing.item.range))
+                var insertAt = existing.item.range.upperBound
+                while insertAt > existing.item.range.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
+                lines.insert("\(indent)image: true", at: insertAt)
             }
-            i += 1
+            return
         }
-        // models 段存在但无此子项:段尾追加带标记的完整项
-        let itemIndent = String(repeating: " ", count: headerIndent + 2)
-        var insertAt = header + 1
-        var j2 = header + 1
-        while j2 < entryRange.upperBound {
-            let lj = lines[j2]
-            let tj = lj.trimmingCharacters(in: .whitespacesAndNewlines)
-            if tj.isEmpty { j2 += 1; continue }
-            let ij = lj.prefix(while: { $0 == " " || $0 == "\t" }).count
-            if ij <= headerIndent { break }
-            j2 += 1
-            insertAt = j2
-        }
-        while insertAt > header + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
-        let block = [
-            "\(itemIndent)- name: \(yamlScalar(model))",
-            "\(itemIndent)  alias: \(yamlScalar(model))",
-            "\(itemIndent)  image: true",
-        ]
-        lines.insert(contentsOf: block, at: insertAt)
+        let indent = modelSequenceIndent(in: lines, range: range, entryRange: entryRange)
+        var insertAt = range.upperBound
+        while insertAt > range.lowerBound, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
+        lines.insert(contentsOf: [
+            "\(indent)- name: \(yamlScalar(model))",
+            "\(indent)  alias: \(yamlScalar(model))",
+            "\(indent)  image: true",
+        ], at: insertAt)
     }
 
     // MARK: - add
@@ -391,7 +352,7 @@ public final class CPAWriter {
             guard let entryRange = findAggregatedEntry(for: baseURL, in: lines) else {
                 throw WriterError.file("CPA 聚合条目不存在: \(providerName)")
             }
-            if replaceModelsSegment(&lines, entryRange: entryRange, models: uniq) {
+            if try replaceModelsSegment(&lines, entryRange: entryRange, models: uniq) {
                 try atomicWrite(lines.joined(separator: "\n"))
                 return "已更新 CPA 聚合条目「\(providerName)」模型 \(uniq.count) 个"
             }
@@ -406,30 +367,13 @@ public final class CPAWriter {
     /// 整替聚合条目 models 段内容(不写盘)。段不存在返回 false,由调用方补写。
     /// 刷新/编辑/多 key 勾选共用此口径:重新确认的列表必须真替换,
     /// 取消勾选的模型要能删掉 —— merge 只做并集,做不到
-    private func replaceModelsSegment(_ lines: inout [String], entryRange: Range<Int>, models uniq: [String]) -> Bool {
-        guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" }) else {
-            return false
-        }
-        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
-        // models 段范围:header+1 起直到缩进 ≤ header 的非空行(段内其它子键更深缩进,一并替换)
-        var end = header + 1
-        var itemIndent = String(repeating: " ", count: headerIndent + 4)
-        while end < entryRange.upperBound {
-            let line = lines[end]
-            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { end += 1; continue }
-            let ind = line.prefix(while: { $0 == " " || $0 == "\t" }).count
-            if ind <= headerIndent { break }
-            if lines[end].trimmingCharacters(in: .whitespaces).hasPrefix("- name:") {
-                itemIndent = String(repeating: " ", count: ind)
-            }
-            end += 1
-        }
-        var block: [String] = []
-        for m in uniq {
-            block.append("\(itemIndent)- name: \(yamlScalar(m))")
-            block.append("\(itemIndent)  alias: \(yamlScalar(m))")
-        }
-        lines.replaceSubrange((header + 1)..<end, with: block)
+    private func replaceModelsSegment(_ lines: inout [String], entryRange: Range<Int>, models uniq: [String]) throws -> Bool {
+        guard let property = mappingProperty("models", in: lines, itemRange: entryRange),
+              let range = mappingSequenceRange("models", in: lines, itemRange: entryRange) else { return false }
+        try expandEmptyModelsHeader(&lines, header: property.line)
+        let indent = modelSequenceIndent(in: lines, range: range, entryRange: entryRange)
+        let block = uniq.flatMap { ["\(indent)- name: \(yamlScalar($0))", "\(indent)  alias: \(yamlScalar($0))"] }
+        lines.replaceSubrange(range, with: block)
         return true
     }
 
@@ -539,7 +483,7 @@ public final class CPAWriter {
         let lines = content.components(separatedBy: "\n")
         guard let range = findAggregatedEntry(for: baseURL, in: lines)
         else { return [] }
-        return Self.entryModels(in: lines, entryRange: range)
+        return entryModels(in: lines, entryRange: range)
     }
 
     /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,
@@ -560,11 +504,11 @@ public final class CPAWriter {
         if let entryRange = findAggregatedEntry(for: baseURL, in: lines) {
             // merge 的重定位需要条目真实 name(可能与 aggregatedName 不同:手写名/去重后缀)
             let actualName = entryName(in: lines, entryRange: entryRange) ?? providerName
-            let existingModels = Self.entryModels(in: lines, entryRange: entryRange)
+            let existingModels = entryModels(in: lines, entryRange: entryRange)
             if let pickedModels {
                 // 本次粘贴用户明确勾选过:整替为新列表(与 refreshModels 同一口径,
                 // merge 的并集语义会留下未勾选的模型),再把本次 key 合进池子
-                if replaceModelsSegment(&lines, entryRange: entryRange, models: pickedModels) {
+                if try replaceModelsSegment(&lines, entryRange: entryRange, models: pickedModels) {
                     let shifted = findAggregatedEntry(for: baseURL, in: lines) ?? entryRange
                     try mergeIntoAggregatedEntry(&lines, range: shifted, providerName: actualName, keys: keys, models: [], baseURL: baseURL)
                 } else {
@@ -591,22 +535,9 @@ public final class CPAWriter {
     }
 
     /// 从给定条目范围解析 models: 段的模型名(按条目内容缩进判定,与 merge 同一口径)
-    static func entryModels(in lines: [String], entryRange: Range<Int>) -> [String] {
-        guard let header = entryRange.first(where: { lines[$0].trimmingCharacters(in: .whitespaces) == "models:" })
-        else { return [] }
-        let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
-        var out: [String] = []
-        for j in (header + 1)..<entryRange.upperBound {
-            let line = lines[j]
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { continue }
-            if line.prefix(while: { $0 == " " || $0 == "\t" }).count <= headerIndent { break }
-            if trimmed.hasPrefix("- name:") {
-                let nm = trimmed.dropFirst("- name:".count).trimmingCharacters(in: .whitespaces)
-                if !nm.isEmpty { out.append(nm) }
-            }
-        }
-        return out
+    private func entryModels(in lines: [String], entryRange: Range<Int>) -> [String] {
+        guard let range = mappingSequenceRange("models", in: lines, itemRange: entryRange) else { return [] }
+        return modelItems(in: lines, range: range).map(\.name)
     }
 
     /// 读取指定 baseURL 聚合条目当前精选的模型列表(锁内读,与写者互斥)。
@@ -617,7 +548,7 @@ public final class CPAWriter {
             guard let content = try? readConfigText() else { return [] }
             let lines = content.components(separatedBy: "\n")
             guard let range = findAggregatedEntry(for: baseURL, in: lines) else { return [] }
-            return Self.entryModels(in: lines, entryRange: range)
+            return entryModels(in: lines, entryRange: range)
         }) ?? []
     }
 
@@ -755,10 +686,6 @@ public final class CPAWriter {
             .first { entryName(in: lines, entryRange: $0.range) == providerName }?.range
     }
 
-    private func stripYAMLValue(_ s: String) -> String {
-        decodeYAMLScalar(s)
-    }
-
     // MARK: - aggregated write helpers
 
     /// 合并 keys 和 models 进现有聚合条目;keys 去重(已有的跳过),models 同样。
@@ -821,37 +748,18 @@ public final class CPAWriter {
 
     /// 在聚合条目范围内合并 models(去重)
     private func mergeAggregatedModels(_ lines: inout [String], entryRange: Range<Int>, newModels: [String]) throws {
-        // 找现有 `models:` 段位置
-        var modelsHeader: Int? = nil
-        for i in entryRange {
-            let t = lines[i].trimmingCharacters(in: .whitespaces)
-            if t.hasPrefix("models:") { modelsHeader = i; break }
-        }
-        var existing = Set<String>()
-        if let header = modelsHeader {
-            let headerIndent = lines[header].prefix(while: { $0 == " " || $0 == "\t" }).count
-            var modelItemIndent = ""
-            var endModels = entryRange.upperBound
-            for j in (header + 1)..<entryRange.upperBound {
-                let line = lines[j]
-                let curIndent = line.prefix(while: { $0 == " " || $0 == "\t" }).count
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty && curIndent <= headerIndent { endModels = j; break }
-                if trimmed.hasPrefix("- name:") {
-                    if modelItemIndent.isEmpty { modelItemIndent = String(line.prefix(curIndent)) }
-                    let nm = stripYAMLValue(String(trimmed.dropFirst("- name:".count)))
-                    existing.insert(nm.trimmingCharacters(in: .whitespaces))
-                }
-            }
+        if let property = mappingProperty("models", in: lines, itemRange: entryRange),
+           let range = mappingSequenceRange("models", in: lines, itemRange: entryRange) {
+            let existing = Set(modelItems(in: lines, range: range).map(\.name))
             let toAdd = newModels.filter { !existing.contains($0) }
-            if toAdd.isEmpty { return }
-            let indent = modelItemIndent.isEmpty ? String(repeating: " ", count: headerIndent + 2) : modelItemIndent
-            var insertAt = endModels
-            while insertAt > header + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
+            guard !toAdd.isEmpty else { return }
+            try expandEmptyModelsHeader(&lines, header: property.line)
+            let indent = modelSequenceIndent(in: lines, range: range, entryRange: entryRange)
+            var insertAt = range.upperBound
+            while insertAt > range.lowerBound, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
             let block = toAdd.flatMap { ["\(indent)- name: \(yamlScalar($0))", "\(indent)  alias: \(yamlScalar($0))"] }
             lines.insert(contentsOf: block, at: insertAt)
         } else {
-            // 条目无 models 段:在条目末尾(去空行后)追加
             let propIndent = String(repeating: " ", count: mappingIndent(in: lines, itemRange: entryRange))
             var insertAt = entryRange.upperBound
             while insertAt > entryRange.lowerBound + 1, lines[insertAt - 1].trimmingCharacters(in: .whitespaces).isEmpty { insertAt -= 1 }
@@ -862,6 +770,34 @@ public final class CPAWriter {
             }
             lines.insert(contentsOf: block, at: insertAt)
         }
+    }
+
+    private func modelItems(in lines: [String], range: Range<Int>) -> [(item: Item, name: String)] {
+        sequenceItems(in: lines, range: range).compactMap { item in
+            guard let name = mappingProperty("name", in: lines, itemRange: item.range)?.value,
+                  !name.isEmpty else { return nil }
+            return (item, name)
+        }
+    }
+
+    private func modelSequenceIndent(in lines: [String], range: Range<Int>, entryRange: Range<Int>) -> String {
+        if let first = sequenceItems(in: lines, range: range).first {
+            return String(lines[first.range.lowerBound].prefix(while: { $0 == " " || $0 == "\t" }))
+        }
+        return String(repeating: " ", count: mappingIndent(in: lines, itemRange: entryRange) + 2)
+    }
+
+    /// models: []/null 转成块序列前清除行内空值,保留行尾注释。
+    private func expandEmptyModelsHeader(_ lines: inout [String], header: Int) throws {
+        guard let field = lines[header].range(of: "models:") else { return }
+        let raw = String(lines[header][field.upperBound...])
+        let value = withoutYAMLComment(raw)
+        guard !value.isEmpty else { return }
+        guard value == "[]" || value == "null" || value == "~" else {
+            throw WriterError.file("CPA models 使用了不支持的行内值,请改为块序列后重试")
+        }
+        guard let valueRange = lines[header].range(of: value, range: field.upperBound..<lines[header].endIndex) else { return }
+        lines[header].removeSubrange(valueRange)
     }
 
     /// 追加全新聚合条目到 `openai-compatibility:` 段末尾;段不存在则创建
@@ -1009,11 +945,16 @@ public final class CPAWriter {
 
     /// 聚合条目范围内找 `api-key-entries:` 子段下的 `- api-key:` 行范围
     private func findAPIKeyEntriesSubrange(in lines: [String], entryRange: Range<Int>) -> Range<Int>? {
-        guard let property = mappingProperty("api-key-entries", in: lines, itemRange: entryRange) else { return nil }
+        mappingSequenceRange("api-key-entries", in: lines, itemRange: entryRange)
+    }
+
+    /// 直接属性后的块序列范围,兼容首属性、注释和与属性头同列的序列项。
+    private func mappingSequenceRange(_ key: String, in lines: [String], itemRange: Range<Int>) -> Range<Int>? {
+        guard let property = mappingProperty(key, in: lines, itemRange: itemRange) else { return nil }
         let header = property.line
-        let headerIndent = mappingIndent(in: lines, itemRange: entryRange)
-        var end = entryRange.upperBound
-        for j in (header + 1)..<entryRange.upperBound {
+        let headerIndent = mappingIndent(in: lines, itemRange: itemRange)
+        var end = itemRange.upperBound
+        for j in (header + 1)..<itemRange.upperBound {
             let trimmed = withoutYAMLComment(lines[j])
             if trimmed.isEmpty { continue }
             let indent = lines[j].prefix(while: { $0 == " " || $0 == "\t" }).count

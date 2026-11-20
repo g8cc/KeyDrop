@@ -1632,7 +1632,7 @@ openai-compatibility:
                 // 手动重测(refreshModels)同样入档
                 _ = try! core.refreshModels(entryIDPrefix: "mon-hist")
                 e = core.history.find(idPrefix: "mon-hist")!
-                t.equal(e.probeLog?.count, 3, "手动重测也产生探测点")
+                t.equal(e.probeLog?.count, 4, "刷新先测原配置，再测改选模型，两次真实探测均入档")
                 // 30 点滚动截断
                 for i in 0..<35 {
                     try? core.history.appendProbePoint(id: e.id, ok: i % 3 != 0, ms: 500, cpa: nil,
