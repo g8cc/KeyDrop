@@ -13,6 +13,97 @@ enum HistoryTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("History.CPA untested routes are not fully available") { t in
+            var e = entry("untested-cpa", ts: 1)
+            e.healthAt = 10
+            e.targets = ["cpa"]
+            e.models = ["model-a", "model-b"]
+            e.modelProbeLog = ["model-a": [ProbePoint(t: 10, ms: 1, ok: true, cpa: true)],
+                               "model-b": [ProbePoint(t: 10, ms: 1, ok: true)]]
+            e.viaCPAOk = true
+            e.viaCPAAt = 10
+            t.expect(HistorySections([e]).available.isEmpty, "有模型未测 CPA 不得整行全部通过")
+            t.equal(e.modelStatus.untested, 1, "上游通过但 CPA 未测应显示待验证")
+            e.viaCPAOk = nil
+            e.modelProbeLog = nil
+            t.expect(!HistorySections([e]).unverified.isEmpty, "无 CPA 实测归待验证")
+        }
+        h.runSuite("History.monitoring section regression") { t in
+            var e = entry("section-evidence", ts: 1)
+            e.healthAt = 10
+            e.targets = ["cpa"]
+            e.viaCPAOk = false
+            e.viaCPAAt = 10
+            t.expect(HistorySections([e]).available.isEmpty, "CPA 失败不能留在可用列表")
+            e.viaCPAOk = nil
+            e.failStreak = 1
+            t.expect(HistorySections([e]).available.isEmpty, "待复测不能留在可用列表")
+            e.failStreak = nil
+            e.health = "reachable"
+            t.expect(HistorySections([e]).available.isEmpty, "仅目录可达不能留在可用列表")
+            e.health = nil
+            t.expect(HistorySections([e]).available.isEmpty, "未验证不能留在可用列表")
+            e.health = "ok"
+            e.models = ["works", "fails"]
+            e.modelProbeLog = ["works": [ProbePoint(t: 10, ms: 1, ok: true)],
+                               "fails": [ProbePoint(t: 10, ms: nil, ok: false)]]
+            t.expect(!e.healthColor.ok, "部分模型失败需要独立状态，不能整行显示全绿")
+            t.expect(HistorySections([e]).available.isEmpty, "部分模型失败归需关注列表")
+            e.models = ["fails"]
+            t.expect(e.availability != .quota, "普通模型失败不应被误称为额度耗尽")
+            e.models = []
+            e.model = "fails"
+            t.expect(!e.healthColor.ok, "空 models 不能忽略实际默认模型的失败")
+        }
+        h.runSuite("History.monitoring stale CPA sample regression") { t in
+            let env = try TestEnv("hist-stale-cpa-sample")
+            defer { env.cleanup() }
+            let store = HistoryStore()
+            var e = entry("stale-cpa", ts: 1)
+            e.healthAt = 10
+            e.targets = ["cpa"]
+            e.viaCPAOk = false
+            e.viaCPAAt = 10
+            try store.append(e)
+            e.health = "proxy-ok"
+            try store.mergeHealth([e], at: 20)
+            let saved = store.find(idPrefix: e.id)!
+            t.equal(saved.viaCPAAt, 10, "保留上次 CPA 测试的真实时间")
+            t.expect(saved.probeLog?.last?.cpa == nil, "本轮没测 CPA，不能复制旧失败制造新的红点")
+        }
+        h.runSuite("History.monitoring sections cover every current state") { t in
+            var good = entry("good", ts: 1)
+            good.healthAt = 10
+            good.models = ["a", "b"]
+            good.modelProbeLog = ["a": [ProbePoint(t: 1, ms: nil, ok: false), ProbePoint(t: 10, ms: 1, ok: true)],
+                                  "b": [ProbePoint(t: 10, ms: 1, ok: true)]]
+            t.equal(good.availability, .available, "历史红点不阻止最新全部恢复的记录可用")
+            var partial = good
+            partial.id = "partial"
+            partial.modelProbeLog?["b"] = [ProbePoint(t: 10, ms: nil, ok: false)]
+            t.equal(partial.availability, .partial, "明确区分部分成功")
+            t.equal(partial.modelStatus.passed, 1, "按当前选中模型计数")
+            t.equal(partial.modelStatus.failed, 1, "失败数与颜色口径一致")
+            var pending = good
+            pending.id = "pending"
+            pending.modelProbeLog = nil
+            t.equal(pending.availability, .unverified, "配置模型无样本不能借用 key 的成功")
+            var quota = good
+            quota.id = "quota"; quota.health = "quota"
+            var dead = good
+            dead.id = "dead"; dead.health = "dead"
+            let sections = HistorySections([good, partial, pending, quota, dead])
+            t.equal(sections.available.map(\.id), [good.id], "全部验证通过才进入可用区")
+            t.equal(sections.attention.map(\.id), [partial.id], "部分成功单列需关注")
+            t.equal(sections.unverified.map(\.id), [pending.id], "未采样单列待验证")
+            t.equal(sections.quota.map(\.id), [quota.id], "只有明确额度原因归额度区")
+            t.equal(sections.dead.map(\.id), [dead.id], "认证失败归失败区")
+            t.equal(sections.okCount, 1, "计数与分组一致")
+            t.equal(HistorySections([partial], query: "partial").attention.count, 1, "所有分区都可按 ID 检索")
+            let many = (0..<81).map { i -> HistoryEntry in var e = good; e.id = "many-\(i)"; return e }
+            t.equal(HistorySections(many).available.count, 81, "默认不静默截掉 60 条以后的配置")
+            t.equal(HistorySections(many, limit: 3).available.count, 3, "显式数量限制仍有效")
+        }
         h.runSuite("History.rejects stale pool probe results") { t in
             let env = try TestEnv("hist-stale-pool-probe")
             defer { env.cleanup() }
@@ -184,7 +275,7 @@ enum HistoryTests {
             t.expect(e.healthColor.ok, "已经移除 CPA 目标时旧 CPA 结果不影响直连状态")
             e.targets = ["cpa"]
             e.viaCPAOk = nil
-            t.expect(e.healthColor.ok, "没测 CPA 不伪造链路失败")
+            t.equal(e.availability, .chainUnverified, "没测 CPA 如实显示待验证")
             e.probeLog = [ProbePoint(t: 11, ms: nil, ok: true)]
             t.equal(e.uptimePercent, 100, "未测链路的直连通过率保持原语义")
         }
@@ -211,9 +302,10 @@ enum HistoryTests {
             quota.id = "quota"; quota.health = "ok"; quota.ts = 2
             var good = entry("good", ts: 1)
             good.healthAt = 1
+            quota.healthAt = 2
             let sections = HistorySections([good, quota, dead])
-            t.equal(sections.dead.map(\.id), ["dead"], "死 key 归待删除区")
-            t.equal(sections.quota.map(\.id), ["quota"], "全红模型仅进额度区")
+            t.equal(sections.dead.map(\.id), ["dead", "quota"], "认证失败和已选模型全失败归探测失败")
+            t.expect(sections.quota.isEmpty, "没有额度证据不能归额度耗尽")
             t.equal(sections.available.map(\.id), ["good"], "可用区互斥")
             t.equal(sections.okCount, 1, "横幅统计一致")
             let searched = HistorySections([good, quota, dead], query: "P-GOOD\tx.com")

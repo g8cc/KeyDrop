@@ -111,6 +111,26 @@ final class UpdateFixtureProtocol: URLProtocol {
 }
 
 Task { @MainActor in
+    func failureFixture(_ id: String, health: String) -> HistoryEntry {
+        HistoryEntry(id: id, ts: 1, raw: "fixture", format: "test", name: id,
+                     url: "https://fixture.invalid/v1", model: nil, key: "sk-fixture", keyMasked: "***",
+                     targets: [], ccProviderID: nil, ccRenamedFrom: nil, ccRenamedTo: nil,
+                     cpaConfigPath: nil, status: "active", health: health, healthAt: 1)
+    }
+    let selectedFailure = failureFixture("selected-failure", health: "err")
+    let hiddenFailure = failureFixture("hidden-failure", health: "dead")
+    let recovered = failureFixture("recovered-entry", health: "ok")
+    for entry in [selectedFailure, hiddenFailure, recovered] { try! Core.shared.history.append(entry) }
+    let deletionState = AppState()
+    deletionState.clearFailed(ids: [selectedFailure.id, recovered.id])
+    let deletionFinished = await waitUntil { !deletionState.isBusy }
+    check(deletionFinished && Core.shared.history.find(idPrefix: selectedFailure.id)?.status == "deleted",
+          "批量删除只处理明确选中的失败记录")
+    check(Core.shared.history.find(idPrefix: hiddenFailure.id)?.status == "active",
+          "批量删除不影响搜索未命中的其他失败记录")
+    check(Core.shared.history.find(idPrefix: recovered.id)?.status == "active",
+          "确认后已恢复的记录不会被批量删除")
+
     await state.continueAddKey(raw: "https://example.invalid", assumeBusy: true)
     check(!state.isBusy && state.busyLabel.isEmpty, "订阅回退无目标时释放 busy 状态")
     check(!state.statusOK, "明确提示未启用写入目标")

@@ -578,7 +578,7 @@ final class AppState: ObservableObject {
                         self.pickModelsSync(options)
                     }
                 }
-                setStatus(msg, ok: true)
+                setStatus(msg, ok: core.history.find(idPrefix: id)?.healthColor.ok == true)
                 historyVersion += 1
                 notify(summary: "KeyDrop 刷新完成", body: msg)
             } catch {
@@ -972,33 +972,39 @@ final class AppState: ObservableObject {
         }
     }
 
-    func clearDead() {
-        // proxy-ok 是「直连不可用但经代理可用」,不是失效,绝不能被一键清除误删
+    func clearFailed(ids displayedIDs: [String]) {
+        let selected = Set(displayedIDs)
         let ids = core.history.snapshot()
-            .filter { $0.status == "active" && ($0.health == "dead" || $0.health == "err") }
+            .filter { selected.contains($0.id) && ($0.availability == .dead || $0.availability == .error) }
             .map { $0.id }
         guard !ids.isEmpty, !isBusy else { return }
         isBusy = true
-        busyLabel = "清除失效 \(ids.count) 条…"
+        busyLabel = "删除所选记录 \(ids.count) 条…"
         Task { @MainActor in
             defer {
                 isBusy = false
                 busyLabel = ""
             }
             var failed: [String] = []
+            var deleted = 0
             for id in ids {
                 do {
                     let msg = try await runOffPool {
-                        try Core.shared.delete(entryIDPrefix: id)
+                        guard let current = Core.shared.history.find(idPrefix: id),
+                              current.availability == .dead || current.availability == .error else { return "" }
+                        return try Core.shared.delete(entryIDPrefix: id)
                     }
-                    AppLog.info("清除失效: \(msg)")
+                    if !msg.isEmpty {
+                        deleted += 1
+                        AppLog.info("删除所选失败记录: \(msg)")
+                    }
                 } catch {
                     failed.append("\(id.prefix(8)) \(error.localizedDescription)")
                 }
             }
             historyVersion += 1
             if failed.isEmpty {
-                setStatus("已清除 \(ids.count) 条失效 key", ok: true)
+                setStatus("已删除 \(deleted) 条记录", ok: true)
             } else {
                 setStatus("清除完成,\(failed.count) 条失败: \(failed.prefix(3).joined(separator: "; "))", ok: false)
             }
@@ -1139,13 +1145,13 @@ struct HistoryRow: View {
     /// 拆成独立方法:内联在主行时表达式过复杂,SwiftUI 类型检查超时
     @ViewBuilder
     private func monitorBadges(_ entry: HistoryEntry) -> some View {
-        if let ms = entry.latencyMs, entry.healthColor.ok {
+        if let ms = entry.latencyMs, ms.isFinite, ms >= 0, entry.healthColor.ok {
             Text("·")
             Text(String(format: "%.1fs", ms / 1000))
                 .foregroundStyle(ms > 8000
                     ? Color(red: 0.85, green: 0.55, blue: 0.15)
                     : Color.secondary.opacity(0.9))
-                .help("\(providerContext) · 最近一次通过的探测耗时 \(Int(ms)) ms")
+                .help("\(providerContext) · 最近一次通过的探测耗时 \(String(format: "%.0f", ms)) ms")
         }
         if let ok = entry.viaCPAOk, entry.targets.contains("cpa") {
             Text("·")
@@ -1215,7 +1221,7 @@ struct HistoryRow: View {
     }
 
     var body: some View {
-        let displayModels = entry.models ?? (entry.model.map { [$0] })
+        let displayModels = entry.configuredModels
         // 多 key 条目账本不落 key 字段(只记「N 个 key」),凭据能从 raw 恢复,
         // 所以按钮可见性也必须走 extractKey —— 否则 v1.4.51 修好的重测/curl 在这类行上根本点不到
         let testable = !entry.isDSHOnly && entry.status == "active" && entry.url != nil
@@ -1224,9 +1230,9 @@ struct HistoryRow: View {
         let dotColor: Color = {
             switch availability {
             case .available, .proxyAvailable: return Color(red: 0.28, green: 0.68, blue: 0.42)
-            case .retry, .quota, .chainError: return Color(red: 0.93, green: 0.68, blue: 0.20)
+            case .partial, .retry, .quota, .chainError: return Color(red: 0.93, green: 0.68, blue: 0.20)
             case .error, .dead: return Color(red: 0.86, green: 0.28, blue: 0.24)
-            case .dshOnly, .unverified, .reachable, .inactive: return Color.secondary.opacity(0.65)
+            case .dshOnly, .unverified, .reachable, .chainUnverified, .inactive: return Color.secondary.opacity(0.65)
             }
         }()
         let detail = entry.displayHealthDetail.map { "\n" + String($0.prefix(240)) } ?? ""
@@ -1253,29 +1259,18 @@ struct HistoryRow: View {
                     .padding(.top, 4)
                     .help(dotTip)
 
-                if availability == .dshOnly || availability == .proxyAvailable || availability == .retry || availability == .chainError || availability == .error || availability == .unverified || availability == .reachable {
-                    Text(availability.label)
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(.secondary)
-                        .help(dotTip)
-                }
-
-                // key 活着但用户配置的模型全被限流 → 已挬入无额度区,行内标注区别于真死 key
-                if entry.allConfiguredModelsLimited,
-                   entry.health == "ok" || entry.health == "proxy-ok" {
-                    Text("所选模型最近探测均失败")
-                        .font(.system(size: 9.5, weight: .semibold))
-                        .foregroundStyle(Color(red: 0.85, green: 0.55, blue: 0.15))
-                        .padding(.horizontal, 5).padding(.vertical, 1.5)
-                        .background(RoundedRectangle(cornerRadius: 4).fill(Color(red: 0.85, green: 0.55, blue: 0.15).opacity(0.13)))
-                        .help(dotTip)
-                }
-
                 VStack(alignment: .leading, spacing: 3) {
                     Text(entry.summary)
                         .font(.system(size: 12.5, weight: .semibold))
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if availability != .available && availability != .inactive {
+                        Text(availability.label)
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .help(dotTip)
+                    }
                     HStack(spacing: 6) {
                         Text(entry.timeStr)
                         Text("·")
@@ -1294,7 +1289,7 @@ struct HistoryRow: View {
                                 )
                                 .help("\(providerContext) · 已同步到 DeepSeek Harness")
                         }
-                        if entry.viaCPAOk == false {
+                        if entry.viaCPAOk == false, entry.targets.contains("cpa") {
                             // 经 CPA 网关的真实链路探测失败:上游直连是通的,
                             // 但用户真实流量走的链路断了——行内可见而非只藏在 tooltip
                             Text("CPA 链路 ✗")
@@ -1312,8 +1307,12 @@ struct HistoryRow: View {
                     }
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
 
-                    if let displayModels, !displayModels.isEmpty {
+                    if !displayModels.isEmpty {
+                        Text(entry.modelStatus.label)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
                         // 每个模型一行:模型名(点击复制)+ 右侧该模型的监控格条
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(displayModels, id: \.self) { m in
@@ -1343,7 +1342,7 @@ struct HistoryRow: View {
                     }
                     // key 级格条不再上行:当前死活由圆点+分区表达,时间轴历史(何时死/挂几次/
                     // 延迟趋势)在「监控」弹窗的趋势图与事件记录里完整保留。监控系统本身
-                    // (scanHealth)不受影响 —— 它是把 key 分进无额度/待删除区的机制,
+                    // (scanHealth)不受影响，仍会按实际状态更新分区，
                     // 也是充值后自动复活的检测器
                 }
 
@@ -1379,7 +1378,7 @@ struct HistoryRow: View {
                                     onCopy(Core.shared.extractKey(entry) ?? "")
                                 }
                                 .disabled(!testable)
-                                if let displayModels, !displayModels.isEmpty {
+                                if !displayModels.isEmpty {
                                     Menu("复制模型名") {
                                         ForEach(displayModels, id: \.self) { m in
                                             let name = CCSwitchWriter.copyModelName(for: entry, model: m)
@@ -1801,8 +1800,9 @@ struct HelpView: View {
                         item("Codex 特殊:其配置不支持代理字段。被墙网关导入 codex 后,请在 cc-switch「代理」面板开启 Codex 接管,或启动 codex 前 export HTTPS_PROXY")
                     }
                     section("健康探测与清理", icon: "heart") {
-                        item("每小时自动探测全部 key:超时标「异常」,401/403 标「失效」")
-                        item("失效/异常的 key 进入「待删除区」,展开后可一键清除全部(同步还原 cc-switch / CPA)")
+                        item("每小时自动探测。所选模型及适用的 CPA 链路通过后才进入「已验证可用」；部分失败或未验证会单列提示")
+                        item("监控格从左到右记录历史，右侧最新。历史红格保留，当前分组按最新实测判断")
+                        item("失败记录可先刷新重试；批量删除仅处理当前筛选出的失败记录，并需确认")
                         item("单条删除:历史行垃圾桶图标;删除时自动还原被暂存的旧 provider")
                     }
                     section("模型", icon: "brain") {
@@ -2085,6 +2085,10 @@ struct PanelView: View {
     @State private var showStatusDetail = false
     @State private var showDeadArea = false
     @State private var showQuotaArea = false
+    @State private var showAttentionArea = true
+    @State private var showUnverifiedArea = true
+    @State private var showBulkDeleteConfirm = false
+    @State private var pendingDeletionIDs: [String] = []
     @State private var searchText = ""
     @State private var toastText: String?
     @State private var dropTargeted = false
@@ -2536,6 +2540,69 @@ struct PanelView: View {
         .animation(.easeOut(duration: 0.18), value: showStatusDetail)
     }
 
+    private func historyRow(_ e: HistoryEntry) -> some View {
+        HistoryRow(
+            entry: e,
+            refreshing: state.refreshingID == e.id,
+            busy: state.isBusy,
+            onDelete: { state.doDelete(e.id) },
+            onVerify: { id in state.doVerify(id) },
+            verifyRunning: state.verifyingID == e.id,
+            verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
+            onCopy: { m in
+                let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(copyText, forType: .string)
+                showToast("已复制: \(copyText)")
+            },
+            onCopyId: { id in
+                showToast("已复制 ID: \(id.prefix(8))…")
+            },
+            onRefresh: { id in state.doRefresh(id) },
+            onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
+            onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
+            onCopyCurl: {
+                guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
+                    showToast("缺少 URL 或 key")
+                    return
+                }
+                let model = e.model ?? e.configuredModels.first
+                let style: String? = {
+                    if let style = e.apiStyle { return style }
+                    if e.targets.contains("ccswitch") { return "anthropic" }
+                    if let d = e.healthDetail, d.lowercased().contains("anthropic") { return "anthropic" }
+                    return nil
+                }()
+                let curl = APITester.curlCommand(url: url, key: key, model: model, styleHint: style)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(curl, forType: .string)
+                showToast("已复制 curl")
+            },
+            onReimport: { state.doReimport(e.id) },
+            onEdit: { state.showEdit(e) },
+            highlighted: state.highlightID == e.id && state.highlightPulse > 0
+        )
+    }
+
+    private func historySectionHeader(_ title: String, count: Int, detail: String,
+                                      expanded: Binding<Bool>) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) { expanded.wrappedValue.toggle() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: expanded.wrappedValue ? "chevron.down" : "chevron.right")
+                Text("\(title) · \(count)").fontWeight(.semibold)
+                Spacer()
+                Text(detail).foregroundStyle(.secondary)
+            }
+            .font(.system(size: 10.5))
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+        }
+        .buttonStyle(.borderless)
+        .padding(.top, 6)
+    }
+
     private var historyBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
             let sections = HistorySections(state.core.history.snapshot(), query: searchText)
@@ -2543,14 +2610,19 @@ struct PanelView: View {
             // 横幅只保留「零可用」一种(灰色,真正需要行动的状态)。CPA 链路异常
             // 横幅已移除(用户确认:无用信息纯打扰;签名制收起也挡不住异常集合
             // 每轮变动导致的重复弹出)—— 行内 CPA 徽章 + 行内模型监控格条承载
-            if sc.ok + sc.warn == 0 {
+            if sc.ok == 0 {
                 OverallStatusBanner(okCount: sc.ok, warnCount: sc.warn, deadCount: sc.dead, compact: true)
             }
             // 颜色图例常显在主界面(用户确认:不能只靠悬停)—— 模型格条是双维编码
             // (通过与否 × 延迟快慢),不标注的话「全黄/全紫也 100%」看起来像算错
             StatusLegend(showUptimeNote: false)
+            Text("色块是历史探测记录，最右侧为最近一次；分组依据最新结果，历史失败不会因恢复而消失。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
             Divider().opacity(0.3)
             let items = sections.available
+            let attention = sections.attention
+            let unverified = sections.unverified
             let deads = sections.dead
             let quotas = sections.quota
             HStack(spacing: 6) {
@@ -2585,7 +2657,7 @@ struct PanelView: View {
                 )
                 .frame(width: 340)
                 Spacer()
-                Text("最近添加")
+                Text("已验证可用")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Text("\(items.count)")
@@ -2593,7 +2665,7 @@ struct PanelView: View {
                     .foregroundStyle(.secondary)
             }
             let searching = !searchText.trimmingCharacters(in: .whitespaces).isEmpty
-            if items.isEmpty && deads.isEmpty && quotas.isEmpty && !searching {
+            if items.isEmpty && attention.isEmpty && unverified.isEmpty && deads.isEmpty && quotas.isEmpty && !searching {
                 VStack(spacing: 6) {
                     Image(systemName: "tray")
                         .font(.system(size: 22))
@@ -2607,7 +2679,7 @@ struct PanelView: View {
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 22)
-            } else if items.isEmpty && deads.isEmpty && quotas.isEmpty && searching {
+            } else if items.isEmpty && attention.isEmpty && unverified.isEmpty && deads.isEmpty && quotas.isEmpty && searching {
                 VStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 22))
@@ -2625,47 +2697,28 @@ struct PanelView: View {
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 2) {
+                            Text("已验证可用 · \(items.count)")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 6)
                             ForEach(items, id: \.id) { e in
-                                HistoryRow(
-                                    entry: e,
-                                    refreshing: state.refreshingID == e.id,
-                                    busy: state.isBusy,
-                                    onDelete: { state.doDelete(e.id) },
-                                    onVerify: { id in state.doVerify(id) },
-                                    verifyRunning: state.verifyingID == e.id,
-                                    verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
-                                    onCopy: { m in
-                                        let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(copyText, forType: .string)
-                                        showToast("已复制: \(copyText)")
-                                    },
-                                    onCopyId: { id in
-                                        showToast("已复制 ID: \(id.prefix(8))…")
-                                    },
-                                    onRefresh: { id in state.doRefresh(id) },
-                                    onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
-                                    onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
-                                    onCopyCurl: {
-                                        guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
-                                            showToast("缺少 URL 或 key")
-                                            return
-                                        }
-                                        let model = e.models?.first ?? e.model
-                                        let style: String? = {
-                                            if e.targets.contains("ccswitch") { return "anthropic" }
-                                            if let d = e.healthDetail, d.lowercased().contains("anthropic") { return "anthropic" }
-                                            return nil
-                                        }()
-                                        let curl = APITester.curlCommand(url: url, key: key, model: model, styleHint: style)
-                                        NSPasteboard.general.clearContents()
-                                        NSPasteboard.general.setString(curl, forType: .string)
-                                        showToast("已复制 curl")
-                                    },
-                                    onReimport: { state.doReimport(e.id) },
-                                    onEdit: { state.showEdit(e) },
-                                                                        highlighted: state.highlightID == e.id && state.highlightPulse > 0
-                                )
+                                historyRow(e)
+                            }
+                            if !attention.isEmpty {
+                                historySectionHeader("需关注", count: attention.count,
+                                                     detail: "部分模型失败、CPA 链路异常或待复测",
+                                                     expanded: $showAttentionArea)
+                                if showAttentionArea || searching {
+                                    ForEach(attention, id: \.id) { historyRow($0) }
+                                }
+                            }
+                            if !unverified.isEmpty {
+                                historySectionHeader("待验证", count: unverified.count,
+                                                     detail: "模型或转发链路尚未验证，或需在指定客户端验证",
+                                                     expanded: $showUnverifiedArea)
+                                if showUnverifiedArea || searching {
+                                    ForEach(unverified, id: \.id) { historyRow($0) }
+                                }
                             }
                             if !quotas.isEmpty {
                                 Button {
@@ -2674,7 +2727,7 @@ struct PanelView: View {
                                     HStack(spacing: 6) {
                                         Image(systemName: showQuotaArea ? "chevron.down" : "chevron.right")
                                             .font(.system(size: 10, weight: .semibold))
-                                        Text("无额度区")
+                                        Text("额度耗尽")
                                             .font(.system(size: 11, weight: .semibold))
                                         Text("\(quotas.count)")
                                             .font(.system(size: 10, design: .monospaced))
@@ -2692,48 +2745,9 @@ struct PanelView: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .padding(.top, 6)
-                                if showQuotaArea {
+                                if showQuotaArea || searching {
                                     ForEach(quotas, id: \.id) { e in
-                                        HistoryRow(
-                                            entry: e,
-                                            refreshing: state.refreshingID == e.id,
-                                            busy: state.isBusy,
-                                            onDelete: { state.doDelete(e.id) },
-                                            onVerify: { id in state.doVerify(id) },
-                                            verifyRunning: state.verifyingID == e.id,
-                                            verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
-                                            onCopy: { m in
-                                                let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(copyText, forType: .string)
-                                                showToast("已复制: \(copyText)")
-                                            },
-                                            onCopyId: { id in
-                                                showToast("已复制 ID: \(id.prefix(8))…")
-                                            },
-                                            onRefresh: { id in state.doRefresh(id) },
-                                            onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
-                                            onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
-                                            onCopyCurl: {
-                                                guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
-                                                    showToast("缺少 URL 或 key")
-                                                    return
-                                                }
-                                                let model = e.models?.first ?? e.model
-                                                let style: String? = {
-                                                    if e.targets.contains("ccswitch") { return "anthropic" }
-                                                    if let d = e.healthDetail, d.lowercased().contains("anthropic") { return "anthropic" }
-                                                    return nil
-                                                }()
-                                                let curl = APITester.curlCommand(url: url, key: key, model: model, styleHint: style)
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(curl, forType: .string)
-                                                showToast("已复制 curl")
-                                            },
-                                            onReimport: { state.doReimport(e.id) },
-                                            onEdit: { state.showEdit(e) },
-                                            highlighted: state.highlightID == e.id && state.highlightPulse > 0
-                                        )
+                                        historyRow(e)
                                     }
                                 }
                             }
@@ -2744,12 +2758,12 @@ struct PanelView: View {
                                     HStack(spacing: 6) {
                                         Image(systemName: showDeadArea ? "chevron.down" : "chevron.right")
                                             .font(.system(size: 10, weight: .semibold))
-                                        Text("待删除区")
+                                        Text("探测失败")
                                             .font(.system(size: 11, weight: .semibold))
                                         Text("\(deads.count)")
                                             .font(.system(size: 10, design: .monospaced))
                                         Spacer()
-                                        Text(showDeadArea ? "收起" : "定时探测失效 · 一键清除")
+                                        Text(showDeadArea ? "收起" : "最近探测失败，可刷新重试")
                                             .font(.system(size: 10, weight: .medium))
                                             .foregroundStyle(showDeadArea ? Color.secondary : Color(red: 0.85, green: 0.30, blue: 0.28))
                                     }
@@ -2762,68 +2776,28 @@ struct PanelView: View {
                                 }
                                 .buttonStyle(.borderless)
                                 .padding(.top, 6)
-                                if showDeadArea {
-                                    HStack(spacing: 6) {
+                                if showDeadArea || searching {
+                                    HStack {
                                         Spacer()
-                                        Button {
-                                            state.clearDead()
-                                        } label: {
-                                            Label("清除全部失效", systemImage: "trash.fill")
-                                                .font(.system(size: 11, weight: .bold))
-                                                .foregroundStyle(.white)
-                                                .padding(.horizontal, 10)
-                                                .padding(.vertical, 5)
-                                                .background(
-                                                    RoundedRectangle(cornerRadius: 6)
-                                                        .fill(Color(red: 0.85, green: 0.22, blue: 0.20))
-                                                )
+                                        Button("删除本组 \(deads.count) 条…") {
+                                            pendingDeletionIDs = deads.map(\.id)
+                                            showBulkDeleteConfirm = true
                                         }
                                         .buttonStyle(.borderless)
-                                        .help("删除待删除区全部 \(deads.count) 条,并从 cc-switch / CPA 同步移除")
+                                        .disabled(state.isBusy)
+                                        .confirmationDialog("删除所选 \(pendingDeletionIDs.count) 条记录及其目标配置？",
+                                                            isPresented: $showBulkDeleteConfirm) {
+                                            Button("删除这些记录", role: .destructive) {
+                                                state.clearFailed(ids: pendingDeletionIDs)
+                                            }
+                                            Button("取消", role: .cancel) {}
+                                        } message: {
+                                            Text("仅处理当前筛选出的失败记录。暂时失败可以先刷新重试。")
+                                        }
                                     }
-                                    .padding(.horizontal, 2)
-                                    .padding(.vertical, 4)
-                                ForEach(deads, id: \.id) { e in
-                                        HistoryRow(
-                                            entry: e,
-                                            refreshing: state.refreshingID == e.id,
-                                            busy: state.isBusy,
-                                            onDelete: { state.doDelete(e.id) },
-                                            onVerify: { id in state.doVerify(id) },
-                                            verifyRunning: state.verifyingID == e.id,
-                                            verifyVerdict: state.verifyVerdicts[e.id] ?? e.verifyVerdict,
-                                            onCopy: { m in
-                                                let copyText = CCSwitchWriter.copyModelName(for: e, model: m)
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(copyText, forType: .string)
-                                                showToast("已复制: \(copyText)")
-                                            },
-                                            onCopyId: { id in
-                                                showToast("已复制 ID: \(id.prefix(8))…")
-                                            },
-                                            onRefresh: { id in state.doRefresh(id) },
-                                            onSyncTarget: { tid, tg in state.doSyncTarget(tid, target: tg) },
-                                            onLaunchApp: { id, cmd in state.doLaunchApp(entryID: id, cmd: cmd) },
-                                            onCopyCurl: {
-                                                guard let url = e.url, let key = Core.shared.extractKey(e), !key.isEmpty else {
-                                                    showToast("缺少 URL 或 key")
-                                                    return
-                                                }
-                                                let model = e.models?.first ?? e.model
-                                                let style: String? = {
-                                                    if e.targets.contains("ccswitch") { return "anthropic" }
-                                                    if let d = e.healthDetail, d.lowercased().contains("anthropic") { return "anthropic" }
-                                                    return nil
-                                                }()
-                                                let curl = APITester.curlCommand(url: url, key: key, model: model, styleHint: style)
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(curl, forType: .string)
-                                                showToast("已复制 curl")
-                                            },
-                                            onReimport: { state.doReimport(e.id) },
-                                            onEdit: { state.showEdit(e) },
-                                            highlighted: state.highlightID == e.id && state.highlightPulse > 0
-                                        )
+                                    .padding(6)
+                                    ForEach(deads, id: \.id) { e in
+                                        historyRow(e)
                                     }
                                 }
                             }
@@ -2832,6 +2806,8 @@ struct PanelView: View {
                     .frame(maxHeight: .infinity)
                     .onChange(of: state.highlightPulse) { _, _ in
                         guard let id = state.highlightID else { return }
+                        if attention.contains(where: { $0.id == id }) { showAttentionArea = true }
+                        if unverified.contains(where: { $0.id == id }) { showUnverifiedArea = true }
                         if deads.contains(where: { $0.id == id }) {
                             showDeadArea = true
                         }
@@ -2995,9 +2971,7 @@ struct StatusCell: View {
         .help((context.map { $0 + " · " } ?? "") + Self.hoverText(point, uptime: uptime))
     }
 
-    /// 软件更新 sheet:发现新版本 → 自动下载(进度可见)→ 用户确认重启。
-/// 流程刻意拆成「下载」与「重启」两步:重启会打断正在使用的会话,必须由用户拍板
-// 状态色唯一事实源,图例(StatusLegend)从这里引用,避免两处改不同步
+    // 状态色唯一事实源，图例(StatusLegend)从这里引用。
     static let okFast    = Color(red: 0.30, green: 0.66, blue: 0.42)   // 绿:通过且 <3s
     static let okSlow    = Color(red: 0.88, green: 0.62, blue: 0.20)   // 橙:通过但 3-8s
     // 紫:通过但 ≥8s。曾用与失败几乎相同的红(0.82,0.35,0.25),用户看到整条红
@@ -3020,7 +2994,7 @@ struct StatusCell: View {
         f.dateFormat = "MM-dd HH:mm:ss"
         let time = f.string(from: Date(timeIntervalSince1970: p.t))
         let up = uptime.map { " · uptime \($0)%" } ?? ""
-        let cpa = p.cpa.map { $0 ? " · CPA 链路通过" : " · CPA 链路失败" } ?? ""
+        let cpa = p.cpa.map { $0 ? " · CPA 链路通过" : " · CPA 链路失败" } ?? " · 本次未测 CPA"
         if p.ok, let ms = p.ms, ms.isFinite, ms >= 0, ms < 1e9 {
             let speed = ms < 3000 ? "" : (ms < 8000 ? "(慢)" : "(很慢)")
             return "\(time) · 上游通过\(speed) · \(Int(ms)) ms\(cpa)\(up)"
@@ -3190,17 +3164,16 @@ struct OverallStatusBanner: View {
     var compact = false
 
     var body: some View {
-        // 口径(用户确认):只反映可用区。额度区/待删除区不参与分级 ——
-        // 它们是已知状态,横幅只回答「我现在能用的网关好不好」
+        // 横幅和列表共用当前可用性判断；历史通过率不参与当前分组。
         let (bg, icon, title): (Color, String, String) = {
-            if okCount + warnCount == 0 {
+            if okCount == 0 {
                 return (Color.secondary.opacity(0.75),
-                        "minus.circle.fill", "暂无可用网关(失效/无额度条目见下方分区)")
+                        "minus.circle.fill", "暂无全部通过的网关，请查看下方需关注和待验证分区")
             }
             if warnCount > 0 {
                 return (Color(red: 0.85, green: 0.55, blue: 0.15),
                         "exclamationmark.triangle.fill",
-                        "可用 \(okCount) 个 · \(warnCount) 个链路异常(上游正常但经 CPA 不通)")
+                        "全部通过 \(okCount) 个 · \(warnCount) 个需关注")
             }
             return (Color(red: 0.18, green: 0.52, blue: 0.34),
                     "checkmark.seal.fill", "已探测可用 · \(okCount) 个")

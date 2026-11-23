@@ -6,6 +6,8 @@ private final class MonitoringHTTPServer {
     let partial: Bool
     let cooldown: Bool
     let missingCatalog: Bool
+    let catalogUnavailable: Bool
+    let unavailableModels: Set<String>
     private let lock = NSLock()
     private var requestedModels: [String] = []
     func requestCount(for model: String) -> Int {
@@ -16,11 +18,14 @@ private final class MonitoringHTTPServer {
     var base: String { "http://127.0.0.1:\(port)/v1" }
     static let models = ["gpt-monitor-ok", "gpt-monitor-denied", "gpt-monitor-failed"]
 
-    init(partial: Bool = true, cooldown: Bool = false, missingCatalog: Bool = false) throws {
+    init(partial: Bool = true, cooldown: Bool = false, missingCatalog: Bool = false, catalogUnavailable: Bool = false,
+         unavailableModels: Set<String> = []) throws {
         listener = try TCPServer()
         self.partial = partial
         self.cooldown = cooldown
         self.missingCatalog = missingCatalog
+        self.catalogUnavailable = catalogUnavailable
+        self.unavailableModels = unavailableModels
         let listener = listener
         Thread.detachNewThread { [weak self] in
             while let client = listener.accept() {
@@ -36,7 +41,7 @@ private final class MonitoringHTTPServer {
         var status = 404
         var body = #"{"error":{"message":"not found"}}"#
         if first.hasPrefix("GET "), first.contains("/models ") {
-            status = 200
+            status = catalogUnavailable ? 404 : 200
             let names = missingCatalog ? [] : Self.models
             body = String(data: try! JSONSerialization.data(withJSONObject: ["data": names.map { ["id": $0] }]), encoding: .utf8)!
         } else if first.hasPrefix("POST ") {
@@ -47,7 +52,10 @@ private final class MonitoringHTTPServer {
             let object = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any]
             let model = object?["model"] as? String
             if let model { lock.lock(); requestedModels.append(model); lock.unlock() }
-            if partial, model == Self.models[0] || model == "gpt-monitor-new" || model == "test" {
+            if let model, unavailableModels.contains(model) {
+                status = 400
+                body = #"{"error":{"message":"unknown provider for model"}}"#
+            } else if partial, model == Self.models[0] || model == "gpt-monitor-new" || model == "test" {
                 status = 200
                 body = #"{"choices":[{"message":{"role":"assistant","content":"fixture ok"}}]}"#
             } else if partial, model == Self.models[1] {
@@ -81,6 +89,168 @@ enum MonitoringRegressionTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("Monitoring.edit recovers failed status and verifies CPA") { t in
+            let env = try TestEnv("monitor-edit-recovery")
+            defer { env.cleanup() }
+            let upstream = try MonitoringHTTPServer()
+            let cpa = try MonitoringHTTPServer()
+            env.write("cpa-config.yaml", "port: \(cpa.port)\napi-keys:\n  - sk-cpa-fixture\n")
+            setenv("KEYDROP_LLM_KEY", "sk-cpa-fixture", 1)
+            defer { unsetenv("KEYDROP_LLM_KEY") }
+            Prefs.shared.cpaResident = false
+            let core = Core()
+            let imported = try core.add(raw: upstream.base + "\nsk-edit-health-fixture1111", ccOverride: false,
+                                        grokOverride: false, cpaOverride: true, dshOverride: false,
+                                        models: [MonitoringHTTPServer.models[0]], force: true).entry
+            var failed = core.history.find(idPrefix: imported.id)!
+            failed.health = "err"
+            failed.failStreak = 3
+            failed.viaCPAOk = false
+            failed.viaCPAAt = 1
+            try core.history.update(failed)
+            _ = try core.editEntry(entryIDPrefix: failed.id, models: ["gpt-monitor-new"])
+            let saved = core.history.find(idPrefix: failed.id)!
+            t.equal(saved.availability, .available, "编辑选中成功模型后应解除旧失败状态")
+            t.equal(saved.modelProbeLog?["gpt-monitor-new"]?.last?.cpa, true, "编辑完成同步后验证 CPA")
+            t.expect(saved.failStreak == nil && saved.viaCPAOk == true, "清理旧重试和 CPA 失败状态")
+        }
+        h.runSuite("Monitoring.CPA probes every successful selected model") { t in
+            let env = try TestEnv("monitor-cpa-secondary-route")
+            defer { env.cleanup() }
+            let upstream = try MonitoringHTTPServer()
+            let cpa = try MonitoringHTTPServer(unavailableModels: ["gpt-monitor-new"])
+            env.write("cpa-config.yaml", "port: \(cpa.port)\napi-keys:\n  - sk-cpa-fixture\n")
+            setenv("KEYDROP_LLM_KEY", "sk-cpa-fixture", 1)
+            defer { unsetenv("KEYDROP_LLM_KEY") }
+            let core = Core()
+            var record = entry("cpa-secondary-route", server: upstream)
+            record.models = [MonitoringHTTPServer.models[0], "gpt-monitor-new"]
+            record.targets = ["cpa"]
+            record.modelProbeLog = nil
+            try core.history.append(record)
+            let done = DispatchSemaphore(value: 0)
+            core.scanHealth(staleAfter: 0) { _ in done.signal() }
+            t.expect(done.wait(timeout: .now() + 20) == .success, "多模型 CPA 扫描完成")
+            var saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.modelProbeLog?["gpt-monitor-new"]?.last?.cpa, false, "非默认模型缺少 CPA 路由必须记录失败")
+            t.expect(!HistorySections([saved]).attention.isEmpty && !saved.healthColor.ok, "默认模型通过不能掩盖其他 CPA 模型失败")
+            t.equal(saved.modelStatus.failed, 1, "模型计数包含真实 CPA 失败")
+            _ = try core.refreshModels(entryIDPrefix: record.id, pickModels: { _ in record.models! })
+            saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.probeLog?.last?.cpa, false, "手动重测聚合状态也包含非默认 CPA 失败")
+            t.expect(cpa.requestCount(for: "gpt-monitor-new") >= 2, "自动和手动路径均实际请求非默认模型")
+        }
+        h.runSuite("Monitoring.missing catalog still probes configured models") { t in
+            let env = try TestEnv("monitor-no-catalog-endpoint")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(catalogUnavailable: true)
+            let result = APITester.test(url: server.base, key: "sk-no-catalog-fixture",
+                                       preferredModel: "gpt-monitor-new", probePool: ["gpt-monitor-new"])
+            t.expect(result.ok, "没有 models 接口仍能调用已配置模型")
+            t.equal(result.modelProbePoints(at: 1)["gpt-monitor-new"]?.ok, true, "实际模型有采样，不借用占位模型的结果")
+            t.expect(server.requestCount(for: "test") == 0, "已配置模型不探测占位 test")
+        }
+        h.runSuite("Monitoring.CPA shared gateway retains sibling model routes") { t in
+            let env = try TestEnv("monitor-cpa-shared-models")
+            defer { env.cleanup() }
+            env.write("cpa-config.yaml", "port: 8317\n")
+            Prefs.shared.cpaResident = false
+            let server = try MonitoringHTTPServer()
+            let core = Core()
+            let first = try core.add(raw: server.base + "\nsk-shared-first111111", ccOverride: false,
+                                     grokOverride: false, cpaOverride: true, dshOverride: false,
+                                     models: [MonitoringHTTPServer.models[0]], force: true).entry
+            let second = try core.add(raw: server.base + "\nsk-shared-second222222", ccOverride: false,
+                                      grokOverride: false, cpaOverride: true, dshOverride: false,
+                                      models: ["gpt-monitor-new"], force: true).entry
+            let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
+            t.equal(Set(writer.entryModels(baseURL: server.base)), Set([MonitoringHTTPServer.models[0], "gpt-monitor-new"]),
+                    "第二个条目选中的模型必须实际进入 CPA 路由")
+            _ = try core.editEntry(entryIDPrefix: first.id, models: ["gpt-edited-model"], verify: false)
+            t.equal(Set(writer.entryModels(baseURL: server.base)), Set(["gpt-edited-model", "gpt-monitor-new"]),
+                    "编辑一条记录不能移除同上游其他条目的模型")
+            _ = try core.refreshModels(entryIDPrefix: second.id, pickModels: { _ in [MonitoringHTTPServer.models[0]] })
+            t.equal(Set(writer.entryModels(baseURL: server.base)), Set(["gpt-edited-model", MonitoringHTTPServer.models[0]]),
+                    "刷新改选只替换本条目的模型，保留同组其他选择")
+        }
+        h.runSuite("Monitoring.proxy and manual refresh recover CPA status") { t in
+            let env = try TestEnv("monitor-cpa-recovery")
+            defer { env.cleanup() }
+            let upstream = try MonitoringHTTPServer()
+            let cpa = try MonitoringHTTPServer()
+            env.write("cpa-config.yaml", "port: \(cpa.port)\napi-keys:\n  - sk-cpa-fixture\n")
+            setenv("KEYDROP_LLM_KEY", "sk-cpa-fixture", 1)
+            defer { unsetenv("KEYDROP_LLM_KEY") }
+            let core = Core()
+            Prefs.shared.proxy = "http://127.0.0.1:\(upstream.port)"
+            var record = entry("cpa-proxy-recovery", server: upstream)
+            record.url = "http://127.0.0.1:1/v1"
+            record.health = "proxy-ok"
+            record.models = [MonitoringHTTPServer.models[0]]
+            record.targets = ["cpa"]
+            record.viaCPAOk = false
+            record.viaCPAAt = 1
+            try core.history.append(record)
+            let done = DispatchSemaphore(value: 0)
+            core.scanHealth(staleAfter: 0) { _ in done.signal() }
+            t.expect(done.wait(timeout: .now() + 20) == .success, "经代理扫描完成")
+            var saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.health, "proxy-ok", "确实走代理路径")
+            t.equal(saved.viaCPAOk, true, "经代理的可用上游也重新验证 CPA")
+            t.equal(saved.modelProbeLog?[record.model!]?.last?.cpa, true, "模型采样记录本次 CPA 成功")
+            saved.viaCPAOk = false
+            saved.viaCPAAt = 1
+            try core.history.update(saved)
+            _ = try core.refreshModels(entryIDPrefix: record.id, pickModels: { _ in record.models! })
+            saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.viaCPAOk, true, "手动刷新也能解除旧 CPA 失败")
+            t.equal(saved.probeLog?.last?.cpa, true, "刷新监控保存实际链路结果")
+        }
+        h.runSuite("Monitoring.explicit invalid responses record failures") { t in
+            let env = try TestEnv("monitor-invalid-body")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .catalogOnly)
+            let result = APITester.test(url: "http://127.0.0.1:\(server.port)/v1", key: "sk-invalid-body-fixture",
+                                        preferredModel: "gpt-5.6-sol", probePool: ["gpt-5.6-sol"])
+            t.expect(!result.reachabilityOnly && !result.ok, "实际请求返回目录 JSON 应为模型失败")
+            t.equal(result.modelProbePoints(at: 1)["gpt-5.6-sol"]?.ok, false, "已请求模型的无效响应应留下失败采样")
+        }
+        h.runSuite("Monitoring.scan only records actually requested models") { t in
+            let env = try TestEnv("monitor-no-invented-scan")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(partial: false)
+            let core = Core()
+            var record = entry("no-invented-scan", server: server)
+            record.models = (1...6).map { "gpt-sample-\($0)" }
+            record.model = record.models?.first
+            record.modelProbeLog = nil
+            try core.history.append(record)
+            let done = DispatchSemaphore(value: 0)
+            core.scanHealth(staleAfter: 0) { _ in done.signal() }
+            t.expect(done.wait(timeout: .now() + 20) == .success, "扫描完成")
+            let saved = core.history.find(idPrefix: record.id)!
+            for model in record.models! {
+                t.equal(saved.modelProbeLog?[model]?.isEmpty == false, server.requestCount(for: model) > 0,
+                        "\(model) 未请求时不能伪造失败采样")
+            }
+        }
+        h.runSuite("Monitoring.refresh only records actually requested models") { t in
+            let env = try TestEnv("monitor-no-invented-refresh")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(partial: false)
+            let core = Core()
+            var record = entry("no-invented-refresh", server: server)
+            record.models = (1...6).map { "gpt-sample-\($0)" }
+            record.model = record.models?.first
+            record.modelProbeLog = nil
+            try core.history.append(record)
+            _ = try? core.refreshModels(entryIDPrefix: record.id)
+            let saved = core.history.find(idPrefix: record.id)!
+            for model in record.models! {
+                t.equal(saved.modelProbeLog?[model]?.isEmpty == false, server.requestCount(for: model) > 0,
+                        "\(model) 刷新未请求时不能伪造失败采样")
+            }
+        }
         h.runSuite("Monitoring.partial scan replaces stale green model points") { t in
             let env = try TestEnv("monitor-partial-scan")
             defer { env.cleanup() }

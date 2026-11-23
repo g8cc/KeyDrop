@@ -195,7 +195,7 @@ enum CLI {
 
         case "scan":
             // 全量强制健康探测:staleAfter=0 让所有 active 条目都重测,
-            // 结果落盘后 UI 的可用/无余额/待删除区随之归位
+            // 结果落盘后 UI 各分区随实际可用性更新
             let before = Core.shared.history.snapshot()
                 .filter { $0.status == "active" }
                 .reduce(into: [String: String]()) { $0[$1.id] = $1.health ?? "未测" }
@@ -227,11 +227,11 @@ enum CLI {
             }
             var out: [String] = []
             out.append("═══ 探测结果(\(entries.count) 条符合探测条件，\(skipped) 条跳过)═══")
-            for (title, rows) in [("认证失败", dead), ("额度或模型异常", quota), ("探测失败", err), ("待验证或复测", pending), ("状态变化", demoted)] where !rows.isEmpty {
+            for (title, rows) in [("认证失败", dead), ("额度耗尽", quota), ("探测失败", err), ("需关注或待验证", pending), ("状态变化", demoted)] where !rows.isEmpty {
                 out.append("── \(title) \(rows.count) 条 ──")
                 out.append(rows.joined(separator: "\n"))
             }
-            out.append("═══ 统计:可用 \(ok) / 额度或模型异常 \(quota.count) / 待验证 \(pending.count) / 失败 \(err.count + dead.count) ═══")
+            out.append("═══ 统计:已验证可用 \(ok) / 额度耗尽 \(quota.count) / 需关注或待验证 \(pending.count) / 失败 \(err.count + dead.count) ═══")
             print(out.joined(separator: "\n"))
             return 0
 
@@ -765,7 +765,7 @@ enum CLI {
                                        [--proxy http://127.0.0.1:7890] (或环境变量 KEYDROP_PROXY)
       KeyDrop --parse "<内容>"       只看解析结果,不写入
       KeyDrop --list                 历史记录
-      KeyDrop scan                   全量强制健康探测,刷新可用/无余额/待删除区
+      KeyDrop scan                   全量强制健康探测,刷新各可用性分区
       KeyDrop proxy-pool             CPA OAuth 账号 × 代理池粘性自动绑定(--file 必填)
                                      [--file <代理列表>] [--auth-dir <路径>] [--type xai]
                                      [--target <检查URL>] [--timeout 8] [--concurrency 64]

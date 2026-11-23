@@ -324,17 +324,16 @@ public final class CPAWriter {
             throw WriterError.file("CPA config 不存在: \(configPath)")
         }
         let writeMsg = try withWriteLock {
-            try addMultiLocked(baseURL: baseURL, keys: [k], models: models, proxy: proxy)
+            try addMultiLocked(baseURL: baseURL, keys: [k], models: models, mergeSelected: true, proxy: proxy)
         }
         return writeMsg.0
     }
 
-    /// 刷新时按用户重新勾选的列表「整体替换」聚合条目 models 段。
-    /// 与 addMultiLocked 的「只合 key 不动精选列表」不同:refresh 的语义是用户对
-    /// 模型列表的重新确认,被取消勾选的模型必须同步移除,否则 CPA 条目永远停在
-    /// 首次导入的列表(真实场景:cc 系已更新 4 模型,CPA 仍停在误杀后剩下的 1 个)。
+    /// 更新模型列表。默认整替；传 removing 时仅撤销当前记录的旧选择，
+    /// preserving 保留其他记录共用的模型，未涉及的手写模型继续保留。
     /// 条目不存在时抛错(由调用方提示),绝不重建已删除的条目
-    public func updateAggregatedModels(baseURL: String, models: [String]) throws -> String {
+    public func updateAggregatedModels(baseURL: String, models: [String],
+                                       removing: [String]? = nil, preserving: [String] = []) throws -> String {
         var uniq: [String] = []
         var seen = Set<String>()
         for m in models {
@@ -351,6 +350,12 @@ public final class CPAWriter {
             let providerName = aggregatedName(for: baseURL)
             guard let entryRange = findAggregatedEntry(for: baseURL, in: lines) else {
                 throw WriterError.file("CPA 聚合条目不存在: \(providerName)")
+            }
+            if let removing {
+                let removed = Set(removing)
+                let remaining = entryModels(in: lines, entryRange: entryRange).filter { !removed.contains($0) }
+                var selected = Set<String>()
+                uniq = (remaining + uniq + preserving).filter { selected.insert($0).inserted }
             }
             if try replaceModelsSegment(&lines, entryRange: entryRange, models: uniq) {
                 try atomicWrite(lines.joined(separator: "\n"))
@@ -372,7 +377,14 @@ public final class CPAWriter {
               let range = mappingSequenceRange("models", in: lines, itemRange: entryRange) else { return false }
         try expandEmptyModelsHeader(&lines, header: property.line)
         let indent = modelSequenceIndent(in: lines, range: range, entryRange: entryRange)
-        let block = uniq.flatMap { ["\(indent)- name: \(yamlScalar($0))", "\(indent)  alias: \(yamlScalar($0))"] }
+        let existing = Dictionary(grouping: modelItems(in: lines, range: range), by: \.name)
+        let block = uniq.flatMap { model -> [String] in
+            if let items = existing[model] {
+                // 保留同名模型已有的别名、图片标记和其他属性。
+                return items.flatMap { Array(lines[$0.item.range]) }
+            }
+            return ["\(indent)- name: \(yamlScalar(model))", "\(indent)  alias: \(yamlScalar(model))"]
+        }
         lines.replaceSubrange(range, with: block)
         return true
     }
@@ -489,10 +501,11 @@ public final class CPAWriter {
     /// 模型探测在锁外完成:探测是网络请求,离线时要等超时,
     /// 不能在 flock 临界区内做 —— 否则 CLI 与菜单栏并发写时互相串行排队到对方超时
     /// 返回 (消息, 条目最终模型列表)。已有非空 models 的条目视为用户精选:
-    /// 再导入只合并 key,绝不追加探测模型(真实反馈:CPA 聚合 /models 混入 22 家
-    /// 上游共 100+ 模型,用户只要 SOTA 四件套,KeyDrop 不得把一大堆回填)
+    /// 批量探测再导入只合并 key，不追加整站目录；mergeSelected 用于单条明确选择，
+    /// 将用户选择并入已有模型，而不是静默丢弃本次选择。
     private func addMultiLocked(baseURL: String, keys: [String], models probedModels: [String],
-                                picked pickedModels: [String]? = nil, proxy rawProxy: String? = nil) throws -> (String, [String]) {
+                                picked pickedModels: [String]? = nil, mergeSelected: Bool = false,
+                                proxy rawProxy: String? = nil) throws -> (String, [String]) {
         let content = try readConfigText()
         let proxy = Self.rewriteProxyForDocker(rawProxy, configContent: content)
         var lines = content.components(separatedBy: "\n")
@@ -515,6 +528,12 @@ public final class CPAWriter {
                     try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName, keys: keys, models: pickedModels, baseURL: baseURL)
                 }
                 finalModels = pickedModels
+            } else if mergeSelected {
+                // 单条导入传入的是明确选择，不是整站探测目录。共享上游时保留其他条目的选择。
+                try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName,
+                                             keys: keys, models: probedModels, baseURL: baseURL)
+                var seen = Set<String>()
+                finalModels = (existingModels + probedModels).filter { seen.insert($0).inserted }
             } else if existingModels.isEmpty {
                 // 条目无模型列表(上次探测失败):补写本次探测结果
                 try mergeIntoAggregatedEntry(&lines, range: entryRange, providerName: actualName, keys: keys, models: probedModels, baseURL: baseURL)

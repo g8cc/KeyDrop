@@ -1193,7 +1193,7 @@ public final class Core {
         if test.ok { return (health, detail, 0) }
         let keepAvailable = test.transientFailure && previousHealth == "ok" && streak < 2
         if keepAvailable {
-            return ("ok", "⚠ 探测失败 1 次(保留可用,连续 2 次将降级): \(detail.prefix(70))", streak)
+            return ("ok", "⚠ 本次网络探测失败，等待复测: \(detail.prefix(70))", streak)
         }
         return (health, detail, streak)
     }
@@ -1235,8 +1235,7 @@ public final class Core {
                 // 监控只测用户勾选的模型(激活模型置顶):站点目录里没勾的模型与本次
                 // 监控无关,拿去轮换只会把我自己的模型挤到十几轮之后才补一格。
                 // 发现新可用模型是「行内 ↻ 刷新」的活,不是巡检的活
-                var probePool = e.models ?? []
-                if let am = e.model, !probePool.contains(am) { probePool.insert(am, at: 0) }
+                let probePool = e.configuredModels
                 let test = APITester.test(url: entryURL, key: entryKey, timeout: 10,
                                           proxy: px, preferredModel: e.model,
                                           modelProbeTimes: e.modelProbeLog?.compactMapValues { $0.last?.t },
@@ -1258,13 +1257,7 @@ public final class Core {
                 updated.healthAt = now
                 updated.latencyMs = test.ok ? test.latencyMs : e.latencyMs
                 // 部分可用时也记录已确认失败的模型,防止旧绿格一直保留。
-                var modelPoints = test.ok ? test.modelProbePoints(at: now) : [:]
-                if !test.ok, updated.health != "ok" {
-                    // 整体失败沿用原行为;首次网络抖动经防抖后不把所有模型染红。
-                    for m in e.models ?? (e.model.map { [$0] } ?? []) {
-                        modelPoints[m] = ProbePoint(t: now, ms: nil, ok: false)
-                    }
-                }
+                let modelPoints = test.modelProbePoints(at: now)
                 // 增量语义:每个模型包一层单点数组,mergeHealth 负责追加进完整轨迹并截 30
                 // (与 probeLog 的 merge 模式一致,避免快照覆盖监控历史)
                 if modelPoints.isEmpty {
@@ -1280,31 +1273,13 @@ public final class Core {
                 // "model only supported on /v1/images/generations" 拒绝,曾把
                 // gpt-image-2 条目误标为链路异常(真实事故)。跳过 = 视为未测,
                 // 不显示 CPA 徽章,不误报
-                if e.targets.contains("cpa"), test.ok, updated.health == "ok",
-                   let cpa = CPAWriter.endpointInfo(), let m = e.model ?? e.models?.first, !m.isEmpty,
-                   !Core.isNonChatModel(m) {
-                    let cpaBase = cpa.baseURL.hasSuffix("/v1") ? cpa.baseURL : cpa.baseURL + "/v1"
-                    let via = APITester.testModelChat(base: cpaBase, key: cpa.clientKey, model: m, timeout: 15)
-                    updated.viaCPAOk = via.ok
-                    updated.viaCPAAt = now
-                    // CPA 结果注到该模型本轮增量点上(数组末位);无点则建一个纯链路点
-                    if var mp = updated.modelProbeLog {
-                        if var arr = mp[m], !arr.isEmpty {
-                            arr[arr.count - 1].cpa = via.ok
-                            mp[m] = arr
-                        } else {
-                            mp[m] = [ProbePoint(t: now, ms: nil, ok: via.ok, cpa: via.ok)]
-                        }
-                        updated.modelProbeLog = mp
-                    } else {
-                        updated.modelProbeLog = [m: [ProbePoint(t: now, ms: nil, ok: via.ok, cpa: via.ok)]]
+                let cpaResults = self.updateCPAProbe(for: &updated, test: test, at: now)
+                for (model, passed) in cpaResults {
+                    // CPA 结果只附到该模型本轮实际请求的增量点上。
+                    if var points = updated.modelProbeLog?[model], !points.isEmpty {
+                        points[points.count - 1].cpa = passed
+                        updated.modelProbeLog?[model] = points
                     }
-                    if !via.ok {
-                        updated.healthDetail = (updated.healthDetail ?? "") + " | ⚠ CPA 链路探测失败(\(via.detail.prefix(60)))"
-                    }
-                } else if !e.targets.contains("cpa") {
-                    updated.viaCPAOk = nil
-                    updated.viaCPAAt = nil
                 }
                 // 只收集不落盘;结束后 mergeHealth 一次性按字段合并保存(见 scanHealth 尾部)
                 // 每条各 save 一次会把整份历史反复序列化写盘(O(N²) IO 放大)
@@ -1367,7 +1342,7 @@ public final class Core {
                 let px = self.proxyForHealth()
                 let test = APITester.test(url: url, key: key, timeout: 10, proxy: px,
                                           preferredModel: e.model, importedModels: e.models,
-                                          probePool: e.models ?? e.model.map { [$0] }, styleHint: e.apiStyle)
+                                          probePool: e.configuredModels, styleHint: e.apiStyle)
                 guard !test.skippedForCooldown else { return }
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 // 再确认目标仍缺失。用户可能在网络探测期间重新导入。
@@ -1871,7 +1846,8 @@ public final class Core {
                             }
                         }
                         if !incomingModels.isEmpty {
-                            _ = try writer.updateAggregatedModels(baseURL: newURL, models: incomingModels)
+                            _ = try updateCPASelection(writer: writer, entryID: e.id, url: newURL, models: incomingModels,
+                                                       previous: writer.normalizeUpstreamURL(oldURL) == writer.normalizeUpstreamURL(newURL) ? local.configuredModels : [])
                         }
                         let sameUpstream = writer.normalizeUpstreamURL(oldURL) == writer.normalizeUpstreamURL(newURL)
                         let incomingKeys = Set(newKeys)
@@ -2207,7 +2183,7 @@ public final class Core {
         }
         let px = proxyForHealth()
         let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model,
-                                  importedModels: entry.models, probePool: entry.models ?? entry.model.map { [$0] },
+                                  importedModels: entry.models, probePool: entry.configuredModels,
                                   styleHint: entry.apiStyle)
         if test.skippedForCooldown { return "暂缓探测: " + test.detail }
         noteProxyWorked(needsProxy: test.needsProxy, used: px)
@@ -2219,17 +2195,17 @@ public final class Core {
                 found.healthDetail = h.detail
                 found.healthAt = Date().timeIntervalSince1970
                 found.failStreak = nil   // 手动重测成功即清零(审计 2026-11-14 P2)
-                recordProbeResult(test, for: found)
+                recordProbeResult(test, for: &found)
                 historyUpdateLogged(found)
             }
-            let label = test.reachabilityOnly ? "网关可达" : (test.quotaExhausted ? "额度用尽" : "✓ 可用")
+            let label = history.find(idPrefix: entryIDPrefix)?.availability.label ?? h.health
             return "\(label): \(h.detail) (\(test.models.count) 个模型)"
         }
         if var found = history.find(idPrefix: entryIDPrefix) {
             found.health = h.health
             found.healthDetail = h.detail
             found.healthAt = Date().timeIntervalSince1970
-            recordProbeResult(test, for: found)
+            recordProbeResult(test, for: &found)
             historyUpdateLogged(found)
         }
         return "✗ 不可用: \(test.detail)"
@@ -2407,18 +2383,58 @@ public final class Core {
         return out.joined(separator: "; ")
     }
 
-    /// 所有手动重测分支共享监控落盘,包括失败和改选后的第二次探测。
-    private func recordProbeResult(_ test: APITestResult, for entry: HistoryEntry) {
-        guard !test.skippedForCooldown, !test.reachabilityOnly else { return }
-        let now = entry.healthAt ?? Date().timeIntervalSince1970
-        var points = test.modelProbePoints(at: now)
-        if !test.ok {
-            for model in entry.models ?? (entry.model.map { [$0] } ?? []) where points[model] == nil {
-                points[model] = ProbePoint(t: now, ms: nil, ok: false)
+    /// 同一上游的多条记录共享 CPA 模型段，改选只移除当前记录放弃的模型。
+    private func updateCPASelection(writer: CPAWriter, entryID: String, url: String,
+                                    models: [String], previous: [String]) throws -> String {
+        let upstream = writer.normalizeUpstreamURL(url)
+        let siblings = history.snapshot().filter {
+            $0.id != entryID && $0.status == "active" && $0.targets.contains("cpa")
+                && writer.normalizeUpstreamURL($0.url ?? "") == upstream
+                && (CPAAPI.apiMode || $0.cpaConfigPath == nil || $0.cpaConfigPath == writer.configPath)
+        }.flatMap(\.configuredModels)
+        return try writer.updateAggregatedModels(baseURL: url, models: models,
+                                                  removing: previous, preserving: siblings)
+    }
+
+    private func updateCPAProbe(for entry: inout HistoryEntry, test: APITestResult, at: TimeInterval) -> [String: Bool] {
+        guard entry.targets.contains("cpa") else {
+            entry.viaCPAOk = nil
+            entry.viaCPAAt = nil
+            return [:]
+        }
+        guard test.ok, !test.reachabilityOnly, !test.quotaExhausted,
+              let cpa = CPAWriter.endpointInfo() else { return [:] }
+        let configured = Set(entry.configuredModels)
+        let models = test.workingModels.filter { configured.contains($0) && !Self.isNonChatModel($0) }
+        guard !models.isEmpty else { return [:] }
+        let base = cpa.baseURL.hasSuffix("/v1") ? cpa.baseURL : cpa.baseURL + "/v1"
+        var results: [String: Bool] = [:]
+        for model in models {
+            let via = APITester.testModelChat(base: base, key: cpa.clientKey, model: model, timeout: 15)
+            results[model] = via.ok
+            if !via.ok {
+                entry.healthDetail = (entry.healthDetail ?? "") + " | ⚠ CPA 链路探测失败[\(model)](\(via.detail.prefix(180)))"
             }
         }
+        entry.viaCPAOk = results.values.allSatisfy { $0 }
+        entry.viaCPAAt = at
+        return results
+    }
+
+    /// 所有手动重测分支共享监控落盘,包括失败和改选后的第二次探测。
+    private func recordProbeResult(_ test: APITestResult, for entry: inout HistoryEntry) {
+        guard !test.skippedForCooldown else { return }
+        let now = entry.healthAt ?? Date().timeIntervalSince1970
+        var points = test.modelProbePoints(at: now)
+        let cpaResults = updateCPAProbe(for: &entry, test: test, at: now)
+        for (model, passed) in cpaResults {
+            points[model]?.cpa = passed
+        }
+        let cpa: Bool? = cpaResults.isEmpty ? nil : cpaResults.values.allSatisfy { $0 }
         do {
-            try history.appendProbePoint(id: entry.id, ok: test.ok && !test.quotaExhausted && !test.chatDegraded, ms: test.latencyMs, cpa: nil, at: now)
+            if !test.reachabilityOnly {
+                try history.appendProbePoint(id: entry.id, ok: test.ok && !test.quotaExhausted && !test.chatDegraded, ms: test.latencyMs, cpa: cpa, at: now)
+            }
             try history.appendModelProbePoints(id: entry.id, points: points)
         } catch {
             AppLog.warn("探测点写入失败: \(error.localizedDescription)")
@@ -2440,7 +2456,7 @@ public final class Core {
         }
         let test = APITester.test(url: url, key: key, proxy: effProxy,
                                   preferredModel: entry.model, importedModels: entry.models,
-                                  probePool: entry.models ?? entry.model.map { [$0] }, styleHint: entry.apiStyle)
+                                  probePool: entry.configuredModels, styleHint: entry.apiStyle)
         if test.ok { entry.apiStyle = test.style }
         if test.skippedForCooldown, pickModels == nil { throw ParseError.io(test.detail) }
         // 端点报错但 /models 拿到了清单 ≠ 不能改选:恰恰是勾选的那个模型 503/429 才最需要
@@ -2452,14 +2468,14 @@ public final class Core {
             let h = Self.healthFor(test)
             // 只改 health 不动 status:status="dead" 会让条目从 UI 全部列表消失,
             // 且 delete() 只认 status=="active",记录变成删不掉的僵尸。
-            // health="dead" + status="active" 会正常进入「待删除区」,与健康扫描路径一致
+            // health="dead" + status="active" 会正常进入「探测失败」,与健康扫描路径一致
             entry.health = h.health
             entry.healthDetail = h.detail
             entry.healthAt = Date().timeIntervalSince1970
-            recordProbeResult(test, for: entry)
+            recordProbeResult(test, for: &entry)
             historyUpdateLogged(entry)
             let deadMark = (test.authFailed || test.detail.contains("401") || test.detail.contains("403"))
-                ? "(key 已失效,已移入待删除区)" : ""
+                ? "(接口拒绝认证，已移入探测失败区)" : ""
             throw ParseError.io("✗ 不可用: \(test.detail)\(deadMark)")
         }
         // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表。
@@ -2487,16 +2503,16 @@ public final class Core {
             }
             entry.healthAt = Date().timeIntervalSince1970
             entry.failStreak = nil   // 手动重测成功即清零
-            recordProbeResult(test, for: entry)
+            recordProbeResult(test, for: &entry)
         } else if !test.skippedForCooldown {
             // 改选路径:先如实记下本次失败,选完再重探覆盖(别停在旧模型的 503 上)
             let h = Self.healthFor(test)
             entry.health = h.health
             entry.healthDetail = h.detail
             entry.healthAt = Date().timeIntervalSince1970
-            recordProbeResult(test, for: entry)
+            recordProbeResult(test, for: &entry)
         }
-        let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
+        let previousModels = entry.configuredModels
         let currentModels = Set(previousModels)
         // test.models 是 /models JSON(data[].id)的真实模型 ID;testModels 仅给无
         // picker 的 CLI 路径兖当去噪。弹窗选项必须用原始列表:step-3.7-flash /
@@ -2671,7 +2687,7 @@ public final class Core {
             let keep = currentModels.isEmpty ? "无" : currentModels.joined(separator: ", ")
             let q = quotaNote.map { "(\($0) — 充值后刷新自动恢复)" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
-            return "✓ \(quotaNote != nil ? "端点可用但无额度" : "可用"): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)\(m)"
+            return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)\(m)"
         }
         // 变化检测用原始列表:entry.models 修复后可能含被本启发式误杀的点分名,
         // 拿过滤后的列表比对着会把「无变化」误判成「已变化」,每次刷新都弹窗
@@ -2685,7 +2701,7 @@ public final class Core {
             try history.update(entry)
             let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
-            return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,无变化)\(q)\(m)"
+            return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,无变化)\(q)\(m)"
         }
 
         var filtered: [String] = []
@@ -2712,6 +2728,7 @@ public final class Core {
         // 是死是活无从判断。全挂也保留用户的选择(清单是端点自己 /models 给的),
         // 只如实标 err 并留痕,下次扫描会重测
         var retestNote: String? = nil
+        var selectionTest: APITestResult?
         if repickAfterFail || filtered != previousModels {
             // 新选择必须用其自身的调用结果，目录里的其他模型成功不能替它背书。
             if filtered != previousModels {
@@ -2728,7 +2745,7 @@ public final class Core {
                 entry.healthDetail = h.detail
                 entry.healthAt = Date().timeIntervalSince1970
                 entry.failStreak = retest.ok ? nil : 1
-                recordProbeResult(retest, for: entry)
+                selectionTest = retest
             } else if filtered != previousModels {
                 entry.health = nil
                 entry.healthAt = nil
@@ -2773,7 +2790,8 @@ public final class Core {
             }
             if let cfg = cfgPath {
                 do {
-                    let cpaMsg = try CPAWriter(configPath: cfg).updateAggregatedModels(baseURL: url, models: filtered)
+                    let cpaMsg = try updateCPASelection(writer: CPAWriter(configPath: cfg), entryID: entry.id, url: url,
+                                                        models: filtered, previous: previousModels)
                     entry.cpaConfigPath = cfg
                     cpaNote = "\n✓ CPA: \(cpaMsg)"
                     let resident = syncCPAResidentEntries(models: filtered)
@@ -2783,15 +2801,16 @@ public final class Core {
                 }
             }
         }
+        if let selectionTest { recordProbeResult(selectionTest, for: &entry) }
         try history.update(entry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
-        let r = retestNote.map { "\n\($0)" } ?? ""
+        let r = retestNote == nil ? "" : "\n\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(entry.healthDetail ?? "")"
         if retestNote != nil {
             // 以新选择的复测结果报告，不能沿用旧模型的成功提示。
             return "已改选 \(filtered.count) 个模型(端点: \(test.detail))\(w)\(dshNote)\(cpaNote)\(r)"
         }
-        return "✓ 可用: \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
+        return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
     }
 
     /// 编辑弹窗「勾选模型」的数据源:只探测不写任何目标/账本
@@ -2834,7 +2853,7 @@ public final class Core {
         }
 
         var lines: [String] = []
-        let previousModels = entry.models ?? (entry.model.map { [$0] } ?? [])
+        let previousModels = entry.configuredModels
         var newModels = previousModels
 
         // key 轮换:站方轮换 key 是高频场景,同 URL 同模型只换凭据。新 key 必须先
@@ -2843,15 +2862,19 @@ public final class Core {
         var effectiveKey = key
         let previousKey = key
         var keyRotated = false
+        var rotationTest: APITestResult?
         if let newKey = newKey?.trimmingCharacters(in: .whitespacesAndNewlines), !newKey.isEmpty, newKey != key {
             if let owner = history.findActiveByKey(newKey) {
                 throw ParseError.duplicate(id: owner.id, message: "新凭据已属于活跃记录，不能通过轮换重复认领")
             }
-            let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth(), styleHint: entry.apiStyle)
+            let selected = models?.isEmpty == false ? models! : entry.configuredModels
+            let test = APITester.test(url: url, key: newKey, proxy: proxyForHealth(),
+                                      preferredModel: selected.first, probePool: selected, styleHint: entry.apiStyle)
             guard test.ok else {
                 throw ParseError.io("新 key 验证失败,未做任何修改: \(test.detail)")
             }
             entry.apiStyle = test.style
+            rotationTest = test
             effectiveKey = newKey
             keyRotated = true
             if entry.isCredentialPool {
@@ -2873,6 +2896,7 @@ public final class Core {
         // 模型级探测点入档容器(函数级:models 块与 key 轮换块共用)
         var editModelPoints: [String: ProbePoint] = [:]
         let editProbeNow = Date().timeIntervalSince1970
+        var editUsedProxy = false
 
         if let models, !models.isEmpty {
             var verified: [String] = []
@@ -2884,9 +2908,10 @@ public final class Core {
                 if verify {
                     // 先直连再代理:验证端点拿到代理就只走代理(无直连回退),本机代理对
                     // 回环/内网网关会返 502,直接传代理会把本可直连的模型全判失败(与 add() 同口径)
-                    var check = APITester.testModelChat(base: url, key: effectiveKey, model: m)
+                    var check = APITester.testModelChat(base: url, key: effectiveKey, model: m, styleHint: entry.apiStyle)
                     if !check.ok, let verifyProxy, !verifyProxy.isEmpty {
-                        check = APITester.testModelChat(base: url, key: effectiveKey, model: m, proxy: verifyProxy)
+                        check = APITester.testModelChat(base: url, key: effectiveKey, model: m, proxy: verifyProxy, styleHint: entry.apiStyle)
+                        if check.ok { editUsedProxy = true }
                     }
                     if check.ok {
                         verified.append(m)
@@ -3066,7 +3091,7 @@ public final class Core {
         }
 
         // CPA 同步(与 refresh 同一账本口径,此前编辑只更新 cc 系目标,CPA 条目停在旧列表):
-        // 编辑模型 = 用户对列表的重新确认 → updateAggregatedModels 整替;
+        // 编辑模型只替换本条目选择，同时保留其他条目的模型;
         // key 轮换 → 聚合条目组内原位替换旧 key。API 模式全程零文件触碰。
         if entry.targets.contains("cpa") {
             let cfgPath: String?
@@ -3091,7 +3116,8 @@ public final class Core {
                         }
                     }
                     if !(models ?? []).isEmpty {
-                        let msg = try writer.updateAggregatedModels(baseURL: url, models: newModels)
+                        let msg = try updateCPASelection(writer: writer, entryID: entry.id, url: url,
+                                                         models: newModels, previous: previousModels)
                         cpaLines.append(msg)
                         entry.cpaConfigPath = cfg
                         lines.append("✓ CPA: " + cpaLines.joined(separator: "; "))
@@ -3110,9 +3136,18 @@ public final class Core {
             }
         }
 
-        if !editModelPoints.isEmpty {
-            do { try history.appendModelProbePoints(id: entry.id, points: editModelPoints) }
-            catch { AppLog.warn("编辑验证点写入失败: \(error.localizedDescription)") }
+        if !editModelPoints.isEmpty || rotationTest != nil {
+            let result = editModelPoints.isEmpty ? rotationTest! : APITestResult(
+                ok: true, style: entry.apiStyle ?? "openai", models: newModels,
+                detail: "编辑后所选模型验证通过", authFailed: false, needsProxy: editUsedProxy,
+                workingModels: newModels.filter { editModelPoints[$0]?.ok == true },
+                failedModels: editModelPoints.filter { !$0.value.ok }.map(\.key))
+            let status = Self.healthFor(result)
+            entry.health = status.health
+            entry.healthDetail = status.detail
+            entry.healthAt = editProbeNow
+            entry.failStreak = nil
+            recordProbeResult(result, for: &entry)
         }
         do { try history.update(entry) }
         catch {
@@ -3244,7 +3279,7 @@ public final class Core {
     /// 通用「按需同步到指定目标」:条目行的同步菜单入口(cc-switch/CPA/DSH/Grok)。
     /// 与 replayArtifacts 的区别:单条目、单目标、用户显式触发。
     /// - cc-switch:账本无本机 pid 或 pid 已不存在 → cc.add 建;已存在 → syncModelsAfterRefresh
-    /// - CPA:聚合条目 upsert(key 合并 + 模型整替为条目精选)
+    /// - CPA:聚合条目 upsert(key 和条目明确选择的模型合并)
     /// - DSH/Grok:写入器天然 upsert
     public func syncTarget(entryIDPrefix: String, target: String) throws -> String {
         guard var entry = history.find(idPrefix: entryIDPrefix)
@@ -3262,7 +3297,7 @@ public final class Core {
               let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法同步")
         }
-        let models = (entry.models ?? (entry.model.map { [$0] } ?? []))
+        let models = entry.configuredModels
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !models.isEmpty else {

@@ -51,7 +51,7 @@ public struct APITestResult {
 
     /// 只将真实请求的结果转成监控点;冷却/仅目录可达不会制造模型结果。
     public func modelProbePoints(at time: TimeInterval) -> [String: ProbePoint] {
-        guard !skippedForCooldown, !reachabilityOnly else { return [:] }
+        guard !skippedForCooldown else { return [:] }
         var points: [String: ProbePoint] = [:]
         for model in workingModels { points[model] = ProbePoint(t: time, ms: modelLatencies?[model], ok: true) }
         for model in quotaModels + failedModels { points[model] = ProbePoint(t: time, ms: modelLatencies?[model], ok: false) }
@@ -287,11 +287,139 @@ public enum APITester {
         let s = session(for: proxy)
 
         var lastErr = "无"
-        var style = ""
+        let style = ""
         var authFailed = false
         // 暂时性网络层失败标记(超时/不可达):健康扫描防抖判定依据。
         // 服务端明确应答(HTTP 任意状态)反证网络层可达 → 非暂时性
         var sawTransient = false
+        // 目录可选；显式模型应始终用自己的请求验证，不能借用占位模型结果。
+        func probeChatModels(_ models: [String], catalogDetail: String, catalogAuthFailed: Bool = false) -> APITestResult {
+            var lastErr = "无"
+            var style = styleHint == "anthropic" ? "anthropic" : "openai"
+            // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
+            // chat 探测多模型(上限 4,free 字样模型优先):单个模型 429 不代表整 key 无额度。
+            // 任一模型返回聊天内容 → key 可用;探测过的模型全部 quota → 才判无额度;
+            // 401/403 仅在没有任何可用模型时才判 key 失效(见下方 gatedModels 注释)。
+            // 真实事故:4 模型中首选 composer 429、
+            // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
+            let probeOrder: [String]
+            if let pool = probePool, !pool.isEmpty {
+                probeOrder = configuredProbeOrder(pool, preferred: preferredModel,
+                                                  modelProbeTimes: modelProbeTimes)
+            } else {
+                probeOrder = chatProbeOrder(models, preferred: preferredModel,
+                                            modelProbeTimes: modelProbeTimes,
+                                            importedModels: importedModels)
+            }
+            var working: [String] = []
+            var quotaModels: [String] = []
+            var failedModels: [String] = []
+            var degradedModel: (String, Int)? = nil
+            var authModel: (String, Int)? = nil
+            var gatedModels: [String] = []
+            var firstWorkingLatency: Double? = nil
+            var skippedCount = 0
+            var cooldownDetail: String?
+            var modelLatencies: [String: Double] = [:]
+            for probe in probeOrder {
+                let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe, native: style == "anthropic")
+                if let detectedStyle = chat.style { style = detectedStyle }
+                if chat.skippedForCooldown {
+                    skippedCount += 1
+                    cooldownDetail = chat.detail
+                    continue
+                }
+                if let st = chat.authStatus {
+                    // 401/403 曾经一律判「key 失效」短路。真实事故(vyceai, 2026-09-23):
+                    // 站点按模型限权 —— 同一把 key,deepseek-v4.1 chat 200,而
+                    // qwen3.8-flash 403;首选模型已探活时,403 只说明该模型不对这把
+                    // key 开放,不是 key 死了。有可用模型就继续,403 只记账
+                    if authModel == nil { authModel = (probe, st) }
+                    gatedModels.append(probe)
+                    failedModels.append(probe)
+                    // 403 可能只限制当前模型，继续验证其余模型才能判断整把 key。
+                    if st == 401 && working.isEmpty { break }
+                    continue
+                }
+                if let ms = chat.latencyMs { modelLatencies[probe] = ms }
+                if chat.quota != nil { quotaModels.append(probe); continue }
+                if let st = chat.degraded {
+                    failedModels.append(probe)
+                    if degradedModel == nil { degradedModel = (probe, st) }
+                    if let detail = chat.detail { lastErr = detail }
+                    continue
+                }
+                if chat.networkError {
+                    failedModels.append(probe)
+                    // 全部 chat 路径超时/无响应:模型不可达,绝不能计入 working
+                    // (归入 degraded,与 5xx「服务不可用」同向)
+                    if degradedModel == nil { degradedModel = (probe, 0) }
+                    continue
+                }
+                if chat.invalidResponse {
+                    failedModels.append(probe)
+                    // 显式配置的模型已实际请求失败，不能退化成仅目录可达。
+                    if (probePool ?? []).contains(probe) || preferredModel == probe {
+                        if degradedModel == nil { degradedModel = (probe, chat.invalidStatus ?? 0) }
+                        lastErr = chat.detail ?? "没有收到有效对话内容"
+                    }
+                    continue
+                }
+                if let ms = chat.latencyMs {
+                    working.append(probe)
+                    if firstWorkingLatency == nil { firstWorkingLatency = ms }
+                }
+            }
+            if skippedCount > 0, skippedCount == probeOrder.count {
+                return APITestResult(ok: false, style: style, models: models,
+                                     detail: cooldownDetail ?? "服务端限流冷却中",
+                                     authFailed: false, skippedForCooldown: true)
+            }
+            let realModels = Set(models + (probePool ?? []) + (preferredModel.map { [$0] } ?? []))
+            let reportedFailures = failedModels.filter { realModels.contains($0) }
+            if let (m, st) = authModel, working.isEmpty {
+                return APITestResult(ok: false, style: style, models: models,
+                                     detail: "\(catalogDetail), 但 chat 端点 HTTP \(st)(\(m) 认证失败/key 失效)",
+                                     authFailed: true, quotaModels: quotaModels.filter { realModels.contains($0) },
+                                     failedModels: reportedFailures, modelLatencies: modelLatencies)
+            }
+            // models 为空时探测用的是占位 "test",不得混进返回模型列表;有真实模型才重排
+            let hasRealModels = !models.isEmpty
+            if !working.isEmpty {
+                let q = quotaModels.isEmpty ? "" : ",其中 \(quotaModels.count) 个模型限流(\(quotaModels.prefix(3).joined(separator: "、"))\(quotaModels.count > 3 ? " 等" : ""))"
+                let g = gatedModels.isEmpty ? "" : ",\(gatedModels.count) 个模型本 key 无权限(\(gatedModels.prefix(2).joined(separator: "、"))\(gatedModels.count > 2 ? " 等" : ""))"
+                let probedModels = Set(working + quotaModels)
+                let catalog = Set(models)
+                let reordered = hasRealModels
+                    ? (working.filter { catalog.contains($0) } + models.filter { !probedModels.contains($0) } + quotaModels.filter { catalog.contains($0) })
+                    : models
+                return APITestResult(ok: true, style: style, models: reordered,
+                                     detail: "\(catalogDetail)" + (hasRealModels ? ", \(models.count) 个模型" : "") + q + g,
+                                     authFailed: false,
+                                     workingModels: working.filter { realModels.contains($0) },
+                                     quotaModels: quotaModels.filter { realModels.contains($0) }, failedModels: reportedFailures,
+                                     latencyMs: firstWorkingLatency,
+                                     modelLatencies: modelLatencies.isEmpty ? nil : modelLatencies)
+            }
+            if let (m, st) = degradedModel {
+                let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
+                return APITestResult(ok: false, style: style, models: models,
+                                     detail: "\(catalogDetail), 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)" + (lastErr == "无" ? "" : " | \(lastErr)"),
+                                     authFailed: catalogAuthFailed, quotaModels: quotaModels.filter { realModels.contains($0) },
+                                     failedModels: reportedFailures, modelLatencies: modelLatencies,
+                                     transientFailure: !catalogAuthFailed && failedModels.count > 0 && modelLatencies.isEmpty && st == 0)
+            }
+            if !quotaModels.isEmpty, !realModels.isEmpty {
+                return APITestResult(ok: true, style: style, models: models,
+                                     detail: "\(catalogDetail), 但探测的 \(quotaModels.count) 个模型均 quota exhausted(无额度)",
+                                     authFailed: false, quotaExhausted: true, quotaModels: quotaModels.filter { realModels.contains($0) },
+                                     failedModels: reportedFailures, modelLatencies: modelLatencies)
+            }
+            return APITestResult(ok: true, style: style, models: models,
+                                 detail: "\(catalogDetail)，未验证对话模型",
+                                 authFailed: false, failedModels: reportedFailures, reachabilityOnly: true)
+        }
+
         for ep in candidates {
             guard let u = URL(string: ep) else { continue }
             var req = URLRequest(url: u)
@@ -329,125 +457,15 @@ public enum APITester {
                     lastErr = "GET \(ep) → 200 但非 JSON(疑似前端兜底页)"
                     continue
                 }
-                style = styleHint == "anthropic" ? "anthropic" : "openai"
-                // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
-                // chat 探测多模型(上限 4,free 字样模型优先):单个模型 429 不代表整 key 无额度。
-                // 任一模型返回聊天内容 → key 可用;探测过的模型全部 quota → 才判无额度;
-                // 401/403 仅在没有任何可用模型时才判 key 失效(见下方 gatedModels 注释)。
-                // 真实事故:4 模型中首选 composer 429、
-                // glm-5.3-free 可用,旧逻辑只试第一个,整 key 误入额度区看不到
-                let probeOrder: [String]
-                if let pool = probePool, !pool.isEmpty {
-                    probeOrder = configuredProbeOrder(pool, preferred: preferredModel,
-                                                      modelProbeTimes: modelProbeTimes)
-                } else {
-                    probeOrder = chatProbeOrder(models, preferred: preferredModel,
-                                                modelProbeTimes: modelProbeTimes,
-                                                importedModels: importedModels)
-                }
-                var working: [String] = []
-                var quotaModels: [String] = []
-                var failedModels: [String] = []
-                var degradedModel: (String, Int)? = nil
-                var authModel: (String, Int)? = nil
-                var gatedModels: [String] = []
-                var firstWorkingLatency: Double? = nil
-                var skippedCount = 0
-                var cooldownDetail: String?
-                var modelLatencies: [String: Double] = [:]
-                for probe in probeOrder {
-                    let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe, native: style == "anthropic")
-                    if let detectedStyle = chat.style { style = detectedStyle }
-                    if chat.skippedForCooldown {
-                        skippedCount += 1
-                        cooldownDetail = chat.detail
-                        continue
-                    }
-                    if let st = chat.authStatus {
-                        // 401/403 曾经一律判「key 失效」短路。真实事故(vyceai, 2026-09-23):
-                        // 站点按模型限权 —— 同一把 key,deepseek-v4.1 chat 200,而
-                        // qwen3.8-flash 403;首选模型已探活时,403 只说明该模型不对这把
-                        // key 开放,不是 key 死了。有可用模型就继续,403 只记账
-                        if authModel == nil { authModel = (probe, st) }
-                        gatedModels.append(probe)
-                        failedModels.append(probe)
-                        // 403 可能只限制当前模型，继续验证其余模型才能判断整把 key。
-                        if st == 401 && working.isEmpty { break }
-                        continue
-                    }
-                    if let ms = chat.latencyMs { modelLatencies[probe] = ms }
-                    if chat.quota != nil { quotaModels.append(probe); continue }
-                    if let st = chat.degraded {
-                        failedModels.append(probe)
-                        if degradedModel == nil { degradedModel = (probe, st) }
-                        if let detail = chat.detail { lastErr = detail }
-                        continue
-                    }
-                    if chat.networkError {
-                        failedModels.append(probe)
-                        // 全部 chat 路径超时/无响应:模型不可达,绝不能计入 working
-                        // (归入 degraded,与 5xx「服务不可用」同向)
-                        if degradedModel == nil { degradedModel = (probe, 0) }
-                        sawTransient = true
-                        continue
-                    }
-                    if let ms = chat.latencyMs {
-                        working.append(probe)
-                        if firstWorkingLatency == nil { firstWorkingLatency = ms }
-                    }
-                }
-                if skippedCount > 0, skippedCount == probeOrder.count {
-                    return APITestResult(ok: false, style: style, models: models,
-                                         detail: cooldownDetail ?? "服务端限流冷却中",
-                                         authFailed: false, skippedForCooldown: true)
-                }
-                let realModels = Set(models + (probePool ?? []) + (preferredModel.map { [$0] } ?? []))
-                let reportedFailures = failedModels.filter { realModels.contains($0) }
-                if let (m, st) = authModel, working.isEmpty {
-                    return APITestResult(ok: false, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 HTTP \(st)(\(m) 认证失败/key 失效)",
-                                         authFailed: true, quotaModels: quotaModels.filter { realModels.contains($0) },
-                                         failedModels: reportedFailures, modelLatencies: modelLatencies)
-                }
-                // models 为空时探测用的是占位 "test",不得混进返回模型列表;有真实模型才重排
-                let hasRealModels = !models.isEmpty
-                if !working.isEmpty {
-                    let q = quotaModels.isEmpty ? "" : ",其中 \(quotaModels.count) 个模型限流(\(quotaModels.prefix(3).joined(separator: "、"))\(quotaModels.count > 3 ? " 等" : ""))"
-                    let g = gatedModels.isEmpty ? "" : ",\(gatedModels.count) 个模型本 key 无权限(\(gatedModels.prefix(2).joined(separator: "、"))\(gatedModels.count > 2 ? " 等" : ""))"
-                    let probedModels = Set(working + quotaModels)
-                    let catalog = Set(models)
-                    let reordered = hasRealModels
-                        ? (working.filter { catalog.contains($0) } + models.filter { !probedModels.contains($0) } + quotaModels.filter { catalog.contains($0) })
-                        : models
-                    return APITestResult(ok: true, style: style, models: reordered,
-                                         detail: "GET \(ep) → 200" + (hasRealModels ? ", \(models.count) 个模型" : "") + q + g,
-                                         authFailed: false,
-                                         workingModels: working.filter { realModels.contains($0) },
-                                         quotaModels: quotaModels.filter { realModels.contains($0) }, failedModels: reportedFailures,
-                                         latencyMs: firstWorkingLatency,
-                                         modelLatencies: modelLatencies.isEmpty ? nil : modelLatencies)
-                }
-                if let (m, st) = degradedModel {
-                    if st == 0 { sawTransient = true }
-                    let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
-                    return APITestResult(ok: false, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)" + (lastErr == "无" ? "" : " | \(lastErr)"),
-                                         authFailed: false, quotaModels: quotaModels.filter { realModels.contains($0) },
-                                         failedModels: reportedFailures, modelLatencies: modelLatencies,
-                                         transientFailure: failedModels.count > 0 && modelLatencies.isEmpty && st == 0)
-                }
-                if !quotaModels.isEmpty, !realModels.isEmpty {
-                    return APITestResult(ok: true, style: style, models: models,
-                                         detail: "GET \(ep) → 200, 但探测的 \(quotaModels.count) 个模型均 quota exhausted(无额度)",
-                                         authFailed: false, quotaExhausted: true, quotaModels: quotaModels.filter { realModels.contains($0) },
-                                         failedModels: reportedFailures, modelLatencies: modelLatencies)
-                }
-                return APITestResult(ok: true, style: style, models: models,
-                                     detail: "GET \(ep) → 200，未验证对话模型",
-                                     authFailed: false, reachabilityOnly: true)
+                return probeChatModels(models, catalogDetail: "GET \(ep) → 200")
             }
             if status == 0 { sawTransient = true }
             lastErr = "GET \(ep) → \(status == 0 ? "超时/无响应" : "HTTP \(status)")"
+        }
+
+        if probePool?.isEmpty == false || preferredModel?.isEmpty == false {
+            return probeChatModels([], catalogDetail: "模型目录不可用\(authFailed ? "（认证被拒绝）" : "")，使用已配置模型",
+                                   catalogAuthFailed: authFailed)
         }
 
         let anthropic = anthropicTest(base: base, key: key, timeout: timeout, proxy: proxy)
@@ -563,6 +581,8 @@ public enum APITester {
         /// 与 5xx 判 degraded(移出可用列表)方向完全相反
         var networkError = false
         var skippedForCooldown = false
+        var invalidResponse = false
+        var invalidStatus: Int?
     }
 
     private static let cooldownLock = NSLock()
@@ -606,6 +626,8 @@ public enum APITester {
         let chatPaths = native ? (hasV1 ? ["/messages"] : ["/messages", "/v1/messages"]) : (hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"])
         let s = session(for: proxy)
         var sawNetworkError = false
+        var lastFailure: String?
+        var lastStatus: Int?
         for path in chatPaths {
             guard let u = URL(string: base + path) else { continue }
             var req = URLRequest(url: u)
@@ -630,6 +652,10 @@ public enum APITester {
             let latencyMs = Date().timeIntervalSince(started) * 1000
             let status = NetSync.statusCode(o)
             let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
+            if status != 0 {
+                lastStatus = status
+                lastFailure = "HTTP \(status)：" + (status == 200 ? "没有有效对话内容" : "模型请求未通过")
+            }
             // HTML 盾页(CF 挑战/basic-auth realm)≠ 认证失败,与 /models 探测口径一致:
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除401/403 + JSON 才判认证失败,HTML 盾页同等豁免
@@ -677,7 +703,9 @@ public enum APITester {
         if canFallback, !sawNetworkError, native || model.lowercased().hasPrefix("claude-") {
             return chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model, native: !native, canFallback: false)
         }
-        return ChatProbeOutcome(style: native ? "anthropic" : "openai", networkError: sawNetworkError || native)
+        return ChatProbeOutcome(style: native ? "anthropic" : "openai", detail: lastFailure,
+                                networkError: sawNetworkError, invalidResponse: !sawNetworkError,
+                                invalidStatus: lastStatus)
     }
 
     private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String, Bool) {

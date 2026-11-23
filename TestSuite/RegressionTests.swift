@@ -417,7 +417,7 @@ enum RegressionTests {
                 _ = try core.refreshModels(entryIDPrefix: e0!.id)
                 t.expect(false, "失效 key 的 refresh 应抛错")
             } catch {
-                t.contains(error.localizedDescription, "已失效", "报错标注失效: \(error.localizedDescription)")
+                t.contains(error.localizedDescription, "拒绝认证", "报错标注认证失败: \(error.localizedDescription)")
             }
             let e1 = core.history.snapshot().first { $0.key == "sk-deadmark11111111111" }
             t.equal(e1?.health, "dead", "health=dead")
@@ -1549,7 +1549,7 @@ openai-compatibility:
                 t.equal(e.health, "err", "连续失败维持 err")
             }
             // 场景 4b:key 死掉期间模型条不能冻结成灰 —— 防抖后仍判失败的轮次,
-            // 所有模型都记红格(真实反馈:key 挂了,模型条却一直灰,看起来像「还没轮到测」)
+            // 凭据错误立即影响条目状态；未发送请求的模型仍保留未采样，避免伪造监控
             do {
                 let env = try! TestEnv("reg-mon-deadmodels")
                 defer { env.cleanup() }
@@ -1574,7 +1574,7 @@ openai-compatibility:
                 _ = done.wait(timeout: .now() + 60)
                 e = core.history.find(idPrefix: "mon-deadm")!
                 t.equal(e.health, "dead", "[死 key] 维持 dead")
-                t.expect(e.modelProbeLog?["model-b"]?.last?.ok == false, "[死 key] 模型 b 也记红格(不冻结)")
+                t.expect(e.modelProbeLog?["model-b"] == nil, "[死 key] 首模型 401 后短路，未请求的模型 b 不伪造红格")
             }
             // 场景 4c:配置模型全红但 key 级 ok → 分区口径必须以用户配置为准
             // 真实反馈(ed0d76a6):只配了 glm-5.3-flash(连续 429),网关上未配置的

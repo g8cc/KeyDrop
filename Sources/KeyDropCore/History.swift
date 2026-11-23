@@ -106,7 +106,7 @@ public struct HistoryEntry: Codable {
     /// 连续探测失败次数(成功即清零)。防抖:单次网络抖动不降级状态,
     /// 连续 ≥2 次才把 health 从 ok 改为 err/dead
     public var failStreak: Int?
-    /// CPA 链路最近一次探测结果(经 127.0.0.1:8317 用实际激活模型)。nil=未测/无 cpa 目标。
+    /// CPA 链路最近一轮实测结果(本轮请求的所选模型全部通过)。nil=未测/无 cpa 目标。
     /// 健康测试直连上游,但用户真实请求走 CPA —— 上游 OK ≠ CPA 链路 OK
     public var viaCPAOk: Bool?
     /// CPA 链路探测时间
@@ -117,6 +117,38 @@ public struct HistoryEntry: Codable {
     /// key 级 probeLog 回答"这把 key 整体好不好",这里回答"每个模型分别好不好"
     public var apiStyle: String? = nil
     public var modelProbeLog: [String: [ProbePoint]]?
+
+    /// 默认模型也属于当前配置；空 models 数组不能遮住它。保序去重供探测和 UI 共用。
+    public var configuredModels: [String] {
+        var values = models ?? []
+        if let model, !values.contains(model) { values.insert(model, at: 0) }
+        var seen = Set<String>()
+        return values.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }
+
+    public struct ModelStatus {
+        public let total: Int
+        public let passed: Int
+        public let failed: Int
+        public var untested: Int { total - passed - failed }
+        public var label: String {
+            "模型：\(passed)/\(total) 通过" + (failed > 0 ? " · \(failed) 失败" : "")
+                + (untested > 0 ? " · \(untested) 未验证" : "")
+        }
+    }
+
+    /// 当前状态看各模型最新一次实测，历史通过率不参与分组。
+    public var modelStatus: ModelStatus {
+        var passed = 0, failed = 0
+        let configured = configuredModels
+        for model in configured {
+            guard let last = modelProbeLog?[model]?.max(by: { $0.t < $1.t }) else { continue }
+            if !last.ok || (targets.contains("cpa") && last.cpa == false) { failed += 1 }
+            else if targets.contains("cpa"), !Core.isNonChatModel(model), last.cpa == nil { continue }
+            else { passed += 1 }
+        }
+        return ModelStatus(total: configured.count, passed: passed, failed: failed)
+    }
 
     /// uptime 百分比(status page 行业指标):已采集周期中通过的占比。
     /// 只按已采集格算(灰格不拉低),nil=尚无采集数据
@@ -156,9 +188,10 @@ public struct HistoryEntry: Codable {
         if let at = healthAt { bits.append("验证 \(Self.shortTime(at))") }
         if let l = latencyMs, l.isFinite, l >= 0, l < 1e9 { bits.append("延迟 \(Int(l))ms") }
         if let up = uptimePercent { bits.append("uptime \(up)%") }
-        if let n = failStreak, n > 0 { bits.append("连续失败 \(n) 次(单次失败保留可用,连续 2 次才降级)") }
+        if let n = failStreak, n > 0 { bits.append("连续失败 \(n) 次，等待复测") }
         if !bits.isEmpty { lines.append(bits.joined(separator: " · ")) }
-        if let cpa = viaCPAOk {
+        if !configuredModels.isEmpty { lines.append(modelStatus.label) }
+        if let cpa = viaCPAOk, targets.contains("cpa") {
             let at = viaCPAAt.map { Self.shortTime($0) } ?? ""
             lines.append("CPA 链路: \(cpa ? "✓ 正常" : "✗ 异常(上游 OK ≠ 经 8317 的真实链路 OK)")\(at.isEmpty ? "" : " · \(at)")")
         }
@@ -203,7 +236,7 @@ public struct HistoryEntry: Codable {
     public var isDSHOnly: Bool { format == "dsh-only" }
 
     public enum Availability: Equatable {
-        case unverified, reachable, available, proxyAvailable, retry, quota, error, chainError, dead, dshOnly, inactive
+        case unverified, reachable, available, proxyAvailable, partial, retry, quota, error, chainError, chainUnverified, dead, dshOnly, inactive
 
         public var label: String {
             switch self {
@@ -211,10 +244,12 @@ public struct HistoryEntry: Codable {
             case .reachable: return "网关可达，模型尚未验证"
             case .available: return "最近一次探测通过"
             case .proxyAvailable: return "经代理探测通过"
+            case .partial: return "部分模型通过，其他失败或未验证"
             case .retry: return "最近一次探测失败，待复测"
-            case .quota: return "额度用尽或所选模型均探测失败"
+            case .quota: return "额度用尽"
             case .error: return "探测失败"
-            case .chainError: return "上游通过，CPA 链路探测失败"
+            case .chainError: return "上游通过，最近一次 CPA 链路探测失败"
+            case .chainUnverified: return "上游通过，CPA 链路待验证"
             case .dead: return "接口拒绝认证"
             case .dshOnly: return "DSH 专用，请在 DSH 内验证"
             case .inactive: return "记录已停用"
@@ -231,10 +266,18 @@ public struct HistoryEntry: Codable {
         case "quota": return .quota
         case "reachable": return .reachable
         case "ok", "proxy-ok":
-            if allConfiguredModelsLimited { return .quota }
             if (failStreak ?? 0) > 0 { return .retry }
             guard healthAt != nil else { return .unverified }
             if targets.contains("cpa"), viaCPAOk == false { return .chainError }
+            let models = modelStatus
+            if models.total > 0 {
+                if models.failed == models.total { return .error }
+                if models.passed == 0 {
+                    return models.failed > 0 ? .retry : (targets.contains("cpa") ? .chainUnverified : .unverified)
+                }
+                if models.passed < models.total { return .partial }
+            }
+            if models.total == 0, targets.contains("cpa"), viaCPAOk == nil { return .chainUnverified }
             return health == "proxy-ok" ? .proxyAvailable : .available
         default: return .unverified
         }
@@ -804,7 +847,7 @@ public final class HistoryStore {
                 if e.health != "reachable" {
                     let pt = ProbePoint(t: at, ms: e.latencyMs,
                                         ok: (e.health == "ok" || e.health == "proxy-ok") && (e.failStreak ?? 0) == 0,
-                                        cpa: e.viaCPAOk)
+                                        cpa: e.viaCPAAt == at ? e.viaCPAOk : nil)
                     _items[i].probeLog = Array(((_items[i].probeLog ?? []) + [pt]).suffix(30))
                 }
                 // 模型级追加:e.modelProbeLog 携带本轮各模型新点,与 store 现状合并截 30
@@ -1272,7 +1315,7 @@ public extension HistoryEntry {
     /// 未配置的 nemotron 能通 → key 级判 ok → 条目躺在可用区,对用户却是纯坏消息。
     /// 分区/横幅必须以「用户配置的模型」为准;未采集的模型不算数(轮换中,不误伤)
     var allConfiguredModelsLimited: Bool {
-        let configured = models ?? (model.map { [$0] } ?? [])
+        let configured = configuredModels
         guard !configured.isEmpty else { return false }
         let log = modelProbeLog ?? [:]
         return configured.allSatisfy { m in

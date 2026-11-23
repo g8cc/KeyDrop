@@ -174,8 +174,12 @@ enum CPAAAPITests {
             _ = try core.add(raw: "\(url)\nsk-new-model-fixture2222", ccOverride: false, grokOverride: false,
                              cpaOverride: true, dshOverride: false, models: ["model-b"], force: true)
             let writer = CPAWriter(configPath: env.dir + "/cpa-config.yaml")
-            t.equal(writer.entryModels(baseURL: url), ["model-a"], "新凭据合并时识别并保留手写精选模型")
+            t.equal(writer.entryModels(baseURL: url), ["model-a", "model-b"], "保留手写精选模型并加入本次明确选择")
+            t.contains(env.read("cpa-config.yaml"), "alias: favorite-model", "合并选择不改变手写模型别名")
             t.contains(env.read("cpa-config.yaml"), "sk-new-model-fixture2222", "新凭据仍成功合并")
+            _ = try writer.updateAggregatedModels(baseURL: url, models: ["model-c"], removing: ["model-b"])
+            t.equal(writer.entryModels(baseURL: url), ["model-a", "model-c"], "局部改选保留非本条目模型")
+            t.contains(env.read("cpa-config.yaml"), "alias: favorite-model", "局部改选必须保留其他模型的自定义别名")
         }
         h.runSuite("CPAAPI.cross-review spaced credential indentation") { t in
             let env = try TestEnv("cross-review-spaced-key")

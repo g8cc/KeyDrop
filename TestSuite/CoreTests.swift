@@ -236,8 +236,9 @@ enum CoreTests {
             let okEntry0 = core.history.snapshot().first { $0.key == "sk-test-bal1111111111" }
             t.expect(okEntry0 != nil, "条目已入库")
             let okMsg = try! core.refreshModels(entryIDPrefix: okEntry0!.id)
-            t.contains(okMsg, "可用", "有余额刷新可用")
             let okEntry = core.history.snapshot().first { $0.key == "sk-test-bal1111111111" }
+            t.equal(okEntry?.availability, .available, "实测通过刷新可用")
+            t.contains(okMsg, HistoryEntry.Availability.available.label, "刷新提示与当前可用状态一致")
             t.equal(okEntry?.health, "ok", "有余额 health=ok")
 
             // 无余额:余额接口报 0 但 chat 实测有模型通过 → 以实测为准判 ok。
