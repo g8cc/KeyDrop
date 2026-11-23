@@ -70,6 +70,12 @@ check(window.isVisible, "关闭后可重新打开")
 window.orderOut(nil)
 
 let state = AppState()
+check(!state.useMagpie, "旧偏好默认不启用 Magpie")
+state.toggleUseMagpie()
+check(state.useMagpie && Prefs.shared.useMagpie, "Magpie UI 开关同步偏好")
+state.toggleUseMagpie()
+check(!state.useMagpie && !Prefs.shared.useMagpie, "Magpie UI 关闭开关")
+check(CLI.helpText.contains("--magpie|--no-magpie"), "CLI 帮助包含 Magpie 导入参数")
 state.useCC = false; state.useGrok = false; state.useCPA = false; state.useDSH = false
 state.isBusy = true
 state.busyLabel = "拉取订阅…"

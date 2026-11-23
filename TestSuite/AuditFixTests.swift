@@ -634,7 +634,7 @@ enum AuditFixTests {
             t.equal(saved["key"] as? String, "sk-magpie-key-0000001", "key 写入")
             t.equal((saved["models"] as? [String]) ?? [], ["deepseek-v4.1"], "模型写入")
             t.equal(saved["chat"] as? String, "https://m.example.com/v1", "chat = 版本段挂载")
-            t.equal(saved["anthropic"] as? String, "https://m.example.com", "anthropic = 协议根")
+            t.equal(saved["anthropic"] as? String, "", "OpenAI provider 不虚报 Anthropic 原生能力")
             // 二次同步:同 id 原地更新不重复
             _ = try! core.syncTarget(entryIDPrefix: "magpie111", target: "magpie")
             t.equal(srv.magpieProviders.count, 1, "幂等单行")

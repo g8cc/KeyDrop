@@ -41,11 +41,13 @@ public struct LedgerPayload: Codable {
         public var useGrok: Bool
         public var useCPA: Bool
         public var useDSH: Bool
+        public var useMagpie: Bool?
         public var cpaResident: Bool
 
-        public init(useCC: Bool, useGrok: Bool, useCPA: Bool, useDSH: Bool, cpaResident: Bool) {
+        public init(useCC: Bool, useGrok: Bool, useCPA: Bool, useDSH: Bool, cpaResident: Bool, useMagpie: Bool? = nil) {
             self.useCC = useCC; self.useGrok = useGrok; self.useCPA = useCPA
             self.useDSH = useDSH; self.cpaResident = cpaResident
+            self.useMagpie = useMagpie
         }
     }
 }

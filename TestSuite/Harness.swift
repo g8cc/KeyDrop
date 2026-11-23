@@ -90,6 +90,8 @@ final class TestEnv {
         // 自动代理探测隔离:开发者本机常有真实代理(7890)在监听,探测命中会把
         // 回环 mock 的请求塞进真实代理(mihomo 对回环目标返 502),污染测试结果
         setenv("KEYDROP_NO_AUTOPROXY", "1", 1)
+        setenv("KEYDROP_MAGPIE_BIN", dir + "/magpie-cli", 1)
+        setenv("KEYDROP_MAGPIE_CONFIG_HOME", dir + "/config", 1)
         // 隔离加固:以下路径若不显式指向临时目录,测试可能触达开发者本机的真实文件
         // KEYDROP_LLM_PARSE=0:规则解析失败时不得真连本机 LLM 端点(127.0.0.1:8317, 15s 超时)
         setenv("KEYDROP_LLM_PARSE", "0", 1)

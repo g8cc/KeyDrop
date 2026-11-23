@@ -16,6 +16,7 @@ signal(SIGPIPE, SIG_IGN)
 let harness = Harness()
 
 AuditFixTests.run(harness)
+MagpieTests.run(harness)
 ImportFailureLogTests.run(harness)
 ParserTests.run(harness)
 DSHWriterTests.run(harness)

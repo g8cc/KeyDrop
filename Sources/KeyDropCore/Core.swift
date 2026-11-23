@@ -47,6 +47,7 @@ public final class Core {
         grokOverride: Bool? = nil,
         cpaOverride: Bool? = nil,
         dshOverride: Bool? = nil,
+        magpieOverride: Bool? = nil,
         models: [String]? = nil,
         force: Bool = false,
         appType: String? = nil,
@@ -75,6 +76,7 @@ public final class Core {
                 try operation?.advance(to: .parsing)
                 return try addImpl(raw: raw, ccOverride: ccOverride, grokOverride: grokOverride,
                                    cpaOverride: cpaOverride, dshOverride: dshOverride,
+                                   magpieOverride: magpieOverride,
                                    models: models, force: force, appType: appType,
                                    appTypeForced: appTypeForced, proxy: proxy,
                                    pickModels: choose, stage: &stage)
@@ -151,7 +153,7 @@ public final class Core {
 
     private func addImpl(
         raw: String, ccOverride: Bool?, grokOverride: Bool?, cpaOverride: Bool?,
-        dshOverride: Bool?, models: [String]?, force: Bool, appType: String?,
+        dshOverride: Bool?, magpieOverride: Bool?, models: [String]?, force: Bool, appType: String?,
         appTypeForced: Bool, proxy: String?, pickModels: (([String]) -> [String])?,
         stage: inout String
     ) throws -> AddOutcome {
@@ -631,6 +633,7 @@ public final class Core {
         let useCC = ccOverride ?? prefs.useCC
         let useCPA = cpaOverride ?? prefs.useCPA
         let useDSH = dshOverride ?? prefs.useDSH
+        let useMagpie = magpieOverride ?? prefs.useMagpie
 
         // 同 URL 不同 key 的兄弟条目:名字追加 key 尾号后缀区分。
         // 多把 key 共用一个网关是常态,不加后缀时 cc-switch 与 KeyDrop 历史
@@ -869,6 +872,19 @@ public final class Core {
             }
         }
 
+        if useMagpie {
+            anyTarget = true
+            do {
+                let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
+                                                models: selectedModels, apiStyle: entry.apiStyle)
+                if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
+                anyOK = true
+                lines.append("✓ Magpie: \(msg)")
+            } catch {
+                lines.append("✗ Magpie 失败: \(error.localizedDescription)")
+            }
+        }
+
         // Remove an old Grok route only after at least one replacement target
         // succeeded. This also covers CPA-only imports and --no-cc.
         if resolvedAppType != "grok", anyOK,
@@ -889,7 +905,7 @@ public final class Core {
         }
 
         if !anyTarget {
-            throw ParseError.io("没有选中的目标(cc-switch / Grok Build / CPA)")
+            throw ParseError.io("没有选中的目标(cc-switch / Grok Build / CPA / DSH / Magpie)")
         }
 
         entry.status = anyOK ? "active" : "error"
@@ -924,12 +940,25 @@ public final class Core {
                         do { try DSHWriter.remove(providerID: entry.id); dshRolledBack = true }
                         catch { lines.append("⚠ 并发合并: 本进程刚写的 DSH route 回滚失败: \(error.localizedDescription)") }
                     }
+                    var magpieMerged = false
+                    if entry.targets.contains("magpie") {
+                        // Magpie 的所有权绑定 entry.id，不能把另一 ID 的 tag 直接合并。
+                        do {
+                            _ = try MagpieWriter.remove(providerID: entry.id)
+                            // 单目标同步包含账本失败回滚，避免 survivor 下出现无人认领的配置。
+                            _ = try syncTarget(entryIDPrefix: survivor.id, target: "magpie")
+                            magpieMerged = true
+                        } catch {
+                            lines.append("⚠ 并发合并: Magpie 同步失败，请对既有记录重新同步: \(error.localizedDescription)")
+                        }
+                    }
                     // CPA 是聚合写入、Clash 是独立文件,无需回滚;把目标记录并入 survivor。
                     // 已成功回滚的外部配置对应的 tag 绝不能并入:tag 会指向已删除的
                     // provider/route,后续 delete 会按错误的 appType 清理 survivor 自己的产物
                     for t in entry.targets where !merged.targets.contains(t) {
                         if t.hasPrefix("ccswitch") && ccRolledBack { continue }
                         if t == "dsh" && dshRolledBack { continue }
+                        if t == "magpie" && !magpieMerged { continue }
                         merged.targets.append(t)
                     }
                     if merged.cpaConfigPath == nil { merged.cpaConfigPath = entry.cpaConfigPath }
@@ -941,7 +970,16 @@ public final class Core {
                 try prefs.save()
             } catch {
                 lines.append("⚠ 历史/偏好保存失败: \(error.localizedDescription)")
-                lines.append("  (cc-switch 已写入,但 KeyDrop 历史缺失,删除时无法自动还原)")
+                lines.append("  (目标配置可能已写入，请检查记录后重试)")
+                if dup == nil, entry.targets.contains("magpie"), history.find(idPrefix: entry.id) == nil {
+                    anyOK = false
+                    entry.status = "error"
+                    do {
+                        _ = try MagpieWriter.remove(providerID: entry.id)
+                        entry.targets.removeAll { $0 == "magpie" }
+                    }
+                    catch { lines.append("⚠ Magpie 回滚失败: \(error.localizedDescription)") }
+                }
             }
         }
 
@@ -1726,7 +1764,7 @@ public final class Core {
             entries: history.snapshot(),
             switches: .init(useCC: prefs.useCC, useGrok: prefs.useGrok,
                             useCPA: prefs.useCPA, useDSH: prefs.useDSH,
-                            cpaResident: prefs.cpaResident)
+                            cpaResident: prefs.cpaResident, useMagpie: prefs.useMagpie)
         )
         let data = try JSONEncoder().encode(payload)
         return try LedgerCrypto.seal(data, passphrase: passphrase)
@@ -1887,6 +1925,10 @@ public final class Core {
                             _ = try writer.remove(baseURL: oldURL, key: oldKey, models: previousModels)
                         }
                     }
+                    if local.targets.contains("magpie"), let mk = e.key, let mURL = e.url {
+                        _ = try MagpieWriter.sync(providerID: e.id, baseURL: mURL, key: mk,
+                                                  models: incomingModels, apiStyle: e.apiStyle)
+                    }
                     var merged = e
                     if e.models == nil && e.model == nil {
                         merged.models = local.models
@@ -1938,6 +1980,7 @@ public final class Core {
             prefs.useGrok = payload.switches?.useGrok ?? prefs.useGrok
             prefs.useCPA = payload.switches?.useCPA ?? prefs.useCPA
             prefs.useDSH = payload.switches?.useDSH ?? prefs.useDSH
+            prefs.useMagpie = payload.switches?.useMagpie ?? prefs.useMagpie
             prefs.cpaResident = payload.switches?.cpaResident ?? prefs.cpaResident
             try prefs.save()
         }
@@ -2043,7 +2086,7 @@ public final class Core {
             // magpie(经 Web API,与行内同步同通道)
             if e.targets.contains("magpie") {
                 do {
-                    let msg = try MagpieWriter.sync(providerID: e.id, baseURL: url, key: key, models: models)
+                    let msg = try MagpieWriter.sync(providerID: e.id, baseURL: url, key: key, models: models, apiStyle: e.apiStyle)
                     entryLines.append("Magpie: \(msg)")
                     replayed += 1
                 } catch {
@@ -2441,6 +2484,15 @@ public final class Core {
         }
     }
 
+    private func syncMagpieIfNeeded(_ entry: HistoryEntry) -> String {
+        guard entry.targets.contains("magpie"), let url = entry.url, let key = extractKey(entry) else { return "" }
+        do {
+            let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
+                                            models: entry.configuredModels, apiStyle: entry.apiStyle)
+            return "\n✓ Magpie: \(msg)"
+        } catch { return "\n⚠ Magpie 同步失败: \(error.localizedDescription)" }
+    }
+
     public func refreshModels(
         entryIDPrefix: String,
         proxy: String? = nil,
@@ -2680,6 +2732,7 @@ public final class Core {
             // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
+            let magpieNote = syncMagpieIfNeeded(entry)
             // 必须在 ccSyncOrMigrate 之后再落盘:它可能就地修改 entry(targets/ccProviderID/models),
             // 提前落盘会把迁移结果丢掉,而旧 provider 已删 → 历史指向已删 provider 的孤儿态
             // (下面「模型无变化」分支即为此处的正确写法)
@@ -2687,7 +2740,7 @@ public final class Core {
             let keep = currentModels.isEmpty ? "无" : currentModels.joined(separator: ", ")
             let q = quotaNote.map { "(\($0) — 充值后刷新自动恢复)" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
-            return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)\(m)"
+            return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (端点无模型列表,保留已有模型: \(keep))\(q)\(m)\(magpieNote)"
         }
         // 变化检测用原始列表:entry.models 修复后可能含被本启发式误杀的点分名,
         // 拿过滤后的列表比对着会把「无变化」误判成「已变化」,每次刷新都弹窗
@@ -2698,10 +2751,11 @@ public final class Core {
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
+            let magpieNote = syncMagpieIfNeeded(entry)
             try history.update(entry)
             let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
-            return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,无变化)\(q)\(m)"
+            return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,无变化)\(q)\(m)\(magpieNote)"
         }
 
         var filtered: [String] = []
@@ -2802,15 +2856,16 @@ public final class Core {
             }
         }
         if let selectionTest { recordProbeResult(selectionTest, for: &entry) }
+        let magpieNote = syncMagpieIfNeeded(entry)
         try history.update(entry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
         let r = retestNote == nil ? "" : "\n\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(entry.healthDetail ?? "")"
         if retestNote != nil {
             // 以新选择的复测结果报告，不能沿用旧模型的成功提示。
-            return "已改选 \(filtered.count) 个模型(端点: \(test.detail))\(w)\(dshNote)\(cpaNote)\(r)"
+            return "已改选 \(filtered.count) 个模型(端点: \(test.detail))\(w)\(dshNote)\(cpaNote)\(magpieNote)\(r)"
         }
-        return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)"
+        return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,已更新 \(filtered.count) 个)\(q)\(w)\(dshNote)\(cpaNote)\(magpieNote)"
     }
 
     /// 编辑弹窗「勾选模型」的数据源:只探测不写任何目标/账本
@@ -3149,6 +3204,8 @@ public final class Core {
             entry.failStreak = nil
             recordProbeResult(result, for: &entry)
         }
+        let magpieNote = syncMagpieIfNeeded(entry)
+        if !magpieNote.isEmpty { lines.append(magpieNote.trimmingCharacters(in: .newlines)) }
         do { try history.update(entry) }
         catch {
             if let writer = poolRotationWriter {
@@ -3384,7 +3441,7 @@ public final class Core {
             return "Grok Build: \(msg)"
         case "magpie":
             let alreadyHadMagpie = entry.targets.contains("magpie")
-            let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key, models: models)
+            let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key, models: models, apiStyle: entry.apiStyle)
             if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
             do { try history.update(entry) }
             catch {

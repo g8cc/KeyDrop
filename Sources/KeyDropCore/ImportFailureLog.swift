@@ -24,7 +24,7 @@ public enum ImportFailureLog {
     public static func stage(forLine line: String) -> String {
         let targets: [(String, String)] = [
             ("cc-switch", "write_ccswitch"), ("Grok Build", "write_grok"),
-            ("CPA", "write_cpa"), ("DeepSeek Harness", "write_dsh"), ("Clash", "write_clash")
+            ("CPA", "write_cpa"), ("DeepSeek Harness", "write_dsh"), ("Magpie", "write_magpie"), ("Clash", "write_clash")
         ]
         for (needle, stage) in targets where line.contains(needle) { return stage }
         if line.contains("验证失败") || line.contains("模型验证") { return "verify" }

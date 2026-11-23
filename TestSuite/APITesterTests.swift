@@ -57,6 +57,11 @@ final class MockHTTPServer {
     var magpieDeleteCount = 0
     var magpieLoginCount = 0
     var magpieSeen: [String] = []
+    var magpieExpectedKey: String? = nil
+    var magpieFailSave = false
+    var magpieIgnoreSave = false
+    var magpieIgnoreDelete = false
+    var magpiePublicShape = false
     var davPushCount = 0
     var davRevision = 0
     var cpaAuthFiles: [String: String] = [
@@ -374,6 +379,10 @@ final class MockHTTPServer {
         // 登录:GET /?k=... 换 Cookie
         if method == "GET", target.contains("/?k=") || target.hasPrefix("/?k=") {
             magpieLoginCount += 1
+            let key = URLComponents(string: "http://localhost" + target)?.queryItems?.first { $0.name == "k" }?.value
+            if let expected = magpieExpectedKey, key != expected {
+                respond(client, 401, "Unauthorized", "{}"); return
+            }
             client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: magpie=test; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
             client.close()
             return
@@ -399,6 +408,11 @@ final class MockHTTPServer {
         }
         if target == "/api/provider/save" {
             magpieSaveCount += 1
+            if magpieFailSave { respond(client, 503, "Unavailable", "{}"); return }
+            if body["balanceToken"] is [String: Any] || body["key"] is [String: Any] {
+                respond(client, 400, "Bad Request", "{}"); return
+            }
+            if magpieIgnoreSave { respond(client, 200, "OK", "{}"); return }
             if let id = body["id"] as? String {
                 magpieProviders.removeAll { ($0["id"] as? String) == id }
                 magpieProviders.append(body)
@@ -409,7 +423,7 @@ final class MockHTTPServer {
         }
         if target == "/api/provider/delete" {
             magpieDeleteCount += 1
-            if let id = body["id"] as? String {
+            if !magpieIgnoreDelete, let id = body["id"] as? String {
                 magpieProviders.removeAll { ($0["id"] as? String) == id }
             }
             let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
@@ -420,7 +434,17 @@ final class MockHTTPServer {
     }
 
     private func magpieJSON(_ providers: [[String: Any]]) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: providers),
+        let rows = providers.map { provider -> [String: Any] in
+            guard magpiePublicShape else { return provider }
+            var p = provider
+            let models = p["models"] as? [String] ?? []
+            p["chosen"] = models
+            p["models"] = models.map { ["id": $0, "chosen": true] as [String: Any] }
+            p["key"] = ["set": true, "masked": "sk-…"] as [String: Any]
+            p["balanceToken"] = ["takes": false, "set": false]
+            return p
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: rows),
               let s = String(data: data, encoding: .utf8) else { return "[]" }
         return s
     }

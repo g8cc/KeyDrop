@@ -266,6 +266,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         ccItem.state = Prefs.shared.useCC ? .on : .off
         menu.addItem(ccItem)
 
+        let magpieItem = NSMenuItem(title: "写入 Magpie", action: #selector(toggleMagpie), keyEquivalent: "")
+        magpieItem.target = self
+        magpieItem.state = Prefs.shared.useMagpie ? .on : .off
+        menu.addItem(magpieItem)
+
         let grokItem = NSMenuItem(title: "写入 Grok Build", action: #selector(toggleGrok), keyEquivalent: "")
         grokItem.target = self
         grokItem.state = Prefs.shared.useGrok ? .on : .off
@@ -483,18 +488,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func magpieSettingsAction() {
         let alert = NSAlert()
         alert.messageText = "Magpie 设置"
-        alert.informativeText = "粘贴 Magpie Web 链接整条(托盘菜单里的链接,含 ?k= 部分)。\n同步后需重启 DSH/Magpie 类界面才可见的说明同样适用于此处的写入。"
+        let local = MagpieWriter.localExecutable() == nil ? "未检测到本机 Magpie。" : "已检测到本机 Magpie，留空即可直接导入。"
+        alert.informativeText = local + "\n远程连接：粘贴 Magpie Web 管理页的完整链接（含 ?k=）。\n这是管理页地址，与模型网关地址不同。导入后可在 Magpie 的提供商列表查看。"
         alert.alertStyle = .informational
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 22))
-        field.placeholderString = "http://127.0.0.1:3080/?k=…"
+        field.placeholderString = "留空使用本机，或粘贴 Web 管理链接"
         field.stringValue = Prefs.shared.magpieWebLink ?? ""
         alert.accessoryView = field
         alert.addButton(withTitle: "保存")
         alert.addButton(withTitle: "取消")
         if alert.runModal() == .alertFirstButtonReturn {
             let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard v.isEmpty || MagpieWriter.parseWebLink(v) != nil else {
+                state.setStatus("Magpie 链接无效：需要含 ?k= 的完整 Web 管理链接", ok: false)
+                return
+            }
             Prefs.shared.magpieWebLink = v.isEmpty ? nil : v
-            try? Prefs.shared.save()
+            do { try Prefs.shared.save(); state.setStatus("Magpie 连接设置已保存", ok: true) }
+            catch { state.setStatus("Magpie 设置保存失败: \(error.localizedDescription)", ok: false) }
         }
     }
 
@@ -617,6 +628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func toggleCC() {
         state.toggleUseCC()
     }
+    @objc func toggleMagpie() { state.toggleUseMagpie() }
 
     @objc func toggleGrok() {
         state.toggleUseGrok()
@@ -658,6 +670,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         state.useGrok = Prefs.shared.useGrok
         state.useCPA = Prefs.shared.useCPA
         state.useDSH = Prefs.shared.useDSH
+        state.useMagpie = Prefs.shared.useMagpie
         if panel?.isMiniaturized == true { panel?.deminiaturize(nil) }
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

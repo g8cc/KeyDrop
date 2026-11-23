@@ -145,6 +145,7 @@ final class AppState: ObservableObject {
     @Published var useGrok: Bool
     @Published var useCPA: Bool
     @Published var useDSH: Bool
+    @Published var useMagpie: Bool
     @Published var proxyText: String
     /// 顶栏「代理」下拉的候选端口(在听的排前面),面板出现时后台探测
     @Published var proxyCandidates: [Core.ProxyCandidate] = []
@@ -190,6 +191,7 @@ final class AppState: ObservableObject {
         useGrok = Prefs.shared.useGrok
         useCPA = Prefs.shared.useCPA
         useDSH = Prefs.shared.useDSH
+        useMagpie = Prefs.shared.useMagpie
         proxyText = Prefs.shared.proxy
         cpaAPIKeyInput = Prefs.shared.cpaManagementKey ?? ""
         cpaAPIBaseInput = Prefs.shared.cpaAPIBase ?? ""
@@ -309,9 +311,9 @@ final class AppState: ObservableObject {
 
     @MainActor
     func continueAddKey(raw: String, assumeBusy: Bool = false, dshOnly: Bool = false) async {
-        if !dshOnly && !useCC && !useGrok && !useCPA && !useDSH {
+        if !dshOnly && !useCC && !useGrok && !useCPA && !useDSH && !useMagpie {
             if assumeBusy { finishImport() }
-            setStatus("请先开启 cc-switch、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
+            setStatus("请先开启 cc-switch、Magpie、Grok Build、CPA 或 DeepSeek Harness 写入目标", ok: false)
             return
         }
         guard assumeBusy || !isBusy else { return }
@@ -329,6 +331,7 @@ final class AppState: ObservableObject {
                     grokOverride: Prefs.shared.useGrok,
                     cpaOverride: Prefs.shared.useCPA,
                     dshOverride: Prefs.shared.useDSH,
+                    magpieOverride: Prefs.shared.useMagpie,
                     operation: operation
                 ) { options in
                     self.pickModelsSync(options, operation: operation)
@@ -689,7 +692,7 @@ final class AppState: ObservableObject {
 
     func doSyncTarget(_ id: String, target: String) {
         guard !isBusy else { return }
-        let label = ["ccswitch": "cc-switch", "cpa": "CPA", "dsh": "DSH", "grok": "Grok Build"][target] ?? target
+        let label = ["ccswitch": "cc-switch", "cpa": "CPA", "dsh": "DSH", "grok": "Grok Build", "magpie": "Magpie"][target] ?? target
         isBusy = true
         busyLabel = "同步 \(label)…"
         Task { @MainActor in
@@ -1045,6 +1048,13 @@ final class AppState: ObservableObject {
         useDSH.toggle()
         prefs.useDSH = useDSH
         try? prefs.save()
+    }
+
+    func toggleUseMagpie() {
+        useMagpie.toggle()
+        prefs.useMagpie = useMagpie
+        do { try prefs.save() }
+        catch { setStatus("Magpie 偏好保存失败: \(error.localizedDescription)", ok: false) }
     }
 
     func setProxy(_ v: String) {
@@ -1501,7 +1511,7 @@ struct HistoryRow: View {
                             Button("删除", role: .destructive) { onDelete() }
                             Button("取消", role: .cancel) {}
                         } message: {
-                            Text("将删除: \(entry.summary)\n此操作会从 cc-switch / CPA / DSH 移除该配置。")
+                            Text("将删除: \(entry.summary)\n此操作会从已同步的目标（含 Magpie）移除该配置。")
                         }
                         if entry.ccMissing == true {
                             Button {
@@ -1791,8 +1801,9 @@ struct HelpView: View {
                     section("双通道写入", icon: "arrow.left.arrow.right") {
                         item("cc-switch:创建 provider 并激活;直写 Claude Code 配置,重开会话生效")
                         item("CPA:写入 Cliproxy API 的 config.yaml,运行时会自动热重载")
-                        item("顶栏 cc-switch / CPA / DSH 开关控制首次导入目标,可同时开启")
-                        item("已有条目可点击行内向下箭头,把同一 URL / key / 模型同步到 DSH;重复点击会更新")
+                        item("顶栏 cc-switch / Magpie / Grok / CPA / DSH 开关控制首次导入目标，可同时开启")
+                        item("Magpie 自动识别本机安装；远程连接可点 Magpie 旁的齿轮设置 Web 管理链接")
+                        item("已有条目可点击行内向下箭头，将同一 URL / key / 模型同步到 Magpie 等目标；重复点击会更新")
                     }
                     section("代理", icon: "network") {
                         item("顶栏「代理」框填本地代理,如 http://127.0.0.1:7890;右侧 ▾ 列出本机在听的代理端口,点一下即填入")
@@ -1941,7 +1952,7 @@ struct EditView: View {
                 TextField("新 key(留空不改动;站方轮换 key 时填这里,保存前会实测)", text: $state.editKeyText)
                     .font(.system(size: 12, design: .monospaced))
                     .textFieldStyle(.roundedBorder)
-                    .help("轮换 key:验证通过后自动替换 cc-switch / CPA / DSH / Grok 里的旧凭据")
+                    .help("轮换 key:验证通过后自动替换 cc-switch / Magpie / CPA / DSH / Grok 里的旧凭据")
                 TextField("名称(可选)", text: $state.editNameText)
                     .font(.system(size: 12))
                     .textFieldStyle(.roundedBorder)
@@ -1949,7 +1960,7 @@ struct EditView: View {
                     .font(.system(size: 12))
                     .textFieldStyle(.roundedBorder)
                 HStack {
-                    Text("保存后将自动重新验证并同步 cc-switch / CPA / dsh")
+                    Text("保存后将自动重新验证，并同步到此条目已导入的目标")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -2271,6 +2282,16 @@ struct PanelView: View {
                 targetChip("cc-switch", on: state.useCC, color: Color(red: 0.22, green: 0.58, blue: 0.40)) {
                     state.toggleUseCC()
                 }
+                targetChip("Magpie", on: state.useMagpie, color: Color(red: 0.55, green: 0.40, blue: 0.75)) {
+                    state.toggleUseMagpie()
+                }
+                .help("导入到 Magpie；自动识别本机安装，也可在齿轮中设置 Web 管理链接")
+                Button { AppDelegateRef.shared?.magpieSettingsAction() } label: {
+                    Image(systemName: "gearshape").font(.system(size: 10))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Magpie 设置")
+                .help("Magpie 连接设置")
                 targetChip("Grok", on: state.useGrok, color: Color(red: 0.35, green: 0.45, blue: 0.85)) {
                     state.toggleUseGrok()
                 }

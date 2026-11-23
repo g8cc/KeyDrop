@@ -12,6 +12,7 @@ enum CLI {
         var grokOverride: Bool? = nil
         var cpaOverride: Bool? = nil
         var dshOverride: Bool? = nil
+        var magpieOverride: Bool? = nil
         var modelsOverride: [String] = []
         var editName: String? = nil
         var editKey: String? = nil
@@ -44,6 +45,8 @@ enum CLI {
             case "--no-cpa": cpaOverride = false
             case "--dsh": dshOverride = true
             case "--no-dsh": dshOverride = false
+            case "--magpie": magpieOverride = true
+            case "--no-magpie": magpieOverride = false
             case "--force": force = true
             case "--dsh-only": dshOnly = true
             case "--yes", "-y": break
@@ -118,7 +121,7 @@ enum CLI {
         case "add":
             let text = inputText(from: remaining)
             guard !text.isEmpty else {
-                print("用法: KeyDrop --add <key内容> [--cc] [--no-cc] [--grok] [--no-grok] [--cpa] [--no-cpa] [--dsh] [--no-dsh] [--cpa-config <path>] [--proxy <url>]")
+                print("用法: KeyDrop --add <key内容> [--cc|--no-cc] [--magpie|--no-magpie] [--grok|--no-grok] [--cpa|--no-cpa] [--dsh|--no-dsh] [--cpa-config <path>] [--proxy <url>]")
                 return 2
             }
             do {
@@ -133,6 +136,7 @@ enum CLI {
                     grokOverride: grokOverride,
                     cpaOverride: cpaOverride,
                     dshOverride: dshOverride,
+                    magpieOverride: magpieOverride,
                     models: modelsOverride.isEmpty ? nil : modelsOverride,
                     force: force,
                     appType: appType ?? Core.defaultAppType,
@@ -761,6 +765,7 @@ enum CLI {
       KeyDrop                        启动菜单栏小窗
       KeyDrop --add "<内容>"         解析→测试→选模型→添加(明文/base64/JSON/zip路径/文件路径/curl命令)
                                       [--cc|--no-cc] [--grok|--no-grok] [--cpa|--no-cpa] [--cpa-config <path>]
+                                       [--dsh|--no-dsh] [--magpie|--no-magpie] (Magpie 默认自动识别本机安装)
                                        [--app claude|opencode|codex|grok] [--model 名称1,名称2] [--force 跳过测试]
                                        [--proxy http://127.0.0.1:7890] (或环境变量 KEYDROP_PROXY)
       KeyDrop --parse "<内容>"       只看解析结果,不写入
