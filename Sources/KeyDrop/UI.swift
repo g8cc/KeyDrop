@@ -1240,7 +1240,7 @@ struct HistoryRow: View {
         let dotColor: Color = {
             switch availability {
             case .available, .proxyAvailable: return Color(red: 0.28, green: 0.68, blue: 0.42)
-            case .partial, .retry, .quota, .chainError: return Color(red: 0.93, green: 0.68, blue: 0.20)
+            case .partial, .retry, .quota, .chainError, .syncError, .poolPartial: return Color(red: 0.93, green: 0.68, blue: 0.20)
             case .error, .dead: return Color(red: 0.86, green: 0.28, blue: 0.24)
             case .dshOnly, .unverified, .reachable, .chainUnverified, .inactive: return Color.secondary.opacity(0.65)
             }
@@ -1323,6 +1323,9 @@ struct HistoryRow: View {
                         Text(entry.modelStatus.label)
                             .font(.system(size: 10))
                             .foregroundStyle(.secondary)
+                        if let credentials = entry.credentialStatusLabel {
+                            Text(credentials).font(.system(size: 10)).foregroundStyle(.secondary)
+                        }
                         // 每个模型一行:模型名(点击复制)+ 右侧该模型的监控格条
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(displayModels, id: \.self) { m in

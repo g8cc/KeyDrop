@@ -98,7 +98,8 @@ public enum Parser {
                let key = llm.key {
                 var p = ParsedKey()
                 p.key = key
-                p.url = llm.url
+                p.url = llm.url.flatMap(normalizeURL)
+                p.apiStyle = llm.url.flatMap(apiStyle(for:))
                 p.model = llm.model
                 p.name = llm.name
                 p.format = "llm"
@@ -115,7 +116,9 @@ public enum Parser {
            let key = llm.key, key != parsed.key {
             var p = ParsedKey()
             p.key = key
-            p.url = llm.url ?? parsed.url
+            p.url = llm.url.flatMap(normalizeURL) ?? parsed.url
+            p.apiStyle = llm.url.flatMap(apiStyle(for:))
+                ?? (p.url == parsed.url ? parsed.apiStyle : nil)
             p.model = llm.model ?? parsed.model
             p.name = llm.name ?? parsed.name
             p.format = "llm>" + parsed.format
@@ -607,6 +610,7 @@ public enum Parser {
         guard tokens.count >= 2, tokens[0] == "curl" else { return nil }
 
         var url: String? = nil
+        var style: String? = nil
         var key: String? = nil
         var model: String? = nil
 
@@ -665,14 +669,16 @@ public enum Parser {
             case "--url":
                 if i + 1 < tokens.count {
                     i += 1
-                    if url == nil, let u = normalizeURL(tokens[i]) { url = u }
+                    if url == nil, let u = normalizeURL(tokens[i]) {
+                        url = u; style = apiStyle(for: tokens[i])
+                    }
                 }
             case "-X", "--request", "-o", "--output", "--output-file":
                 i += 1
             default:
                 if t.hasPrefix("-") { break }
                 if url == nil, let u = normalizeURL(t) {
-                    url = u
+                    url = u; style = apiStyle(for: t)
                 } else {
                     takeKey(t)
                 }
@@ -696,6 +702,7 @@ public enum Parser {
         var p = ParsedKey()
         p.key = k
         p.url = url
+        p.apiStyle = style
         p.model = model
         p.format = "curl"
         return p
@@ -792,7 +799,7 @@ public enum Parser {
     }
 
     private static func classify(_ cands: [Cand], separator: String? = nil) throws -> ParsedKey {
-        var urls: [String] = []
+        var urls: [(url: String, style: String?)] = []
         var keys: [String] = []
         var rest: [(String, String?)] = []
 
@@ -800,7 +807,7 @@ public enum Parser {
             let t = c.value
             if let lhs = c.lhs {
                 if lhs.contains("url") || lhs.contains("endpoint") || lhs.contains("host") {
-                    if let url = normalizeURL(t) { urls.append(url); continue }
+                    if let url = normalizeURL(t) { urls.append((url, apiStyle(for: t))); continue }
                 }
                 if lhs.contains("key") || lhs.contains("token") || lhs.contains("secret") {
                     if let decoded = decodeKeyIfBase64(t) { keys.append(decoded); continue }
@@ -819,7 +826,7 @@ public enum Parser {
                     }
                 }
             }
-            if looksLikeURL(t), let u = normalizeURL(t) { urls.append(u) }
+            if looksLikeURL(t), let u = normalizeURL(t) { urls.append((u, apiStyle(for: t))) }
             else if let decoded = decodeKeyIfBase64(t) { keys.append(decoded) }
             else if let k = extractKey(t, separator) { keys.append(k) }
             else { rest.append((t, c.lhs)) }
@@ -831,7 +838,8 @@ public enum Parser {
 
         var p = ParsedKey()
         p.key = applySuffixInstructions(key, rest: rest)
-        p.url = urls.first
+        p.url = urls.first?.url
+        p.apiStyle = urls.first?.style
         p.format = cands.count > 1 ? "multiline" : "single"
 
         if keys.count == 1 {
@@ -984,7 +992,7 @@ public enum Parser {
 
     static func extractJSON(_ obj: Any, into p: inout ParsedKey) {
         var keyCandidates: [(Int, String)] = []
-        var urlCandidates: [(Int, String)] = []
+        var urlCandidates: [(Int, String, String?)] = []
         var modelCandidates: [(Int, String)] = []
         var nameCandidates: [(Int, String)] = []
         collectJSON(obj, keyC: &keyCandidates, urlC: &urlCandidates, modelC: &modelCandidates, nameC: &nameCandidates)
@@ -994,19 +1002,21 @@ public enum Parser {
             if let d = decodeKeyIfBase64(k), looksLikeKey(d) { k = d }
             p.key = k
         }
-        if p.url == nil, let best = urlCandidates.min(by: { $0.0 < $1.0 }) { p.url = best.1 }
+        if p.url == nil, let best = urlCandidates.min(by: { $0.0 < $1.0 }) {
+            p.url = best.1; p.apiStyle = best.2
+        }
         if p.model == nil, let best = modelCandidates.min(by: { $0.0 < $1.0 }) { p.model = best.1 }
         if p.name == nil, let best = nameCandidates.min(by: { $0.0 < $1.0 }) { p.name = best.1 }
     }
 
-    private static func collectJSON(_ v: Any, keyC: inout [(Int, String)], urlC: inout [(Int, String)], modelC: inout [(Int, String)], nameC: inout [(Int, String)]) {
+    private static func collectJSON(_ v: Any, keyC: inout [(Int, String)], urlC: inout [(Int, String, String?)], modelC: inout [(Int, String)], nameC: inout [(Int, String)]) {
         if let d = v as? [String: Any] {
             for (k, val) in d {
                 let kl = k.lowercased()
                 if let s = val as? String, !s.isEmpty {
                     if let i = keyFieldPriority.firstIndex(of: kl), looksLikeKey(s) { keyC.append((i, s)) }
                     else if kl == "apikey" || kl == "sk", looksLikeKey(s) { keyC.append((9, s)) }
-                    if let i = urlFieldPriority.firstIndex(of: kl), let url = normalizeURL(s) { urlC.append((i, url)) }
+                    if let i = urlFieldPriority.firstIndex(of: kl), let url = normalizeURL(s) { urlC.append((i, url, apiStyle(for: s))) }
                     if let i = modelFieldPriority.firstIndex(of: kl), s.count < 80, !s.contains("\n") { modelC.append((i, s)) }
                     if let i = nameFieldPriority.firstIndex(of: kl), s.count < 50, !s.contains("\n"), !looksLikeURL(s) { nameC.append((i, s)) }
                 } else {
@@ -1135,19 +1145,21 @@ public enum Parser {
         files.sort { $0.1 < $1.1 }
 
         var best: ParsedKey? = nil
-        var urlBorrow: String? = nil
+        var urlBorrow: (url: String, style: String?)? = nil
         for (url, _) in files {
             guard let data = try? Data(contentsOf: url),
                   let s = String(data: data, encoding: .utf8) else { continue }
             if let r = try? parse(s, depth: depth + 1) {
                 if r.key != nil, best == nil || r.score > best!.score { best = r; best?.sourceFile = url.lastPathComponent }
-                if r.url != nil, urlBorrow == nil { urlBorrow = r.url }
+                if let url = r.url, urlBorrow == nil { urlBorrow = (url, r.apiStyle) }
             }
         }
         guard var found = best else {
             throw ParseError.noKeyFound("zip 内扫描了 \(files.count) 个文件,未找到 key。")
         }
-        if found.url == nil, let u = urlBorrow { found.url = u }
+        if found.url == nil, let borrowed = urlBorrow {
+            found.url = borrowed.url; found.apiStyle = borrowed.style
+        }
         found.format = "zip>" + found.format
         return found
     }
@@ -1307,6 +1319,20 @@ public enum Parser {
         return nil
     }
 
+    /// Inspect the selected original URL before stripping its endpoint path.
+    static func apiStyle(for raw: String) -> String? {
+        guard normalizeURL(raw) != nil else { return nil }
+        var value = stripQuotes(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+            .trimmingCharacters(in: CharacterSet(charactersIn: ",;"))
+        if let index = value.firstIndex(where: { $0 == "?" || $0 == "#" }) { value = String(value[..<index]) }
+        value = value.replacingOccurrences(of: #"\([A-Za-z0-9 _-]*\)$"#, with: "", options: .regularExpression)
+        if value.hasSuffix("/") { value.removeLast() }
+        if value.hasSuffix("/responses") { return "responses" }
+        if value.hasSuffix("/messages") { return "anthropic" }
+        if value.hasSuffix("/chat/completions") { return "openai" }
+        return nil
+    }
+
     static func normalizeURL(_ raw: String) -> String? {
         var value = stripQuotes(raw.trimmingCharacters(in: .whitespacesAndNewlines))
             .trimmingCharacters(in: CharacterSet(charactersIn: ",;"))
@@ -1328,7 +1354,7 @@ public enum Parser {
         if let qi = value.firstIndex(of: "?") { value = String(value[..<qi]) }
         if let fi = value.firstIndex(of: "#") { value = String(value[..<fi]) }
         value = value.replacingOccurrences(of: #"\([A-Za-z0-9 _-]*\)$"#, with: "", options: .regularExpression)
-        if let r = value.range(of: #"/(?:chat/completions|messages|models)/?$"#, options: .regularExpression) {
+        if let r = value.range(of: #"/(?:chat/completions|messages|responses|models)/?$"#, options: .regularExpression) {
             value = String(value[..<r.lowerBound])
         }
         if value.hasSuffix("/") { value = String(value.dropLast()) }

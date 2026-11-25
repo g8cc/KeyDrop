@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import CryptoKit
 
 /// 单次探测结果点(监控图数据源)。每条目滚动保留最近 30 个点
 public struct ProbePoint: Codable, Equatable {
@@ -8,6 +9,8 @@ public struct ProbePoint: Codable, Equatable {
     public var ok: Bool
     /// CPA 链路探测结果(nil=该轮未测/无 cpa 目标)
     public var cpa: Bool?
+    /// 被测地址、凭据及协议的摘要，不存储额外密钥明文。
+    public var configurationID: String? = nil
 
     public init(t: TimeInterval, ms: Double?, ok: Bool, cpa: Bool? = nil) {
         self.t = t; self.ms = ms; self.ok = ok; self.cpa = cpa
@@ -29,7 +32,7 @@ public struct HistoryEntry: Codable {
         case latencyMs, failStreak, viaCPAOk, viaCPAAt
         case probeLog
         case modelProbeLog
-        case apiStyle, poolKeys
+        case apiStyle, poolKeys, legacyProbeInvalidated, magpieDestinationID, targetSyncErrors, poolProbeLog
     }
 
     public var id: String
@@ -43,6 +46,11 @@ public struct HistoryEntry: Codable {
     public var key: String?
     /// 多 key 导入经过认证筛选后实际写入的凭据；nil 表示旧账本尚未确认。
     public var poolKeys: [String]? = nil
+    public var magpieDestinationID: String? = nil
+    public var targetSyncErrors: [String: String]? = nil
+    public var legacyProbeInvalidated: Bool? = nil
+    /// 每个池成员各模型的最新实测；索引是凭据摘要。
+    public var poolProbeLog: [String: [String: ProbePoint]]? = nil
 
     public var isCredentialPool: Bool { poolKeys != nil || format == "cpa-multikey" }
 
@@ -118,6 +126,44 @@ public struct HistoryEntry: Codable {
     public var apiStyle: String? = nil
     public var modelProbeLog: [String: [ProbePoint]]?
 
+    public var probeConfigurationID: String {
+        let values = [Parser.normalizeURL(url ?? "") ?? url ?? "", apiStyle ?? "openai",
+                      targets.contains("cpa") ? (cpaConfigPath ?? "cpa") : ""] + credentialKeys
+        let data = (try? JSONEncoder().encode(values)) ?? Data()
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public func scopedProbePoints(_ points: [String: ProbePoint]) -> [String: ProbePoint] {
+        let id = probeConfigurationID
+        return points.mapValues { point in
+            var point = point; point.configurationID = id; return point
+        }
+    }
+
+    public static func credentialID(_ key: String) -> String {
+        SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public var credentialStatus: ModelStatus {
+        let keys = credentialKeys
+        let scope = probeConfigurationID
+        let models = configuredModels.filter { !Core.isNonChatModel($0) }
+        var passed = 0, failed = 0
+        for key in keys {
+            let points = poolProbeLog?[Self.credentialID(key)] ?? [:]
+            let current = models.compactMap { points[$0] }.filter { $0.configurationID == scope }
+            if current.contains(where: { !$0.ok }) { failed += 1 }
+            else if !models.isEmpty, current.count == models.count { passed += 1 }
+        }
+        return ModelStatus(total: keys.count, passed: passed, failed: failed)
+    }
+
+    public var credentialStatusLabel: String? {
+        guard isCredentialPool, credentialKeys.count > 1 else { return nil }
+        let status = credentialStatus
+        return "凭据：\(status.passed)/\(status.total) 通过 · \(status.failed) 失败 · \(status.untested) 未完成验证"
+    }
+
     /// 默认模型也属于当前配置；空 models 数组不能遮住它。保序去重供探测和 UI 共用。
     public var configuredModels: [String] {
         var values = models ?? []
@@ -141,8 +187,10 @@ public struct HistoryEntry: Codable {
     public var modelStatus: ModelStatus {
         var passed = 0, failed = 0
         let configured = configuredModels
+        let scope = probeConfigurationID
         for model in configured {
             guard let last = modelProbeLog?[model]?.max(by: { $0.t < $1.t }) else { continue }
+            guard last.configurationID == scope || (last.configurationID == nil && legacyProbeInvalidated != true) else { continue }
             if !last.ok || (targets.contains("cpa") && last.cpa == false) { failed += 1 }
             else if targets.contains("cpa"), !Core.isNonChatModel(model), last.cpa == nil { continue }
             else { passed += 1 }
@@ -194,7 +242,12 @@ public struct HistoryEntry: Codable {
         if let cpa = viaCPAOk, targets.contains("cpa") {
             let at = viaCPAAt.map { Self.shortTime($0) } ?? ""
             lines.append("CPA 链路: \(cpa ? "✓ 正常" : "✗ 异常(上游 OK ≠ 经 8317 的真实链路 OK)")\(at.isEmpty ? "" : " · \(at)")")
+            lines.append("CPA 为模型路由验证，可能转发到其他同名上游；不代表每把池内 key 均通过")
         }
+        for (target, error) in (targetSyncErrors ?? [:]).sorted(by: { $0.key < $1.key }) where targets.contains(target) {
+            lines.append("\(target) 同步待重试：\(error)")
+        }
+        if let credentialStatusLabel { lines.append(credentialStatusLabel) }
         if ccMissing == true { lines.append("⚠ cc-switch 中 provider 已缺失但 key 可用,可点行内 ↺ 重新导入") }
         if let vv = verifyVerdicts, !vv.isEmpty {
             let parts = vv.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }
@@ -236,7 +289,7 @@ public struct HistoryEntry: Codable {
     public var isDSHOnly: Bool { format == "dsh-only" }
 
     public enum Availability: Equatable {
-        case unverified, reachable, available, proxyAvailable, partial, retry, quota, error, chainError, chainUnverified, dead, dshOnly, inactive
+        case unverified, reachable, available, proxyAvailable, partial, retry, quota, error, chainError, chainUnverified, syncError, poolPartial, dead, dshOnly, inactive
 
         public var label: String {
             switch self {
@@ -250,6 +303,8 @@ public struct HistoryEntry: Codable {
             case .error: return "探测失败"
             case .chainError: return "上游通过，最近一次 CPA 链路探测失败"
             case .chainUnverified: return "上游通过，CPA 链路待验证"
+            case .syncError: return "目标配置同步失败，需重试"
+            case .poolPartial: return "凭据池尚未全部验证通过"
             case .dead: return "接口拒绝认证"
             case .dshOnly: return "DSH 专用，请在 DSH 内验证"
             case .inactive: return "记录已停用"
@@ -260,6 +315,12 @@ public struct HistoryEntry: Codable {
     public var availability: Availability {
         guard status == "active" else { return .inactive }
         if isDSHOnly { return .dshOnly }
+        if (targetSyncErrors ?? [:]).keys.contains(where: { targets.contains($0) }) { return .syncError }
+        if isCredentialPool, credentialKeys.count > 1 {
+            let credentials = credentialStatus
+            if credentials.failed == credentials.total { return .error }
+            if credentials.passed < credentials.total { return .poolPartial }
+        }
         switch health {
         case "dead": return .dead
         case "err": return .error
@@ -367,6 +428,10 @@ public struct HistoryEntry: Codable {
         models = try c.decodeIfPresent([String].self, forKey: .models)
         key = try c.decodeIfPresent(String.self, forKey: .key)
         poolKeys = try c.decodeIfPresent([String].self, forKey: .poolKeys)
+        legacyProbeInvalidated = try c.decodeIfPresent(Bool.self, forKey: .legacyProbeInvalidated)
+        magpieDestinationID = try c.decodeIfPresent(String.self, forKey: .magpieDestinationID)
+        targetSyncErrors = try c.decodeIfPresent([String: String].self, forKey: .targetSyncErrors)
+        poolProbeLog = try c.decodeIfPresent([String: [String: ProbePoint]].self, forKey: .poolProbeLog)
         keyMasked = try c.decode(String.self, forKey: .keyMasked)
         targets = try c.decode([String].self, forKey: .targets)
         ccProviderID = try c.decodeIfPresent(String.self, forKey: .ccProviderID)
@@ -408,6 +473,10 @@ public struct HistoryEntry: Codable {
         try c.encodeIfPresent(models, forKey: .models)
         try c.encodeIfPresent(key, forKey: .key)
         try c.encodeIfPresent(poolKeys, forKey: .poolKeys)
+        try c.encodeIfPresent(legacyProbeInvalidated, forKey: .legacyProbeInvalidated)
+        try c.encodeIfPresent(magpieDestinationID, forKey: .magpieDestinationID)
+        try c.encodeIfPresent(targetSyncErrors, forKey: .targetSyncErrors)
+        try c.encodeIfPresent(poolProbeLog, forKey: .poolProbeLog)
         try c.encode(keyMasked, forKey: .keyMasked)
         try c.encode(targets, forKey: .targets)
         try c.encodeIfPresent(ccProviderID, forKey: .ccProviderID)
@@ -748,17 +817,41 @@ public final class HistoryStore {
     public func update(_ e: HistoryEntry) throws {
         lock.lock()
         defer { lock.unlock() }
-        guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
-        var merged = e
-        merged.updatedAt = Date().timeIntervalSince1970
-        // probeLog 是监控账本,归 store 所有:调用方的 entry 快照可能早于最新探测点
-        // (refreshModels 先 appendProbePoint 再 update 整条),整条覆盖会回滚监控历史
-        merged.probeLog = _items[i].probeLog
-        merged.modelProbeLog = _items[i].modelProbeLog
-        let previous = _items[i]
-        _items[i] = merged
-        do { try saveLocked(dirtyIDs: [e.id]) }
-        catch { _items[i] = previous; throw error }
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let i = _items.firstIndex(where: { $0.id == e.id }) else { return }
+            var merged = e
+            if _items[i].probeConfigurationID != e.probeConfigurationID { merged.legacyProbeInvalidated = true }
+            else if _items[i].legacyProbeInvalidated == true { merged.legacyProbeInvalidated = true }
+            merged.updatedAt = Date().timeIntervalSince1970
+            // probeLog 是监控账本,归 store 所有:调用方的 entry 快照可能早于最新探测点
+            // (refreshModels 先 appendProbePoint 再 update 整条),整条覆盖会回滚监控历史
+            merged.probeLog = _items[i].probeLog
+            merged.modelProbeLog = _items[i].modelProbeLog
+            merged.poolProbeLog = Self.mergedPoolEvidence(current: _items[i].poolProbeLog, incoming: e.poolProbeLog, for: merged)
+            let previous = _items[i]
+            _items[i] = merged
+            do { try saveLockedNoFlock(dirtyIDs: [e.id]) }
+            catch { _items[i] = previous; throw error }
+        }
+    }
+
+    private static func mergedPoolEvidence(current: [String: [String: ProbePoint]]?,
+                                           incoming: [String: [String: ProbePoint]]?,
+                                           for entry: HistoryEntry) -> [String: [String: ProbePoint]]? {
+        guard current != nil || incoming != nil else { return nil }
+        let scope = entry.probeConfigurationID
+        let validIDs = Set(entry.credentialKeys.map(HistoryEntry.credentialID))
+        var log: [String: [String: ProbePoint]] = [:]
+        for source in [current, incoming] {
+            for (key, models) in source ?? [:] where validIDs.contains(key) {
+                for (model, point) in models where point.configurationID == scope {
+                    if let old = log[key]?[model], old.t >= point.t { continue }
+                    log[key, default: [:]][model] = point
+                }
+            }
+        }
+        return log
     }
 
     private static func sameProbeConfiguration(_ current: HistoryEntry, _ tested: HistoryEntry) -> Bool {
@@ -822,7 +915,7 @@ public final class HistoryStore {
     }
 
     /// 批量合并本轮的探测字段。过时的结果在读写同一把文件锁内丢弃。
-    public func mergeHealth(_ entries: [HistoryEntry], at: TimeInterval) throws {
+    public func mergeHealth(_ entries: [HistoryEntry], at: TimeInterval, testedConfigurations: [String: String] = [:]) throws {
         lock.lock()
         defer { lock.unlock() }
         try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
@@ -832,8 +925,10 @@ public final class HistoryStore {
             var previous: [(Int, HistoryEntry)] = []
             for e in entries {
                 guard let i = indices[e.id], Self.sameProbeConfiguration(_items[i], e),
+                      testedConfigurations[e.id].map({ $0 == _items[i].probeConfigurationID }) ?? true,
                       (_items[i].healthAt ?? -.infinity) < at else { continue }
                 previous.append((i, _items[i]))
+                if _items[i].probeConfigurationID != e.probeConfigurationID { _items[i].legacyProbeInvalidated = true }
                 if let style = e.apiStyle { _items[i].apiStyle = style }
                 _items[i].health = e.health
                 _items[i].healthDetail = e.healthDetail
@@ -843,6 +938,7 @@ public final class HistoryStore {
                 _items[i].failStreak = e.failStreak
                 _items[i].viaCPAOk = e.viaCPAOk
                 _items[i].viaCPAAt = e.viaCPAAt
+                _items[i].poolProbeLog = Self.mergedPoolEvidence(current: _items[i].poolProbeLog, incoming: e.poolProbeLog, for: _items[i])
                 _items[i].updatedAt = max(_items[i].updatedAt ?? 0, at)
                 if e.health != "reachable" {
                     let pt = ProbePoint(t: at, ms: e.latencyMs,
@@ -860,6 +956,43 @@ public final class HistoryStore {
                     }
                     _items[i].modelProbeLog = merged
                 }
+            }
+            guard !previous.isEmpty else { return }
+            do { try saveLockedNoFlock(dirtyIDs: Set(previous.map { $0.1.id })) }
+            catch {
+                for (index, entry) in previous { _items[index] = entry }
+                throw error
+            }
+        }
+    }
+
+    /// 首个凭据冷却时只合并其他成员的真实采样，不改变首个凭据的健康时间和轨迹。
+    public func mergePoolEvidence(_ entries: [HistoryEntry]) throws {
+        guard !entries.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            var previous: [(Int, HistoryEntry)] = []
+            for entry in entries {
+                guard let i = _items.firstIndex(where: { $0.id == entry.id }),
+                      Self.sameProbeConfiguration(_items[i], entry),
+                      _items[i].probeConfigurationID == entry.probeConfigurationID else { continue }
+                let scope = _items[i].probeConfigurationID
+                let validIDs = Set(_items[i].credentialKeys.map(HistoryEntry.credentialID))
+                var log = _items[i].poolProbeLog ?? [:]
+                var changed = false
+                for (key, models) in entry.poolProbeLog ?? [:] where validIDs.contains(key) {
+                    for (model, point) in models where point.configurationID == scope {
+                        if let old = log[key]?[model], old.configurationID == scope, old.t >= point.t { continue }
+                        log[key, default: [:]][model] = point
+                        changed = true
+                    }
+                }
+                guard changed else { continue }
+                previous.append((i, _items[i]))
+                _items[i].poolProbeLog = log
+                _items[i].updatedAt = Date().timeIntervalSince1970
             }
             guard !previous.isEmpty else { return }
             do { try saveLockedNoFlock(dirtyIDs: Set(previous.map { $0.1.id })) }
@@ -897,7 +1030,8 @@ public final class HistoryStore {
             guard let i = _items.firstIndex(where: { $0.id == id }) else { return }
             let previous = _items[i]
             var merged = _items[i].modelProbeLog ?? [:]
-            for (m, pt) in points {
+            for (m, var pt) in points {
+                if pt.configurationID == nil { pt.configurationID = _items[i].probeConfigurationID }
                 var arr = (merged[m] ?? []) + [pt]
                 if arr.count > 30 { arr = Array(arr.suffix(30)) }
                 merged[m] = arr
@@ -915,8 +1049,11 @@ public final class HistoryStore {
         lock.lock()
         defer { lock.unlock() }
         let previous = _items
-        for e in entries {
+        for var e in entries {
             if let i = _items.firstIndex(where: { $0.id == e.id }) {
+                if _items[i].probeConfigurationID != e.probeConfigurationID || _items[i].legacyProbeInvalidated == true {
+                    e.legacyProbeInvalidated = true
+                }
                 _items[i] = e
             }
         }

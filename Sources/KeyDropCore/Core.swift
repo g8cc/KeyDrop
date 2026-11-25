@@ -422,6 +422,10 @@ public final class Core {
         // 导入时的完整探测结果:落监控用的模型级探测点(此前只有刷新写点,
         // 新导入条目的模型在监控里全灰到第一次扫描/刷新)
         var probedTest: APITestResult? = nil
+        var verifiedStyle: String?
+        // A normalized root loses /responses or /messages. Retain the selected input's
+        // protocol; only reuse prior evidence when the provider address is unchanged.
+        let inputStyle = parsed.apiStyle ?? (dup?.url == url ? dup?.apiStyle : nil)
         if !force {
             // 必须带上解析出的模型做优先探测。真实事故(vyceai, 2026-09-23):粘贴块里
             // 带了模型 deepseek-v4.1,但这里没传 preferredModel,探测按站点目录轮换,
@@ -429,7 +433,9 @@ public final class Core {
             // 失败;手测 deepseek-v4.1 chat 200 完全正常。v1.4.17 修了监控/重测/单条目
             // 三处调用,唯独漏了导入这条路径。
             let test = APITester.test(url: url, key: key, proxy: proxyURL,
-                                      preferredModel: parsed.model, importedModels: parsed.models)
+                                      preferredModel: requestedChatModels.first ?? parsed.model,
+                                      importedModels: requestedChatModels.isEmpty ? parsed.models : requestedChatModels,
+                                      styleHint: inputStyle)
             probedTest = test
             try operation?.checkCancellation()
             let hasProxy = proxyURL?.isEmpty == false
@@ -457,6 +463,7 @@ public final class Core {
                         if !(test.needsProxy && hasProxy) {
                             let direct = APITester.testModelChat(base: url, key: key, model: model, styleHint: test.style)
                             if direct.ok {
+                                verifiedStyle = direct.style
                                 verified.append(model)
                                 continue
                             }
@@ -467,6 +474,7 @@ public final class Core {
                         }
                         let viaProxy = APITester.testModelChat(base: url, key: key, model: model, proxy: proxyURL, styleHint: test.style)
                         if viaProxy.ok {
+                            verifiedStyle = viaProxy.style
                             verified.append(model)
                             explicitNeedsProxy = true
                             continue
@@ -537,6 +545,8 @@ public final class Core {
                         try operation?.checkCancellation()
                         let check = APITester.testModelChat(base: url, key: key, model: m, proxy: verifyProxy, styleHint: test.style)
                         if check.ok {
+                            verifiedStyle = check.style
+                            chatVerifiedModels.insert(m)
                             verified.append(m)
                         } else {
                             failures.append("\(m) → \(check.detail)")
@@ -687,7 +697,10 @@ public final class Core {
             healthAt: addHealth == nil ? nil : Date().timeIntervalSince1970
         )
 
-        entry.apiStyle = probedTest?.ok == true ? probedTest?.style : dup?.apiStyle
+        entry.apiStyle = verifiedStyle ?? (probedTest?.ok == true ? probedTest?.style : inputStyle)
+        entry.magpieDestinationID = dup?.magpieDestinationID
+        entry.targetSyncErrors = dup?.targetSyncErrors
+        entry.legacyProbeInvalidated = dup?.legacyProbeInvalidated
         var lines: [String] = []
         lines.append("解析: \(parsed.format) → key=\(parsed.keyMasked)" + (parsed.model.map { " model=\($0)" } ?? ""))
         if selectedModels.count > 1 {
@@ -875,12 +888,13 @@ public final class Core {
         if useMagpie {
             anyTarget = true
             do {
-                let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
-                                                models: selectedModels, apiStyle: entry.apiStyle)
+                let msg = try syncMagpie(&entry)
                 if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
                 anyOK = true
                 lines.append("✓ Magpie: \(msg)")
             } catch {
+                entry.targetSyncErrors = entry.targetSyncErrors ?? [:]
+                entry.targetSyncErrors?["magpie"] = error.localizedDescription
                 lines.append("✗ Magpie 失败: \(error.localizedDescription)")
             }
         }
@@ -912,10 +926,11 @@ public final class Core {
         entry.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
         lines.append(contentsOf: notes)
 
+        var historySaved = false
         if anyOK {
             do {
-                if dup != nil {
-                    try history.update(entry)
+                if let dup {
+                    try saveAfterMagpie(entry, previous: dup)
                 } else if let survivor = try history.appendDedupByKey(entry) {
                     // 网络测试期间另一进程(CLI/app)刚导入了同一 key。
                     // 本进程也已经写了外部配置(cc-switch provider / DSH route),
@@ -944,9 +959,10 @@ public final class Core {
                     if entry.targets.contains("magpie") {
                         // Magpie 的所有权绑定 entry.id，不能把另一 ID 的 tag 直接合并。
                         do {
-                            _ = try MagpieWriter.remove(providerID: entry.id)
+                            _ = try MagpieWriter.remove(providerID: entry.id, expectedDestinationID: entry.magpieDestinationID)
                             // 单目标同步包含账本失败回滚，避免 survivor 下出现无人认领的配置。
                             _ = try syncTarget(entryIDPrefix: survivor.id, target: "magpie")
+                            merged.magpieDestinationID = history.find(idPrefix: survivor.id)?.magpieDestinationID
                             magpieMerged = true
                         } catch {
                             lines.append("⚠ 并发合并: Magpie 同步失败，请对既有记录重新同步: \(error.localizedDescription)")
@@ -967,19 +983,24 @@ public final class Core {
                     entry = merged
                     lines.append("↻ 检测到同 key 已被其他端导入,已合并到既有记录(\(survivor.id.prefix(8)))")
                 }
-                try prefs.save()
+                historySaved = true
             } catch {
-                lines.append("⚠ 历史/偏好保存失败: \(error.localizedDescription)")
+                anyOK = false
+                lines.append("✗ 历史保存失败，本次导入未完成: \(error.localizedDescription)")
                 lines.append("  (目标配置可能已写入，请检查记录后重试)")
                 if dup == nil, entry.targets.contains("magpie"), history.find(idPrefix: entry.id) == nil {
-                    anyOK = false
                     entry.status = "error"
                     do {
-                        _ = try MagpieWriter.remove(providerID: entry.id)
+                        _ = try MagpieWriter.remove(providerID: entry.id, expectedDestinationID: entry.magpieDestinationID)
                         entry.targets.removeAll { $0 == "magpie" }
                     }
                     catch { lines.append("⚠ Magpie 回滚失败: \(error.localizedDescription)") }
                 }
+                if let dup { entry = history.find(idPrefix: dup.id) ?? dup }
+            }
+            if historySaved {
+                do { try prefs.save() }
+                catch { lines.append("⚠ 偏好保存失败（导入记录已保存）: \(error.localizedDescription)") }
             }
         }
 
@@ -993,9 +1014,9 @@ public final class Core {
             // 显式要求且不在站点目录里的模型(逐个 chat 验证过的)也记 ok 点
             importPoints[m] = ProbePoint(t: Date().timeIntervalSince1970, ms: nil, ok: true)
         }
-        if !importPoints.isEmpty, entry.status == "active" {
+        if historySaved, !importPoints.isEmpty, entry.status == "active" {
             do {
-                try history.appendModelProbePoints(id: entry.id, points: importPoints)
+                try history.appendModelProbePoints(id: entry.id, points: entry.scopedProbePoints(importPoints))
             } catch {
                 AppLog.warn("模型探测点写入失败: \(error.localizedDescription)")
             }
@@ -1256,6 +1277,7 @@ public final class Core {
         }
         var out: [String] = []
         var updatedEntries: [HistoryEntry] = []
+        var poolOnlyEntries: [HistoryEntry] = []
         let outLock = NSLock()
         let sem = DispatchSemaphore(value: 4)
         let group = DispatchGroup()
@@ -1280,7 +1302,14 @@ public final class Core {
                                           importedModels: e.models,
                                           probePool: probePool.isEmpty ? nil : probePool,
                                           knownNeedsProxy: e.health == "proxy-ok", styleHint: e.apiStyle)
-                guard !test.skippedForCooldown else { return }
+                if test.skippedForCooldown {
+                    var updated = e
+                    self.updatePoolProbe(for: &updated, primary: test, at: now, proxy: px)
+                    outLock.lock()
+                    poolOnlyEntries.append(updated)
+                    outLock.unlock()
+                    return
+                }
                 self.noteProxyWorked(needsProxy: test.needsProxy, used: px)
                 let (h, d) = Self.healthFor(test)
                 var updated = e
@@ -1295,7 +1324,7 @@ public final class Core {
                 updated.healthAt = now
                 updated.latencyMs = test.ok ? test.latencyMs : e.latencyMs
                 // 部分可用时也记录已确认失败的模型,防止旧绿格一直保留。
-                let modelPoints = test.modelProbePoints(at: now)
+                let modelPoints = updated.scopedProbePoints(test.modelProbePoints(at: now))
                 // 增量语义:每个模型包一层单点数组,mergeHealth 负责追加进完整轨迹并截 30
                 // (与 probeLog 的 merge 模式一致,避免快照覆盖监控历史)
                 if modelPoints.isEmpty {
@@ -1311,6 +1340,7 @@ public final class Core {
                 // "model only supported on /v1/images/generations" 拒绝,曾把
                 // gpt-image-2 条目误标为链路异常(真实事故)。跳过 = 视为未测,
                 // 不显示 CPA 徽章,不误报
+                self.updatePoolProbe(for: &updated, primary: test, at: now, proxy: px)
                 let cpaResults = self.updateCPAProbe(for: &updated, test: test, at: now)
                 for (model, passed) in cpaResults {
                     // CPA 结果只附到该模型本轮实际请求的增量点上。
@@ -1335,7 +1365,10 @@ public final class Core {
             // mergeHealth 只写 health/healthDetail/healthAt 三个字段:
             // 测试期间条目可能被 CLI 或用户改过,整条覆盖会回滚那些并发修改
             do {
-                try self.history.mergeHealth(updatedEntries, at: now)
+                let testedConfigurations = Dictionary(targets.map { ($0.entry.id, $0.entry.probeConfigurationID) },
+                                                       uniquingKeysWith: { first, _ in first })
+                try self.history.mergeHealth(updatedEntries, at: now, testedConfigurations: testedConfigurations)
+                try self.history.mergePoolEvidence(poolOnlyEntries)
             } catch {
                 AppLog.error("scanHealth 保存失败: \(error.localizedDescription)")
             }
@@ -1404,7 +1437,7 @@ public final class Core {
                     guard try self.history.mergeCCReconciliation(tested: e, health: health.health,
                                                                   detail: health.detail, authFailed: test.authFailed,
                                                                   note: note, point: point,
-                                                                  modelPoints: test.modelProbePoints(at: now)) else { return }
+                                                                  modelPoints: e.scopedProbePoints(test.modelProbePoints(at: now))) else { return }
                     if test.authFailed || e.ccMissing != true {
                         outLock.lock()
                         out.append("同步: 「\(e.name ?? String(e.id.prefix(8)))」\(note)")
@@ -1694,13 +1727,15 @@ public final class Core {
             // ② 超期已删 → 审计桩(计龄:deletedAt 缺失的历史条目回退 healthAt/ts)
             if e.status == "deleted" {
                 let age = e.deletedAt ?? e.healthAt ?? e.ts
-                if age < cutoff, e.key != nil || e.poolKeys != nil || e.probeLog != nil || e.modelProbeLog != nil
+                if age < cutoff, e.key != nil || e.poolKeys != nil || e.probeLog != nil || e.modelProbeLog != nil || e.poolProbeLog != nil
                     || e.raw != "archived" {
                     e.key = nil
                     e.poolKeys = nil
                     e.raw = "archived"
                     e.probeLog = nil
                     e.modelProbeLog = nil
+                    e.poolProbeLog = nil
+                    e.targetSyncErrors = nil
                     e.healthDetail = nil
                     e.latencyMs = nil
                     e.viaCPAOk = nil
@@ -1857,6 +1892,17 @@ public final class Core {
                 }
                 if remoteTS > localTS {
                     // 先同步本机已认领的产物。失败时保留旧账本，后续拉取可重试。
+                    // 缺少凭据不能跳过目标写入后仍接收远端账本，否则会丢失本机
+                    // 清理和重试所需的 key；在任何目标写入前检查以避免部分更新。
+                    if local.targets.contains("magpie") {
+                        guard !e.credentialKeys.isEmpty,
+                              let incomingURL = e.url,
+                              !incomingURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            throw ParseError.io("同步 Magpie 缺少地址或凭据，已保留本机记录")
+                        }
+                    }
+                    // 实例绑定只属于本机；远端账本中的绑定不能参与回退。
+                    e.magpieDestinationID = local.magpieDestinationID
                     var incomingModels = e.models ?? e.model.map { [$0] }
                         ?? local.models ?? local.model.map { [$0] } ?? []
                     if local.targets.contains("cpa") {
@@ -1925,9 +1971,12 @@ public final class Core {
                             _ = try writer.remove(baseURL: oldURL, key: oldKey, models: previousModels)
                         }
                     }
-                    if local.targets.contains("magpie"), let mk = e.key, let mURL = e.url {
-                        _ = try MagpieWriter.sync(providerID: e.id, baseURL: mURL, key: mk,
-                                                  models: incomingModels, apiStyle: e.apiStyle)
+                    if local.targets.contains("magpie"), let mk = e.credentialKeys.first, let mURL = e.url {
+                        var desired = e
+                        desired.key = mk; desired.url = mURL; desired.models = incomingModels; desired.model = incomingModels.first
+                        desired.magpieDestinationID = local.magpieDestinationID
+                        _ = try syncMagpie(&desired)
+                        e.magpieDestinationID = desired.magpieDestinationID
                     }
                     var merged = e
                     if e.models == nil && e.model == nil {
@@ -1939,12 +1988,28 @@ public final class Core {
                     merged.ccRenamedTo = local.ccRenamedTo
                     merged.cpaConfigPath = local.cpaConfigPath
                     merged.grokConfigPath = local.grokConfigPath
+                    merged.magpieDestinationID = local.targets.contains("magpie") ? (e.magpieDestinationID ?? local.magpieDestinationID) : nil
+                    merged.targetSyncErrors = local.targetSyncErrors
+                    if local.targets.contains("magpie") { merged.targetSyncErrors?.removeValue(forKey: "magpie") }
+                    merged.legacyProbeInvalidated = true
+                    // 远端探测不能证明本机 CPA 路由正常，等待本机重新验证。
+                    merged.viaCPAOk = nil; merged.viaCPAAt = nil
+                    merged.modelProbeLog = local.modelProbeLog
+                    merged.probeLog = local.probeLog
+                    merged.poolProbeLog = local.poolProbeLog
                     // targets 是【本机产物事实】:整条取远端曾丢掉本机独有的标签
                     // (如本机同步过 DSH 而维护者没有)。取并集,顺序 = 本机优先。
                     // 必须迭代 local.targets:merged 初始 = e(远端),对 e 求差永假
                     for t in local.targets where !merged.targets.contains(t) {
                         merged.targets.append(t)
                     }
+                    let sameConfiguration = merged.probeConfigurationID == local.probeConfigurationID
+                    merged.health = sameConfiguration ? local.health : nil
+                    merged.healthAt = sameConfiguration ? local.healthAt : nil
+                    merged.healthDetail = sameConfiguration ? local.healthDetail : "同步配置已更新，等待本机验证"
+                    merged.viaCPAOk = sameConfiguration ? local.viaCPAOk : nil
+                    merged.viaCPAAt = sameConfiguration ? local.viaCPAAt : nil
+                    merged.failStreak = sameConfiguration ? local.failStreak : nil
                     merged.updatedAt = Date().timeIntervalSince1970
                     feedChanged.removeAll { $0.id == merged.id }
                     feedChanged.append(merged)
@@ -1962,6 +2027,13 @@ public final class Core {
             e.ccRenamedTo = nil
             e.cpaConfigPath = nil
             e.grokConfigPath = nil
+            e.magpieDestinationID = nil
+            e.targetSyncErrors = nil
+            e.legacyProbeInvalidated = true
+            e.health = nil; e.healthAt = nil
+            e.viaCPAOk = nil; e.viaCPAAt = nil
+            e.modelProbeLog = nil; e.probeLog = nil
+            e.poolProbeLog = nil
             e.ccMissing = nil
             if try history.appendDedupByKey(e) != nil {
                 skippedSameKey += 1
@@ -2086,10 +2158,12 @@ public final class Core {
             // magpie(经 Web API,与行内同步同通道)
             if e.targets.contains("magpie") {
                 do {
-                    let msg = try MagpieWriter.sync(providerID: e.id, baseURL: url, key: key, models: models, apiStyle: e.apiStyle)
+                    let msg = try syncMagpie(&e)
                     entryLines.append("Magpie: \(msg)")
                     replayed += 1
                 } catch {
+                    e.targetSyncErrors = e.targetSyncErrors ?? [:]
+                    e.targetSyncErrors?["magpie"] = error.localizedDescription
                     entryLines.append("⚠ Magpie: \(error.localizedDescription)")
                 }
             }
@@ -2228,7 +2302,12 @@ public final class Core {
         let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model,
                                   importedModels: entry.models, probePool: entry.configuredModels,
                                   styleHint: entry.apiStyle)
-        if test.skippedForCooldown { return "暂缓探测: " + test.detail }
+        if test.skippedForCooldown {
+            var updated = entry
+            updatePoolProbe(for: &updated, primary: test, at: Date().timeIntervalSince1970, proxy: px)
+            try history.mergePoolEvidence([updated])
+            return "暂缓探测: " + test.detail
+        }
         noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
         if test.ok {
@@ -2464,10 +2543,48 @@ public final class Core {
         return results
     }
 
+    /// 每轮除首个凭据外，再测最久未验证的一个成员，限制请求量并逐轮覆盖整池。
+    private func updatePoolProbe(for entry: inout HistoryEntry, primary: APITestResult, at: TimeInterval, proxy: String?) {
+        let keys = entry.credentialKeys
+        guard entry.isCredentialPool, keys.count > 1, let url = entry.url else { return }
+        let validIDs = Set(keys.map(HistoryEntry.credentialID))
+        var log = (entry.poolProbeLog ?? [:]).filter { validIDs.contains($0.key) }
+        func merge(_ key: String, _ result: APITestResult) {
+            guard !result.skippedForCooldown else { return }
+            let id = HistoryEntry.credentialID(key)
+            var points = log[id] ?? [:]
+            for (model, point) in entry.scopedProbePoints(result.modelProbePoints(at: at)) { points[model] = point }
+            log[id] = points
+        }
+        merge(keys[0], primary)
+        let scope = entry.probeConfigurationID
+        func lastTime(_ key: String) -> TimeInterval {
+            let points = log[HistoryEntry.credentialID(key)] ?? [:]
+            return entry.configuredModels.map { model in
+                guard let point = points[model], point.configurationID == scope else { return 0 }
+                return point.t
+            }.max() ?? 0
+        }
+        // 冷却成员没有产生新证据，不能更新采样时间；继续寻找可测成员，
+        // 否则它会始终排在队首，饿死后面的有效凭据。
+        for key in keys.dropFirst().sorted(by: { lastTime($0) < lastTime($1) }) {
+            let points = log[HistoryEntry.credentialID(key)] ?? [:]
+            let result = APITester.test(url: url, key: key, timeout: 10, proxy: proxy,
+                                       preferredModel: entry.model,
+                                       modelProbeTimes: points.compactMapValues { $0.configurationID == scope ? $0.t : nil },
+                                       probePool: entry.configuredModels, knownNeedsProxy: entry.health == "proxy-ok",
+                                       styleHint: entry.apiStyle)
+            merge(key, result)
+            if !result.skippedForCooldown { break }
+        }
+        entry.poolProbeLog = log
+    }
+
     /// 所有手动重测分支共享监控落盘,包括失败和改选后的第二次探测。
     private func recordProbeResult(_ test: APITestResult, for entry: inout HistoryEntry) {
+        let now = test.skippedForCooldown ? Date().timeIntervalSince1970 : (entry.healthAt ?? Date().timeIntervalSince1970)
+        updatePoolProbe(for: &entry, primary: test, at: now, proxy: proxyForHealth())
         guard !test.skippedForCooldown else { return }
-        let now = entry.healthAt ?? Date().timeIntervalSince1970
         var points = test.modelProbePoints(at: now)
         let cpaResults = updateCPAProbe(for: &entry, test: test, at: now)
         for (model, passed) in cpaResults {
@@ -2478,19 +2595,63 @@ public final class Core {
             if !test.reachabilityOnly {
                 try history.appendProbePoint(id: entry.id, ok: test.ok && !test.quotaExhausted && !test.chatDegraded, ms: test.latencyMs, cpa: cpa, at: now)
             }
-            try history.appendModelProbePoints(id: entry.id, points: points)
+            try history.appendModelProbePoints(id: entry.id, points: entry.scopedProbePoints(points))
         } catch {
             AppLog.warn("探测点写入失败: \(error.localizedDescription)")
         }
     }
 
-    private func syncMagpieIfNeeded(_ entry: HistoryEntry) -> String {
-        guard entry.targets.contains("magpie"), let url = entry.url, let key = extractKey(entry) else { return "" }
+    private func syncMagpie(_ entry: inout HistoryEntry) throws -> String {
+        guard let url = entry.url, let key = extractKey(entry) else { throw ParseError.io("Magpie 同步缺少地址或凭据") }
+        let destination = try entry.magpieDestinationID ?? MagpieWriter.destinationID()
+        let message = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
+                                            models: entry.configuredModels, apiStyle: entry.apiStyle,
+                                            expectedDestinationID: destination)
+        entry.magpieDestinationID = destination
+        entry.targetSyncErrors?.removeValue(forKey: "magpie")
+        return message
+    }
+
+    private func syncMagpieIfNeeded(_ entry: inout HistoryEntry) -> String {
+        guard entry.targets.contains("magpie") else { return "" }
         do {
-            let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
-                                            models: entry.configuredModels, apiStyle: entry.apiStyle)
-            return "\n✓ Magpie: \(msg)"
-        } catch { return "\n⚠ Magpie 同步失败: \(error.localizedDescription)" }
+            return "\n✓ Magpie: " + (try syncMagpie(&entry))
+        } catch {
+            entry.targetSyncErrors = entry.targetSyncErrors ?? [:]
+            entry.targetSyncErrors?["magpie"] = error.localizedDescription
+            return "\n⚠ Magpie 同步失败: \(error.localizedDescription)"
+        }
+    }
+
+    private func restoreMagpie(after attempted: HistoryEntry, to original: HistoryEntry) throws {
+        guard attempted.targets.contains("magpie"),
+              attempted.targetSyncErrors?["magpie"] == nil,
+              let newURL = attempted.url, let newKey = extractKey(attempted) else { return }
+        let attemptedState = MagpieWriter.ProviderState(baseURL: newURL, key: newKey,
+                                                        models: attempted.configuredModels, apiStyle: attempted.apiStyle)
+        guard original.targets.contains("magpie") else {
+            _ = try MagpieWriter.remove(providerID: attempted.id, expectedDestinationID: attempted.magpieDestinationID,
+                                        onlyIfMatches: attemptedState)
+            return
+        }
+        guard let oldURL = original.url, let oldKey = extractKey(original) else {
+            throw ParseError.io("原 Magpie 记录缺少凭据，无法恢复配置，请检查后重试")
+        }
+        _ = try MagpieWriter.sync(providerID: original.id, baseURL: oldURL, key: oldKey,
+                                   models: original.configuredModels, apiStyle: original.apiStyle,
+                                   expectedDestinationID: attempted.magpieDestinationID,
+                                   onlyIfMatches: attemptedState)
+    }
+
+    private func saveAfterMagpie(_ entry: HistoryEntry, previous: HistoryEntry) throws {
+        do { try history.update(entry) }
+        catch {
+            do { try restoreMagpie(after: entry, to: previous) }
+            catch let rollbackError {
+                throw ParseError.io("账本保存失败: \(error.localizedDescription);Magpie 回滚未完成: \(rollbackError.localizedDescription)")
+            }
+            throw error
+        }
     }
 
     public func refreshModels(
@@ -2501,6 +2662,7 @@ public final class Core {
         guard var entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
+        let previousEntry = entry
         let effProxy = proxy ?? proxyForHealth()
         guard !entry.isDSHOnly else { throw ParseError.io("DSH 专用条目，请在 DSH 内验证") }
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
@@ -2510,7 +2672,11 @@ public final class Core {
                                   preferredModel: entry.model, importedModels: entry.models,
                                   probePool: entry.configuredModels, styleHint: entry.apiStyle)
         if test.ok { entry.apiStyle = test.style }
-        if test.skippedForCooldown, pickModels == nil { throw ParseError.io(test.detail) }
+        if test.skippedForCooldown {
+            updatePoolProbe(for: &entry, primary: test, at: Date().timeIntervalSince1970, proxy: effProxy)
+            try history.mergePoolEvidence([entry])
+            if pickModels == nil || test.models.isEmpty { throw ParseError.io(test.detail) }
+        }
         // 端点报错但 /models 拿到了清单 ≠ 不能改选:恰恰是勾选的那个模型 503/429 才最需要
         // 换掉它。以前一报错就 throw,弹窗永远出不来(真实卡死 c30beaa0:模型改不了,
         // 又因 cc-switch 在跑删不掉 → 两头堵)。放行到弹窗,选完按新模型重探。
@@ -2732,11 +2898,11 @@ public final class Core {
             // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
-            let magpieNote = syncMagpieIfNeeded(entry)
+            let magpieNote = syncMagpieIfNeeded(&entry)
             // 必须在 ccSyncOrMigrate 之后再落盘:它可能就地修改 entry(targets/ccProviderID/models),
             // 提前落盘会把迁移结果丢掉,而旧 provider 已删 → 历史指向已删 provider 的孤儿态
             // (下面「模型无变化」分支即为此处的正确写法)
-            try history.update(entry)
+            try saveAfterMagpie(entry, previous: previousEntry)
             let keep = currentModels.isEmpty ? "无" : currentModels.joined(separator: ", ")
             let q = quotaNote.map { "(\($0) — 充值后刷新自动恢复)" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
@@ -2751,8 +2917,8 @@ public final class Core {
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
-            let magpieNote = syncMagpieIfNeeded(entry)
-            try history.update(entry)
+            let magpieNote = syncMagpieIfNeeded(&entry)
+            try saveAfterMagpie(entry, previous: previousEntry)
             let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
             let m = migrateNote.map { "\n\($0)" } ?? ""
             return "\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(test.detail) (\(test.models.count) 个模型,无变化)\(q)\(m)\(magpieNote)"
@@ -2856,8 +3022,8 @@ public final class Core {
             }
         }
         if let selectionTest { recordProbeResult(selectionTest, for: &entry) }
-        let magpieNote = syncMagpieIfNeeded(entry)
-        try history.update(entry)
+        let magpieNote = syncMagpieIfNeeded(&entry)
+        try saveAfterMagpie(entry, previous: previousEntry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
         let w = syncWarn.map { "\n\($0)" } ?? ""
         let r = retestNote == nil ? "" : "\n\(history.find(idPrefix: entry.id)?.availability.label ?? entry.availability.label): \(entry.healthDetail ?? "")"
@@ -2906,6 +3072,7 @@ public final class Core {
         if entry.isDSHOnly && (models != nil || newKey != nil) {
             throw ParseError.io("请通过「仅导入 DSH」更新此条目的模型或凭据")
         }
+        let previousEntry = entry
 
         var lines: [String] = []
         let previousModels = entry.configuredModels
@@ -2969,6 +3136,7 @@ public final class Core {
                         if check.ok { editUsedProxy = true }
                     }
                     if check.ok {
+                        entry.apiStyle = check.style
                         verified.append(m)
                         editModelPoints[m] = ProbePoint(t: editProbeNow, ms: nil, ok: true)
                     } else {
@@ -3204,9 +3372,9 @@ public final class Core {
             entry.failStreak = nil
             recordProbeResult(result, for: &entry)
         }
-        let magpieNote = syncMagpieIfNeeded(entry)
+        let magpieNote = syncMagpieIfNeeded(&entry)
         if !magpieNote.isEmpty { lines.append(magpieNote.trimmingCharacters(in: .newlines)) }
-        do { try history.update(entry) }
+        do { try saveAfterMagpie(entry, previous: previousEntry) }
         catch {
             if let writer = poolRotationWriter {
                 do { _ = try writer.rotateKey(baseURL: url, oldKey: effectiveKey, newKey: previousKey) }
@@ -3441,11 +3609,20 @@ public final class Core {
             return "Grok Build: \(msg)"
         case "magpie":
             let alreadyHadMagpie = entry.targets.contains("magpie")
-            let msg = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key, models: models, apiStyle: entry.apiStyle)
-            if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
-            do { try history.update(entry) }
+            let previous = entry
+            let msg: String
+            do { msg = try syncMagpie(&entry) }
             catch {
-                if !alreadyHadMagpie { try? MagpieWriter.remove(providerID: entry.id) }
+                if alreadyHadMagpie {
+                    entry.targetSyncErrors = entry.targetSyncErrors ?? [:]
+                    entry.targetSyncErrors?["magpie"] = error.localizedDescription
+                    try history.update(entry)
+                }
+                throw error
+            }
+            if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
+            do { try saveAfterMagpie(entry, previous: previous) }
+            catch {
                 throw ParseError.io("Magpie 已写入但账本保存失败: \(error.localizedDescription)")
             }
             return "Magpie: \(msg)"
@@ -3544,7 +3721,7 @@ public final class Core {
         }
         if entry.targets.contains("magpie") {
             do {
-                let msg = try MagpieWriter.remove(providerID: entry.id)
+                let msg = try MagpieWriter.remove(providerID: entry.id, expectedDestinationID: entry.magpieDestinationID)
                 if msg.isEmpty {
                     lines.append("– Magpie: 未找到本条目的行,跳过")
                 } else {

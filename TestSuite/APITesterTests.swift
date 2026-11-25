@@ -59,6 +59,7 @@ final class MockHTTPServer {
     var magpieSeen: [String] = []
     var magpieExpectedKey: String? = nil
     var magpieFailSave = false
+    var magpieAfterSave: (() -> Void)? = nil
     var magpieIgnoreSave = false
     var magpieIgnoreDelete = false
     var magpiePublicShape = false
@@ -406,6 +407,17 @@ final class MockHTTPServer {
             respond(client, 200, "OK", payload, contentType: "application/json")
             return
         }
+        if target == "/api/provider/key", method == "POST" {
+            guard let id = body["id"] as? String,
+                  let provider = magpieProviders.first(where: { $0["id"] as? String == id }),
+                  let key = provider["key"] as? String,
+                  let data = try? JSONSerialization.data(withJSONObject: ["key": key]),
+                  let payload = String(data: data, encoding: .utf8) else {
+                respond(client, 404, "Not Found", "{}"); return
+            }
+            respond(client, 200, "OK", payload, contentType: "application/json")
+            return
+        }
         if target == "/api/provider/save" {
             magpieSaveCount += 1
             if magpieFailSave { respond(client, 503, "Unavailable", "{}"); return }
@@ -416,6 +428,7 @@ final class MockHTTPServer {
             if let id = body["id"] as? String {
                 magpieProviders.removeAll { ($0["id"] as? String) == id }
                 magpieProviders.append(body)
+                magpieAfterSave?()
             }
             let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
             respond(client, 200, "OK", payload, contentType: "application/json")

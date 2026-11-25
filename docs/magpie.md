@@ -19,3 +19,11 @@ KeyDrop --add '<URL 和 key>' --magpie --no-cc --no-grok --no-cpa --no-dsh --mod
 开发验证：`KEYDROP_TEST_FILTER=Magpie .build/debug/KeyDropTestRunner`。测试可使用 `KEYDROP_MAGPIE_BIN` 和 `KEYDROP_MAGPIE_CONFIG_HOME` 指定隔离的 CLI 与配置根目录（该目录下的 `magpie/providers.json`）。本机官方 CLI 未额外指定时遵循 `XDG_CONFIG_HOME`。
 
 2026-11-23 在 Magpie 0.1.2122 实测：临时本地上游的 OpenAI Chat、Anthropic Messages、Responses 经真实 Magpie 网关返回正确响应；重复同步、换 key、精选模型、删除均通过，原有 providers 校验一致。测试不调用付费上游。
+
+1.4.65（2026-11-25）补齐 Responses-only 的完整自动导入链路，包括直接粘贴 `/v1/responses` 和无 `/models` 时显式提供模型。请求命令、刷新与编辑沿用实测协议。真实 KeyDrop CLI → 本机 Magpie → 临时 Responses 上游的原生调用与完整生命周期也已验证。
+
+新写入的记录保存 Magpie 实例标识（地址摘要，不含管理 key）。修改管理链接不会自动迁移旧记录；旧记录的同步、重放、删除要求恢复原实例设置。成功同步旧版记录时会补齐实例标识。远端账本的实例标识不会用于认领本机实例。
+
+同步失败显示「目标配置同步失败，需重试」，不会因上游探测成功而进入可用区。行内重新同步或刷新成功后清除状态。本机命令失败但配置完全读回一致时仍登记归属。Web 模式除核对地址和所选模型外，还调用官方 `/api/provider/key` 接口核验实际密钥；列表中相同的密钥掩码不能证明轮换已生效。核验接口不可用时报告失败，不把写入当作已确认。
+
+账本保存失败时，本次导入返回失败；重复导入返回原有记录，并且不追加本次探测数据。Magpie 原有配置会尝试恢复，首次新增的 Magpie 目标会尝试清理。回滚前核对地址、实际密钥和模型，发现已被其他写入者修改则停止回滚并报告原因。偏好保存失败单独提示，不撤销已经保存的导入记录。

@@ -9,6 +9,25 @@ public enum MagpieWriter {
         public let webKey: String
     }
 
+    public struct ProviderState {
+        let baseURL: String
+        let key: String
+        let models: [String]
+        let apiStyle: String?
+    }
+
+    private static func matches(_ row: [String: Any], _ state: ProviderState, web: WebClient? = nil) throws -> Bool {
+        let urls = try endpoints(state.baseURL, apiStyle: state.apiStyle)
+        let selected = row["chosen"] as? [String] ?? row["models"] as? [String] ?? []
+        guard Set(selected) == Set(state.models),
+              ["chat", "responses", "anthropic"].allSatisfy({ (row[$0] as? String ?? "") == urls[$0] }) else { return false }
+        // 列表里的掩码不能验证密钥轮换，也不能用于决定是否覆盖另一个写入者。
+        if let web, let id = row["id"] as? String {
+            return try web.providerKey(id: id) == state.key
+        }
+        return row["key"] as? String == state.key
+    }
+
     public static func parseWebLink(_ raw: String) -> Config? {
         guard var c = URLComponents(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
               ["http", "https"].contains(c.scheme?.lowercased() ?? ""),
@@ -154,6 +173,13 @@ public enum MagpieWriter {
             guard let rows = obj["providers"] as? [[String: Any]] else { throw WriterError.file("Magpie 响应缺 providers 列表") }
             return rows
         }
+        func providerKey(id: String) throws -> String {
+            let obj = try request("/api/provider/key", body: ["id": id])
+            guard let key = obj["key"] as? String else {
+                throw WriterError.file("Magpie 未返回可核验的 provider 凭据")
+            }
+            return key
+        }
     }
 
     public static func providerName(providerID: String, baseURL: String) -> String {
@@ -201,8 +227,28 @@ public enum MagpieWriter {
                 "anthropic": field == "anthropic" ? url : "", "baseAPI": field]
     }
 
-    private static func withDestination<T>(_ body: (WebClient?, String?) throws -> T) throws -> T {
+    /// 本地配置根或远端管理地址的摘要；不包含管理凭据，换登录 key 不改变实例归属。
+    public static func destinationID() throws -> String {
         let link = (Prefs.shared.magpieWebLink ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return try destinationID(link: link)
+    }
+
+    private static func destinationID(link: String) throws -> String {
+        let destination: String
+        if link.isEmpty {
+            destination = "local:" + URL(fileURLWithPath: configRoot).standardizedFileURL.resolvingSymlinksInPath().path
+        } else {
+            guard let config = parseWebLink(link) else { throw WriterError.file("Magpie Web 链接无效") }
+            destination = "web:" + config.baseURL
+        }
+        return SHA256.hash(data: Data(destination.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func withDestination<T>(expected: String? = nil, _ body: (WebClient?, String?) throws -> T) throws -> T {
+        let link = (Prefs.shared.magpieWebLink ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if let expected, try destinationID(link: link) != expected {
+            throw WriterError.file("Magpie 实例已切换，此记录仍绑定原实例。请恢复原 Magpie 设置后重试；原配置的清理责任已保留")
+        }
         let cfg = link.isEmpty ? nil : parseWebLink(link)
         if !link.isEmpty && cfg == nil { throw WriterError.file("Magpie Web 链接无效，请粘贴含 ?k= 的完整链接或清空以使用本机") }
         let executable = cfg == nil ? localExecutable() : nil
@@ -221,16 +267,22 @@ public enum MagpieWriter {
     }
 
     public static func sync(providerID: String, baseURL: String, key: String,
-                            models: [String], apiStyle: String? = nil) throws -> String {
+                            models: [String], apiStyle: String? = nil, expectedDestinationID: String? = nil,
+                            onlyIfMatches: ProviderState? = nil) throws -> String {
         guard providerID.range(of: "^[a-zA-Z0-9-]+$", options: .regularExpression) != nil,
               !key.isEmpty, !models.isEmpty,
               models.allSatisfy({ !$0.isEmpty && !$0.contains(",") && !$0.contains("\n") }) else {
             throw WriterError.file("Magpie 导入需要有效的记录 ID、key 和模型列表")
         }
         let endpoints = try endpoints(baseURL, apiStyle: apiStyle)
-        return try withDestination { web, executable in
+        return try withDestination(expected: expectedDestinationID) { web, executable in
             let rows = try web?.providers() ?? localProviders()
             let existing = try owned(rows, providerID: providerID)
+            if let onlyIfMatches {
+                guard let existing, try matches(existing, onlyIfMatches, web: web) else {
+                    throw WriterError.file("Magpie 配置已被其他写入方修改或无法确认凭据，已停止回滚，请检查后重试")
+                }
+            }
             let id = existing?["id"] as? String ?? "keydrop-" + providerID.lowercased()
             let name = providerName(providerID: providerID, baseURL: baseURL)
             if let web {
@@ -245,34 +297,44 @@ public enum MagpieWriter {
                 payload["models"] = models; payload["keyProtocol"] = ""
                 _ = try web.request("/api/provider/save", body: payload)
                 guard let saved = try web.providers().first(where: { $0["id"] as? String == id }),
-                      Set(saved["chosen"] as? [String] ?? saved["models"] as? [String] ?? []) == Set(models),
-                      ["chat", "responses", "anthropic"].allSatisfy({ (saved[$0] as? String ?? "") == endpoints[$0] }) else {
+                      try matches(saved, .init(baseURL: baseURL, key: key, models: models, apiStyle: apiStyle), web: web) else {
                     throw WriterError.file("Magpie 写入未确认，请检查 Magpie 界面")
                 }
             } else if let executable {
                 var args = existing == nil ? ["provider", "add", name, "id=" + id] : ["provider", "set", id, "name=" + name]
                 args += ["key=" + key, "models=" + models.joined(separator: ",")]
                 args += ["chat", "responses", "anthropic"].map { $0 + "=" + endpoints[$0]! }
-                try runCLI(executable, args, secret: key)
+                // 命令可能先落盘、后在通知网关阶段失败。读回完整字段后再决定结果。
+                var commandError: Error?
+                do { try runCLI(executable, args, secret: key) } catch { commandError = error }
                 guard let saved = try localProviders().first(where: { $0["id"] as? String == id }),
                       saved["key"] as? String == key,
                       Set(saved["models"] as? [String] ?? []) == Set(models),
                       ["chat", "responses", "anthropic"].allSatisfy({ (saved[$0] as? String ?? "") == endpoints[$0] }) else {
-                    throw WriterError.file("Magpie 写入后核验失败，请检查 Magpie 的 provider 配置")
+                    throw commandError ?? WriterError.file("Magpie 写入后核验失败，请检查 Magpie 的 provider 配置")
                 }
             }
             return "已\(existing == nil ? "新建" : "更新") provider「\(name)」(\(models.count) 个模型)"
         }
     }
 
-    public static func remove(providerID: String) throws -> String {
-        try withDestination { web, executable in
+    public static func remove(providerID: String, expectedDestinationID: String? = nil,
+                              onlyIfMatches: ProviderState? = nil) throws -> String {
+        try withDestination(expected: expectedDestinationID) { web, executable in
             let rows = try web?.providers() ?? localProviders()
             guard let target = try owned(rows, providerID: providerID), let id = target["id"] as? String else { return "" }
-            if let web { _ = try web.request("/api/provider/delete", body: ["id": id]) }
-            else if let executable { try runCLI(executable, ["provider", "rm", id]) }
+            if let onlyIfMatches, try !matches(target, onlyIfMatches, web: web) {
+                throw WriterError.file("Magpie 配置已被其他写入方修改，已停止回滚，请检查后重试")
+            }
+            var commandError: Error?
+            do {
+                if let web { _ = try web.request("/api/provider/delete", body: ["id": id]) }
+                else if let executable { try runCLI(executable, ["provider", "rm", id]) }
+            } catch { commandError = error }
             let remaining = try web?.providers() ?? localProviders()
-            guard !remaining.contains(where: { $0["id"] as? String == id }) else { throw WriterError.file("Magpie 删除未确认，请重试") }
+            guard !remaining.contains(where: { $0["id"] as? String == id }) else {
+                throw commandError ?? WriterError.file("Magpie 删除未确认，请重试")
+            }
             return "已移除「\(target["name"] as? String ?? id)」"
         }
     }

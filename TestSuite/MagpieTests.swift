@@ -3,6 +3,105 @@ import KeyDropCore
 
 enum MagpieTests {
     static func run(_ h: Harness) {
+        h.runSuite("Magpie.Audit.重复导入账本失败不能报告成功") { t in
+            let env = try TestEnv("magpie-audit-duplicate"); defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .magpie)
+            server.magpiePublicShape = true
+            Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server.port)/?k=test"
+            let core = Core()
+            let raw = "https://repeat.test/v1\nsk-repeat-fixture111111"
+            func add(_ model: String) throws -> AddOutcome {
+                try core.add(raw: raw, ccOverride: false, grokOverride: false, cpaOverride: false,
+                             dshOverride: false, magpieOverride: true, models: [model], force: true)
+            }
+            let original = try add("gpt-old")
+            server.magpieAfterSave = { env.write("home/history.json", "broken ledger") }
+            let result = try add("gpt-new")
+            t.expect(!result.ok, "已回滚的重复导入不得显示成功")
+            t.equal(result.entry.models, ["gpt-old"], "返回仍生效的原记录")
+            t.equal(server.magpieProviders.first?["models"] as? [String], ["gpt-old"], "原配置恢复")
+            t.equal(core.history.find(idPrefix: original.entry.id)?.models, ["gpt-old"], "内存账本保留原模型")
+            t.equal(env.read("home/history.json"), "broken ledger", "损坏文件保留")
+        }
+
+        h.runSuite("Magpie.Audit.远端密钥轮换独立核验") { t in
+            let env = try TestEnv("magpie-audit-key"); defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .magpie)
+            server.magpiePublicShape = true
+            Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server.port)/?k=test"
+            let id = "12345678-aaaa-bbbb-cccc-dddddddddddd"
+            let base = "https://relay.test/v1"
+            let original = "sk-x-original-same", replacement = "sk-x-replaced-same"
+            _ = try MagpieWriter.sync(providerID: id, baseURL: base, key: original, models: ["gpt-a"])
+            server.magpieIgnoreSave = true
+            do {
+                _ = try MagpieWriter.sync(providerID: id, baseURL: base, key: replacement, models: ["gpt-a"])
+                t.expect(false, "前后掩码一样但实际未换 key，不得报告成功")
+            } catch { t.contains(error.localizedDescription, "未确认", "读回报告配置不符") }
+            t.equal(server.magpieProviders.first?["key"] as? String, original, "未覆盖原密钥")
+            t.expect(server.magpieSeen.contains("POST /api/provider/key HTTP/1.1"), "通过独立接口核验实际密钥")
+            server.magpieIgnoreSave = false
+            _ = try MagpieWriter.sync(providerID: id, baseURL: base, key: replacement, models: ["gpt-a"])
+            t.equal(server.magpieProviders.first?["key"] as? String, replacement, "实际轮换后可以成功")
+        }
+
+        h.runSuite("Magpie.Audit.偏好保存失败保留已提交导入") { t in
+            let env = try TestEnv("magpie-audit-prefs"); defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .magpie)
+            Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server.port)/?k=test"
+            try FileManager.default.createDirectory(atPath: env.dir + "/home/prefs.json.keydrop-lock", withIntermediateDirectories: true)
+            let core = Core()
+            let result = try core.add(raw: "https://prefs.test/v1\nsk-magpie-prefs-fixture", ccOverride: false,
+                                      grokOverride: false, cpaOverride: false, dshOverride: false, magpieOverride: true,
+                                      models: ["gpt-fixture"], force: true)
+            t.expect(result.ok, "偏好保存失败不撤销已经提交的目标与账本")
+            t.equal(core.history.find(idPrefix: result.entry.id)?.models, ["gpt-fixture"], "导入账本仍然保存")
+            t.equal(server.magpieProviders.count, 1, "已提交 provider 不回滚")
+            t.expect(result.lines.contains { $0.contains("偏好保存失败") }, "提示独立的偏好保存错误")
+        }
+
+        h.runSuite("Magpie.Audit.旧记录新增目标账本失败清理产物") { t in
+            let env = try TestEnv("magpie-audit-add-target"); defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .magpie)
+            server.magpiePublicShape = true
+            Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server.port)/?k=test"
+            let core = Core()
+            let raw = "https://target.test/v1\nsk-add-target-fixture111111"
+            var original = HistoryTests.entry("abcdef12-aaaa-bbbb-cccc-dddddddddddd", ts: 1)
+            original.raw = raw; original.key = "sk-add-target-fixture111111"
+            original.url = "https://target.test/v1"; original.models = ["gpt-old"]; original.targets = []
+            try core.history.append(original)
+            server.magpieAfterSave = { env.write("home/history.json", "broken ledger") }
+            let result = try core.add(raw: raw, ccOverride: false, grokOverride: false, cpaOverride: false,
+                                      dshOverride: false, magpieOverride: true, models: ["gpt-new"], force: true)
+            t.expect(!result.ok, "账本失败不得报告新增目标成功")
+            t.equal(server.magpieProviders.count, 0, "新目标回滚，不留下无人认领的 provider")
+            t.equal(core.history.find(idPrefix: original.id)?.targets, [], "原账本保留未绑定状态")
+        }
+
+        h.runSuite("Magpie.Audit.订阅缺少凭据时保留原归属") { t in
+            let env = try TestEnv("magpie-audit-feed"); defer { env.cleanup() }
+            let server = try MockHTTPServer(mode: .magpie)
+            Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server.port)/?k=test"
+            let core = Core()
+            let original = try core.add(raw: "https://feed.test/v1\nsk-feed-fixture111111", ccOverride: false,
+                                        grokOverride: false, cpaOverride: false, dshOverride: false, magpieOverride: true,
+                                        models: ["gpt-feed"], force: true).entry
+            var incoming = original
+            incoming.raw = ""; incoming.key = nil; incoming.poolKeys = []
+            incoming.updatedAt = Date().timeIntervalSince1970 + 30
+            incoming.magpieDestinationID = "remote-machine-marker"
+            let payload = LedgerPayload(schemaVersion: LedgerCrypto.currentSchemaVersion, exportedAt: incoming.updatedAt!,
+                                        appVersion: "test", entries: [incoming], switches: nil)
+            let sealed = try LedgerCrypto.seal(JSONEncoder().encode(payload), passphrase: "feed-test-passphrase")
+            do {
+                _ = try core.importLedger(sealed, passphrase: "feed-test-passphrase", mode: .feed)
+                t.expect(false, "不能接收缺少目标凭据的订阅")
+            } catch { t.contains(error.localizedDescription, "Magpie", "说明无法更新的目标") }
+            let saved = core.history.find(idPrefix: original.id)!
+            t.equal(saved.key, original.key, "原记录保留重试所需的 key")
+            t.equal(saved.magpieDestinationID, original.magpieDestinationID, "不能复制远端实例绑定")
+        }
         h.runSuite("Magpie.Web 协议、真实响应与幂等") { t in
             let env = try TestEnv("magpie-web"); defer { env.cleanup() }
             let server = try MockHTTPServer(mode: .magpie)

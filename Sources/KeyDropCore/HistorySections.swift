@@ -15,7 +15,7 @@ public struct HistorySections {
         let limit = max(0, limit)
         for e in entries.filter({ $0.status == "active" }).sorted(by: { $0.ts > $1.ts }) {
             let availability = e.availability
-            if availability == .chainError || availability == .partial || availability == .retry {
+            if availability == .chainError || availability == .partial || availability == .retry || availability == .syncError || availability == .poolPartial {
                 warnCount += 1
             } else if availability == .available || availability == .proxyAvailable {
                 okCount += 1
@@ -32,7 +32,7 @@ public struct HistorySections {
                 if quota.count < limit { quota.append(e) }
             case .available, .proxyAvailable:
                 if available.count < limit { available.append(e) }
-            case .partial, .chainError, .retry:
+            case .partial, .chainError, .retry, .syncError, .poolPartial:
                 if attention.count < limit { attention.append(e) }
             case .unverified, .reachable, .dshOnly, .chainUnverified:
                 if unverified.count < limit { unverified.append(e) }

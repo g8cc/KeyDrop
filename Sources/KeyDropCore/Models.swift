@@ -4,6 +4,8 @@ public struct ParsedKey {
     public init() {}
     public var name: String? = nil
     public var url: String? = nil
+    /// Wire protocol explicitly named by the supplied endpoint, retained after URL normalization.
+    public var apiStyle: String? = nil
     public var key: String? = nil
     public var model: String? = nil
     public var models: [String]? = nil
