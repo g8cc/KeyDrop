@@ -222,6 +222,23 @@ enum MagpieTests {
                 t.equal(server.magpieProviders.count, 0, "凭据与模型精确匹配后安全补偿删除新 provider")
                 t.expect(core.history.find(idPrefix: clean.entry.id) == nil, "已确认删除后无需创建清理账本")
 
+                let deleteCount = server.magpieDeleteCount
+                server.magpieAfterSave = { [weak server] in
+                    guard let server, let index = server.magpieProviders.indices.first else { return }
+                    // Simulate another Magpie client changing the just-created row before
+                    // KeyDrop's compensation readback; the changed provider must survive.
+                    server.magpieProviders[index]["key"] = "sk-external-client-change"
+                }
+                let changed = try core.add(raw: "https://relay.test/v1\nsk-magpie-readback-changed", ccOverride: false,
+                                           grokOverride: false, cpaOverride: false, dshOverride: false,
+                                           magpieOverride: true, models: ["glm-5.2"], force: true)
+                t.expect(!changed.ok, "外部修改后的写入不能报告成功")
+                t.equal(server.magpieProviders.first?["key"] as? String, "sk-external-client-change",
+                        "补偿不会删除已被其他客户端修改的 provider")
+                t.equal(server.magpieDeleteCount, deleteCount, "状态不匹配时不调用按 ID 删除")
+                t.expect(core.history.find(idPrefix: changed.entry.id)?.targets.contains("magpie") == true,
+                         "未决 provider 仍由账本保留清理责任")
+
                 let env2 = try TestEnv("magpie-readback-pending"); defer { env2.cleanup() }
                 let server2 = try MockHTTPServer(mode: .magpie)
                 Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server2.port)/?k=test"

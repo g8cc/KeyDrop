@@ -294,7 +294,9 @@ public final class Core {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         var subFetchError: Error? = nil
         var subProxies: [ClashProxy]? = nil
-        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://"), !trimmed.contains("\n") {
+        let isSingleURL = (trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://"))
+            && trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
+        if isSingleURL {
             do {
                 subProxies = try Self.fetchSubscriptionProxies(url: trimmed)
             } catch {

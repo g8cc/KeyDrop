@@ -46,6 +46,10 @@ final class MockHTTPServer {
         mgmtLock.lock(); defer { mgmtLock.unlock() }
         return requestCounts[path] ?? 0
     }
+    var totalRequestCount: Int {
+        mgmtLock.lock(); defer { mgmtLock.unlock() }
+        return requestCounts.values.reduce(0, +)
+    }
     var cpaYAML = "# cpa-mgmt-sentinel\nport: 8317\n"
     var cpaPutBody = ""
     var cpaPatchBody = ""

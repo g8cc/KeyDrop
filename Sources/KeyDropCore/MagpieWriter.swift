@@ -216,7 +216,10 @@ public enum MagpieWriter {
 
     /// Compensate a failed first-time Web write only after proving the row still has
     /// the exact URL, secret, and model set KeyDrop attempted to create. A changed or
-    /// unverifiable row is left untouched and reported as potentially present.
+    /// unverifiable row is left untouched and reported as potentially present. Magpie's
+    /// Web API only deletes by ID, not by an expected-state condition, so another client
+    /// can still update the row between this readback and delete; the destination lock
+    /// serializes KeyDrop writers, but that external race cannot be made atomic here.
     private static func compensateWebCreate(_ web: WebClient, id: String, state: ProviderState) -> Bool {
         do {
             guard let row = try web.providers().first(where: { $0["id"] as? String == id }) else { return true }

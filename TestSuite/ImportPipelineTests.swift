@@ -218,6 +218,21 @@ enum ImportPipelineTests {
             t.contains(e5.read("cpa-config.yaml"), "https://route.example.com/v1", "[cpa] base-url 写入")
         }
 
+        h.runSuite("导入管线.单行 URL+key 不触发订阅请求") { t in
+            let (env, core) = makeEnv("pipe-single-line-url-key")
+            defer { env.cleanup() }
+            let server = try MockHTTPServer()
+            let key = "sk-single-line-url-key-fixture"
+            let result = try core.add(
+                raw: "http://127.0.0.1:\(server.port)/v1 \(key)",
+                ccOverride: true, grokOverride: false, cpaOverride: false,
+                dshOverride: false, models: ["gpt-5.6-sol"], force: true,
+                appType: "codex", appTypeForced: true
+            )
+            t.expect(result.ok, "单行 URL + key 仍可导入")
+            t.equal(server.totalRequestCount, 0, "凭据文本不会被当作远端订阅 URL 拉取")
+        }
+
         // MARK: - URL 规范化:同一粘贴 URL 在不同目标里的正确形态
 
         h.runSuite("导入管线.URL 规范化按目标") { t in
