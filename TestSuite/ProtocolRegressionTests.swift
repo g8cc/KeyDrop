@@ -7,16 +7,25 @@ final class ProtocolRegressionServer {
     let chatStatus: Int
     let chatBody: String
     let responsesBody: String
+    let chatRetryAfter: String?
+    var unversionedChatStatus: Int? = nil
+    var unversionedChatBody: String? = nil
+    var unversionedChatRetryAfter: String? = nil
     private let lock = NSLock()
     private var paths: [String] = []
     var base: String { "http://127.0.0.1:\(listener.port)/v1" }
+    var root: String { "http://127.0.0.1:\(listener.port)" }
     static let model = "gpt-protocol-fixture"
     static let chat = #"{"choices":[{"message":{"content":"fixture ok"}}]}"#
     static let responses = #"{"object":"response","status":"completed","error":null,"output":[{"type":"message","content":[{"type":"output_text","text":"fixture ok"}]}]}"#
     init(chatStatus: Int = 403, chatBody: String = #"{"error":{"message":"This route is not enabled"}}"#,
-         responsesBody: String = responses) throws {
+         responsesBody: String = responses, chatRetryAfter: String? = nil,
+         unversionedChatStatus: Int? = nil, unversionedChatBody: String? = nil,
+         unversionedChatRetryAfter: String? = nil) throws {
         listener = try TCPServer(); self.chatStatus = chatStatus
-        self.chatBody = chatBody; self.responsesBody = responsesBody
+        self.chatBody = chatBody; self.responsesBody = responsesBody; self.chatRetryAfter = chatRetryAfter
+        self.unversionedChatStatus = unversionedChatStatus; self.unversionedChatBody = unversionedChatBody
+        self.unversionedChatRetryAfter = unversionedChatRetryAfter
         let listener = listener
         Thread.detachNewThread { [weak self] in
             while let client = listener.accept() {
@@ -35,14 +44,20 @@ final class ProtocolRegressionServer {
         let method = String(first[0]), path = String(first[1])
         lock.lock(); paths.append(path); lock.unlock()
         var status = 404, body = #"{"error":{"message":"route not found"}}"#
-        if method == "GET", path == "/v1/models" {
+        if method == "GET", path == "/v1/models" || path == "/models" {
             status = 200; body = "{\"data\":[{\"id\":\"\(Self.model)\"}]}"
+        } else if method == "POST", path == "/chat/completions" {
+            status = unversionedChatStatus ?? 404
+            body = unversionedChatBody ?? #"{\"error\":{\"message\":\"route not found\"}}"#
         } else if method == "POST", path == "/v1/chat/completions" {
             status = chatStatus; body = chatBody
         } else if method == "POST", path == "/v1/responses" {
             status = 200; body = responsesBody
         }
-        client.write("HTTP/1.1 \(status) Fixture\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)")
+        let retryAfter = path == "/chat/completions" ? unversionedChatRetryAfter : chatRetryAfter
+        let retryHeader = method == "POST" && (path == "/v1/chat/completions" || path == "/chat/completions")
+            ? retryAfter.map { "Retry-After: \($0)\r\n" } ?? "" : ""
+        client.write("HTTP/1.1 \(status) Fixture\r\nContent-Type: application/json\r\n\(retryHeader)Content-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)")
     }
 }
 
@@ -117,6 +132,45 @@ enum ProtocolRegressionTests {
             t.expect(result.ok, "explicit working Responses route imports")
             t.equal(result.entry.apiStyle, "responses", "actual protocol is saved")
             t.equal(server.count("/v1/chat/completions"), 0, "explicit route must not try forbidden chat route")
+        }
+        h.runSuite("ProtocolRegression.rate limit cooldown is isolated by protocol route") { t in
+            let env = try TestEnv("protocol-route-cooldown"); defer { env.cleanup() }
+            let server = try ProtocolRegressionServer(chatStatus: 429,
+                chatBody: #"{"error":{"message":"rate limited"}}"#, chatRetryAfter: "86400")
+            let key = "sk-protocol-cooldown111111"
+            let chat = APITester.test(url: server.base, key: key, timeout: 2,
+                preferredModel: ProtocolRegressionServer.model, styleHint: "openai")
+            t.expect(!chat.ok && chat.detail.contains("429"), "first Chat request records the server rate limit")
+            t.equal(server.count("/v1/chat/completions"), 1, "first Chat probe reaches its route")
+
+            let repeatedChat = APITester.test(url: server.base, key: key, timeout: 2,
+                preferredModel: ProtocolRegressionServer.model, styleHint: "openai")
+            t.expect(repeatedChat.skippedForCooldown, "same Chat route is skipped during Retry-After")
+            t.equal(server.count("/v1/chat/completions"), 1, "cached Chat cooldown avoids another request")
+
+            let responses = APITester.test(url: server.base, key: key, timeout: 2,
+                preferredModel: ProtocolRegressionServer.model, styleHint: "responses")
+            t.expect(responses.ok, "Responses remains probeable while Chat is rate limited")
+            t.equal(responses.style, "responses", "Responses success keeps its own protocol")
+            t.equal(server.count("/v1/responses"), 1, "Responses route is actually requested")
+        }
+        h.runSuite("ProtocolRegression.unversioned Chat aliases share cooldown") { t in
+            let env = try TestEnv("protocol-unversioned-cooldown"); defer { env.cleanup() }
+            let server = try ProtocolRegressionServer(chatStatus: 200,
+                unversionedChatStatus: 429, unversionedChatBody: #"{\"error\":{\"message\":\"rate limited\"}}"#,
+                unversionedChatRetryAfter: "86400")
+            let key = "sk-protocol-unversioned111111"
+            let first = APITester.test(url: server.root, key: key, timeout: 2,
+                preferredModel: ProtocolRegressionServer.model, styleHint: "openai")
+            t.expect(!first.ok && first.detail.contains("429"), "unversioned Chat mount rate limit is recorded")
+            t.equal(server.count("/chat/completions"), 1, "first equivalent mount is attempted")
+            t.equal(server.count("/v1/chat/completions"), 0, "rate limit prevents fallback to equivalent mount")
+
+            let second = APITester.test(url: server.root, key: key, timeout: 2,
+                preferredModel: ProtocolRegressionServer.model, styleHint: "openai")
+            t.expect(second.skippedForCooldown, "cooldown suppresses both equivalent Chat mounts")
+            t.equal(server.count("/chat/completions"), 1, "unversioned route is not retried")
+            t.equal(server.count("/v1/chat/completions"), 0, "versioned alias does not bypass cooldown")
         }
         h.runSuite("ProtocolRegression.wrong success envelope cannot select chat") { t in
             let env = try TestEnv("protocol-wrong-envelope"); defer { env.cleanup() }

@@ -836,6 +836,98 @@ public final class HistoryStore {
         }
     }
 
+    /// Commit a long-running edit only if the configuration it started from is still current.
+    /// This prevents a completed probe/model refresh from replacing a key or model edited
+    /// while its network requests or picker were in flight.
+    @discardableResult
+    func updateIfUnchanged(_ e: HistoryEntry, matching expected: HistoryEntry) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let i = _items.firstIndex(where: { $0.id == e.id }),
+                  [expected.probeConfigurationID, e.probeConfigurationID].contains(_items[i].probeConfigurationID),
+                  Self.sameProbeConfiguration(_items[i], expected, allowingDSHOnly: true) else { return false }
+            let current = _items[i]
+            var merged = current
+            // Merge fields changed by this operation onto the latest ledger row. If both
+            // the operation and another writer changed the same non-health field, reject
+            // the commit instead of silently replacing either writer's value.
+            func field<T: Equatable>(_ candidate: T, _ original: T, _ latest: T) -> (value: T, conflict: Bool) {
+                if candidate == original { return (latest, false) }
+                if latest == original || latest == candidate { return (candidate, false) }
+                return (latest, true)
+            }
+            var conflict = false
+            func merge<T: Equatable>(_ kp: WritableKeyPath<HistoryEntry, T>) {
+                let result = field(e[keyPath: kp], expected[keyPath: kp], current[keyPath: kp])
+                merged[keyPath: kp] = result.value
+                conflict = conflict || result.conflict
+            }
+            merge(\.raw); merge(\.format); merge(\.name); merge(\.url); merge(\.model); merge(\.models)
+            merge(\.key); merge(\.poolKeys); merge(\.keyMasked); merge(\.targets)
+            merge(\.ccProviderID); merge(\.ccRenamedFrom); merge(\.ccRenamedTo)
+            merge(\.cpaConfigPath); merge(\.grokConfigPath); merge(\.status); merge(\.note)
+            merge(\.ccMissing); merge(\.clashFile); merge(\.deletedAt)
+            merge(\.verifyVerdict); merge(\.verifyVerdicts); merge(\.dshMissingAt)
+            merge(\.apiStyle); merge(\.magpieDestinationID); merge(\.targetSyncErrors)
+            guard !conflict else { return false }
+
+            // Health is a time-ordered value group. A probe that started earlier may
+            // finish later, so keep the row with the newer healthAt timestamp.
+            let candidateChangedHealth = e.health != expected.health || e.healthDetail != expected.healthDetail
+                || e.healthAt != expected.healthAt || e.latencyMs != expected.latencyMs
+                || e.failStreak != expected.failStreak || e.viaCPAOk != expected.viaCPAOk
+                || e.viaCPAAt != expected.viaCPAAt
+            let currentChangedHealth = current.health != expected.health || current.healthDetail != expected.healthDetail
+                || current.healthAt != expected.healthAt || current.latencyMs != expected.latencyMs
+                || current.failStreak != expected.failStreak || current.viaCPAOk != expected.viaCPAOk
+                || current.viaCPAAt != expected.viaCPAAt
+            let candidateAt = e.healthAt ?? -.infinity
+            let currentAt = current.healthAt ?? -.infinity
+            let useCurrentHealth = !candidateChangedHealth || (currentChangedHealth && currentAt >= candidateAt)
+            let healthSource = useCurrentHealth ? current : e
+            merged.health = healthSource.health
+            merged.healthDetail = healthSource.healthDetail
+            merged.healthAt = healthSource.healthAt
+            merged.latencyMs = healthSource.latencyMs
+            merged.failStreak = healthSource.failStreak
+            merged.viaCPAOk = healthSource.viaCPAOk
+            merged.viaCPAAt = healthSource.viaCPAAt
+
+            if current.probeConfigurationID != e.probeConfigurationID || current.legacyProbeInvalidated == true {
+                merged.legacyProbeInvalidated = true
+            }
+            merged.updatedAt = Date().timeIntervalSince1970
+            // As in update(), monitoring logs are owned by the store and cannot be rolled
+            // back by the long-lived entry snapshot. Pool evidence is merged by credential
+            // identity and the configuration that will be committed.
+            merged.probeLog = _items[i].probeLog
+            merged.modelProbeLog = _items[i].modelProbeLog
+            merged.poolProbeLog = Self.mergedPoolEvidence(current: current.poolProbeLog, incoming: e.poolProbeLog, for: merged)
+            let previous = current
+            _items[i] = merged
+            do { try saveLockedNoFlock(dirtyIDs: [e.id]) }
+            catch { _items[i] = previous; throw error }
+            return true
+        }
+    }
+
+    /// Recheck a long-running operation's source configuration while holding the store lock.
+    /// `candidate` may carry an API style learned by that operation; all credential, URL,
+    /// model and CPA inputs must still match the original snapshot.
+    func matchesCurrentConfiguration(_ expected: HistoryEntry, allowing candidate: HistoryEntry? = nil) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return (try? FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let current = _items.first(where: { $0.id == expected.id }),
+                  Self.sameProbeConfiguration(current, expected, allowingDSHOnly: true) else { return false }
+            let allowed = [expected.probeConfigurationID, candidate?.probeConfigurationID].compactMap { $0 }
+            return allowed.contains(current.probeConfigurationID)
+        }) ?? false
+    }
+
     private static func mergedPoolEvidence(current: [String: [String: ProbePoint]]?,
                                            incoming: [String: [String: ProbePoint]]?,
                                            for entry: HistoryEntry) -> [String: [String: ProbePoint]]? {
@@ -854,8 +946,9 @@ public final class HistoryStore {
         return log
     }
 
-    private static func sameProbeConfiguration(_ current: HistoryEntry, _ tested: HistoryEntry) -> Bool {
-        current.status == "active" && !current.isDSHOnly &&
+    private static func sameProbeConfiguration(_ current: HistoryEntry, _ tested: HistoryEntry,
+                                               allowingDSHOnly: Bool = false) -> Bool {
+        current.status == "active" && (allowingDSHOnly || !current.isDSHOnly) &&
             current.format == tested.format && current.url == tested.url && current.key == tested.key &&
             current.credentialKeys == tested.credentialKeys &&
             current.model == tested.model && current.models == tested.models &&
@@ -1000,6 +1093,56 @@ public final class HistoryStore {
                 for (index, entry) in previous { _items[index] = entry }
                 throw error
             }
+        }
+    }
+
+    /// Atomically records a manual probe only while its tested credential/model configuration
+    /// is still current. Result points are appended to the current logs, so a stale snapshot
+    /// cannot overwrite concurrent edits or roll back newer monitoring data.
+    @discardableResult
+    func mergeManualProbe(_ tested: HistoryEntry, matching expected: HistoryEntry, expectedConfigurationID: String, at: TimeInterval,
+                          keyPoint: ProbePoint?, modelPoints: [String: ProbePoint]) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return try FileLock.withLock(FileLock.lockPath(for: fileURL.path)) {
+            refreshIfExternalChangeLocked()
+            guard let i = _items.firstIndex(where: { $0.id == tested.id }) else { return false }
+            let current = _items[i]
+            guard current.probeConfigurationID == expectedConfigurationID,
+                  Self.sameProbeConfiguration(current, expected),
+                  (current.healthAt ?? -.infinity) <= at else { return false }
+
+            var updated = current
+            updated.health = tested.health
+            updated.healthDetail = tested.healthDetail
+            updated.healthAt = at
+            updated.apiStyle = tested.apiStyle
+            updated.failStreak = tested.failStreak
+            updated.viaCPAOk = tested.viaCPAOk
+            updated.viaCPAAt = tested.viaCPAAt
+            updated.poolProbeLog = Self.mergedPoolEvidence(current: current.poolProbeLog, incoming: tested.poolProbeLog, for: updated)
+            updated.updatedAt = max(current.updatedAt ?? 0, at)
+
+            if var point = keyPoint {
+                if point.configurationID == nil { point.configurationID = updated.probeConfigurationID }
+                var log = (updated.probeLog ?? []) + [point]
+                if log.count > 30 { log = Array(log.suffix(30)) }
+                updated.probeLog = log
+            }
+            if !modelPoints.isEmpty {
+                var log = updated.modelProbeLog ?? [:]
+                for (model, point) in modelPoints where point.configurationID == updated.probeConfigurationID {
+                    var points = (log[model] ?? []) + [point]
+                    if points.count > 30 { points = Array(points.suffix(30)) }
+                    log[model] = points
+                }
+                updated.modelProbeLog = log
+            }
+
+            _items[i] = updated
+            do { try saveLockedNoFlock(dirtyIDs: [tested.id]) }
+            catch { _items[i] = current; throw error }
+            return true
         }
     }
 

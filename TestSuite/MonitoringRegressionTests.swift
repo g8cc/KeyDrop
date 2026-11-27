@@ -8,8 +8,12 @@ private final class MonitoringHTTPServer {
     let missingCatalog: Bool
     let catalogUnavailable: Bool
     let unavailableModels: Set<String>
+    let chatEntered = DispatchSemaphore(value: 0)
+    let releaseChat = DispatchSemaphore(value: 0)
+    let stallChat: Bool
     private let lock = NSLock()
     private var requestedModels: [String] = []
+    private var didStallChat = false
     func requestCount(for model: String) -> Int {
         lock.lock(); defer { lock.unlock() }
         return requestedModels.filter { $0 == model }.count
@@ -19,13 +23,14 @@ private final class MonitoringHTTPServer {
     static let models = ["gpt-monitor-ok", "gpt-monitor-denied", "gpt-monitor-failed"]
 
     init(partial: Bool = true, cooldown: Bool = false, missingCatalog: Bool = false, catalogUnavailable: Bool = false,
-         unavailableModels: Set<String> = []) throws {
+         unavailableModels: Set<String> = [], stallChat: Bool = false) throws {
         listener = try TCPServer()
         self.partial = partial
         self.cooldown = cooldown
         self.missingCatalog = missingCatalog
         self.catalogUnavailable = catalogUnavailable
         self.unavailableModels = unavailableModels
+        self.stallChat = stallChat
         let listener = listener
         Thread.detachNewThread { [weak self] in
             while let client = listener.accept() {
@@ -52,6 +57,14 @@ private final class MonitoringHTTPServer {
             let object = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any]
             let model = object?["model"] as? String
             if let model { lock.lock(); requestedModels.append(model); lock.unlock() }
+            lock.lock()
+            let shouldStall = stallChat && !didStallChat
+            if shouldStall { didStallChat = true }
+            lock.unlock()
+            if shouldStall {
+                chatEntered.signal()
+                _ = releaseChat.wait(timeout: .now() + 10)
+            }
             if let model, unavailableModels.contains(model) {
                 status = 400
                 body = #"{"error":{"message":"unknown provider for model"}}"#
@@ -89,6 +102,131 @@ enum MonitoringRegressionTests {
     }
 
     static func run(_ h: Harness) {
+        h.runSuite("Monitoring.manual probe drops stale credentials") { t in
+            let env = try TestEnv("monitor-manual-probe-stale-key")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(stallChat: true)
+            let core = Core()
+            var record = entry("manual-probe-stale-key", server: server)
+            record.health = "err"
+            record.healthAt = 100
+            record.healthDetail = "previous status"
+            record.probeLog = [ProbePoint(t: 100, ms: 1, ok: false)]
+            record.modelProbeLog = [record.model!: [ProbePoint(t: 100, ms: 1, ok: false)]]
+            try core.history.append(record)
+
+            let completed = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                _ = try? core.testEntry(entryIDPrefix: record.id)
+                completed.signal()
+            }
+            t.expect(server.chatEntered.wait(timeout: .now() + 5) == .success, "手动探测已进入模型请求")
+            var edited = core.history.find(idPrefix: record.id)!
+            edited.key = "sk-rotated-while-probing-222222"
+            edited.raw = server.base + "\n" + edited.key!
+            try core.history.update(edited)
+            server.releaseChat.signal()
+            t.expect(completed.wait(timeout: .now() + 10) == .success, "手动探测结束")
+
+            let saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.key, "sk-rotated-while-probing-222222", "保留并发轮换后的 key")
+            t.equal(saved.health, "err", "旧凭据成功结果不能标记新 key 可用")
+            t.equal(saved.healthAt, 100, "过时结果不能推进健康时间")
+            t.equal(saved.probeLog?.count, 1, "过时结果不能写 key 级监控点")
+            t.equal(saved.modelProbeLog?[record.model!]?.count, 1, "过时结果不能写模型级监控点")
+        }
+        h.runSuite("Monitoring.refresh drops stale credentials") { t in
+            let env = try TestEnv("monitor-refresh-stale-key")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(stallChat: true)
+            let core = Core()
+            var record = entry("refresh-stale-key", server: server)
+            record.health = "err"
+            record.healthAt = 100
+            record.healthDetail = "previous status"
+            record.probeLog = [ProbePoint(t: 100, ms: 1, ok: false)]
+            record.modelProbeLog = [record.model!: [ProbePoint(t: 100, ms: 1, ok: false)]]
+            try core.history.append(record)
+
+            let completed = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                _ = try? core.refreshModels(entryIDPrefix: record.id)
+                completed.signal()
+            }
+            t.expect(server.chatEntered.wait(timeout: .now() + 5) == .success, "刷新探测已进入模型请求")
+            var edited = core.history.find(idPrefix: record.id)!
+            edited.key = "sk-rotated-during-refresh-333333"
+            edited.raw = server.base + "\n" + edited.key!
+            try core.history.update(edited)
+            server.releaseChat.signal()
+            t.expect(completed.wait(timeout: .now() + 15) == .success, "模型刷新结束")
+
+            let saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.key, "sk-rotated-during-refresh-333333", "模型刷新不能覆盖并发轮换的 key")
+            t.equal(saved.health, "err", "旧凭据结果不能标记新 key 可用")
+            t.equal(saved.healthAt, 100, "旧刷新结果不能推进健康时间")
+            t.equal(saved.probeLog?.count, 1, "旧刷新结果不能写 key 级监控点")
+            t.equal(saved.modelProbeLog?[record.model!]?.count, 1, "旧刷新结果不能写模型级监控点")
+        }
+        h.runSuite("Monitoring.refresh preserves concurrent ledger edits") { t in
+            let env = try TestEnv("monitor-refresh-preserves-edits")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(stallChat: true)
+            let core = Core()
+            let record = entry("refresh-preserve-edits", server: server)
+            try core.history.append(record)
+
+            let completed = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                _ = try? core.refreshModels(entryIDPrefix: record.id)
+                completed.signal()
+            }
+            t.expect(server.chatEntered.wait(timeout: .now() + 5) == .success, "刷新探测已进入模型请求")
+            var edited = core.history.find(idPrefix: record.id)!
+            edited.name = "concurrent rename"
+            edited.note = "concurrent note"
+            edited.targetSyncErrors = ["magpie": "pending repair"]
+            try core.history.update(edited)
+            server.releaseChat.signal()
+            t.expect(completed.wait(timeout: .now() + 15) == .success, "模型刷新结束")
+
+            let saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.name, "concurrent rename", "保留并发改名")
+            t.equal(saved.note, "concurrent note", "保留并发备注")
+            t.equal(saved.targetSyncErrors?["magpie"], "pending repair", "保留并发同步错误")
+        }
+        h.runSuite("Monitoring.slow older probe cannot replace newer result") { t in
+            let env = try TestEnv("monitor-probe-order")
+            defer { env.cleanup() }
+            let server = try MonitoringHTTPServer(stallChat: true)
+            let core = Core()
+            var record = entry("probe-order", server: server)
+            record.health = "err"
+            record.healthAt = 1
+            try core.history.append(record)
+
+            let olderCompleted = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                _ = try? core.testEntry(entryIDPrefix: record.id)
+                olderCompleted.signal()
+            }
+            t.expect(server.chatEntered.wait(timeout: .now() + 5) == .success, "较早探测已停在网络响应前")
+
+            let newerCompleted = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                _ = try? core.testEntry(entryIDPrefix: record.id)
+                newerCompleted.signal()
+            }
+            t.expect(newerCompleted.wait(timeout: .now() + 10) == .success, "较新探测先完成")
+            let newer = core.history.find(idPrefix: record.id)!
+            t.expect((newer.healthAt ?? 0) > 1, "较新结果已写入")
+
+            server.releaseChat.signal()
+            t.expect(olderCompleted.wait(timeout: .now() + 10) == .success, "较早探测随后完成")
+            let saved = core.history.find(idPrefix: record.id)!
+            t.equal(saved.healthAt, newer.healthAt, "晚到的旧请求不能覆盖较新健康时间")
+            t.equal(saved.probeLog?.count, newer.probeLog?.count, "旧请求不追加监控点")
+        }
         h.runSuite("Monitoring.edit recovers failed status and verifies CPA") { t in
             let env = try TestEnv("monitor-edit-recovery")
             defer { env.cleanup() }

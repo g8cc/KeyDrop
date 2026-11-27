@@ -208,6 +208,79 @@ enum MagpieTests {
             catch { t.contains(error.localizedDescription, "未找到本机 Magpie") }
         }
 
+        h.runSuite("Magpie.Web 保存后读回失败安全补偿并保留未决归属") { t in
+            do {
+                let env = try TestEnv("magpie-readback-compensate"); defer { env.cleanup() }
+                let server = try MockHTTPServer(mode: .magpie)
+                Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server.port)/?k=test"
+                server.magpieFailProviderListsAfterSave = 1
+                let core = Core()
+                let clean = try core.add(raw: "https://relay.test/v1\nsk-magpie-readback-clean", ccOverride: false,
+                                         grokOverride: false, cpaOverride: false, dshOverride: false,
+                                         magpieOverride: true, models: ["glm-5.2"], force: true)
+                t.expect(!clean.ok, "读回失败不能报告导入成功")
+                t.equal(server.magpieProviders.count, 0, "凭据与模型精确匹配后安全补偿删除新 provider")
+                t.expect(core.history.find(idPrefix: clean.entry.id) == nil, "已确认删除后无需创建清理账本")
+
+                let env2 = try TestEnv("magpie-readback-pending"); defer { env2.cleanup() }
+                let server2 = try MockHTTPServer(mode: .magpie)
+                Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server2.port)/?k=test"
+                server2.magpieFailProviderListsAfterSave = 2
+                let core2 = Core()
+                let pending = try core2.add(raw: "https://relay.test/v1\nsk-magpie-readback-pending", ccOverride: false,
+                                            grokOverride: false, cpaOverride: false, dshOverride: false,
+                                            magpieOverride: true, models: ["glm-5.2"], force: true)
+                t.expect(!pending.ok, "未确认补偿不能报告可用")
+                t.equal(pending.entry.status, "active", "未决 provider 保持可恢复的账本状态")
+                t.expect(pending.entry.targets.contains("magpie"), "返回结果保留 Magpie 清理责任")
+                let saved = core2.history.find(idPrefix: pending.entry.id)
+                t.expect(saved?.targets.contains("magpie") == true, "账本持久化 Magpie 归属")
+                t.expect(saved?.targetSyncErrors?["magpie"] != nil, "账本持久化同步错误")
+                t.expect(saved?.status == "active", "未决 provider 保留同步与删除入口")
+                t.equal(server2.magpieProviders.count, 1, "模拟远端保存成功但清理确认失败")
+
+                server2.magpieFailProviderListsAfterSave = 1
+                do {
+                    _ = try MagpieWriter.sync(providerID: pending.entry.id, baseURL: "https://relay.test/v1",
+                                              key: "sk-magpie-updated-state", models: ["gpt-5.6-sol"],
+                                              expectedDestinationID: pending.entry.magpieDestinationID)
+                    t.expect(false, "已有 provider 读回失败必须报告未确认")
+                } catch let failure as MagpieWriter.SyncFailure {
+                    t.expect(failure.providerMayExist, "更新失败保留 provider 归属")
+                } catch { t.expect(false, "更新失败应携带残留状态: \(error.localizedDescription)") }
+                t.equal(server2.magpieProviders.count, 1, "已有 provider 更新失败不得删除")
+                t.equal(server2.magpieDeleteCount, 0, "已有 provider 更新路径不执行补偿删除")
+                server2.magpieFailProviderListsAfterSave = 0
+                _ = try core2.syncTarget(entryIDPrefix: pending.entry.id, target: "magpie")
+                t.expect(core2.history.find(idPrefix: pending.entry.id)?.targetSyncErrors?["magpie"] == nil,
+                         "公共重试入口可修复未决 provider")
+                _ = try core2.delete(entryIDPrefix: pending.entry.id)
+                t.equal(server2.magpieProviders.count, 0, "公共删除入口可清理未决 provider")
+
+                let env3 = try TestEnv("magpie-sync-target-pending"); defer { env3.cleanup() }
+                let server3 = try MockHTTPServer(mode: .magpie)
+                Prefs.shared.magpieWebLink = "http://127.0.0.1:\(server3.port)/?k=test"
+                let core3 = Core()
+                let seeded = try core3.add(raw: "https://relay.test/v1\nsk-magpie-sync-target", ccOverride: false,
+                                           grokOverride: false, cpaOverride: false, dshOverride: false,
+                                           magpieOverride: true, models: ["glm-5.2"], force: true)
+                _ = try MagpieWriter.remove(providerID: seeded.entry.id,
+                                            expectedDestinationID: seeded.entry.magpieDestinationID)
+                var detached = core3.history.find(idPrefix: seeded.entry.id)!
+                detached.targets.removeAll { $0 == "magpie" }
+                detached.magpieDestinationID = nil
+                detached.targetSyncErrors = nil
+                try core3.history.update(detached)
+                server3.magpieFailProviderListsAfterSave = 2
+                do { _ = try core3.syncTarget(entryIDPrefix: seeded.entry.id, target: "magpie"); t.expect(false, "同步失败应抛出") }
+                catch { t.contains(error.localizedDescription, "无法确认", "syncTarget 暴露未决补偿错误") }
+                let targetSaved = core3.history.find(idPrefix: seeded.entry.id)
+                t.expect(targetSaved?.targets.contains("magpie") == true, "syncTarget 失败仍记录清理责任")
+                t.expect(targetSaved?.targetSyncErrors?["magpie"] != nil, "syncTarget 持久化同步错误")
+                t.equal(server3.magpieProviders.count, 1, "syncTarget 注入保存后读回和补偿读回双失败")
+            } catch { t.expect(false, "回归用例执行失败: \(error.localizedDescription)") }
+        }
+
         h.runSuite("Magpie.本机 CLI 参数、核验与隔离") { t in
             let env = try TestEnv("magpie-cli"); defer { env.cleanup() }
             // 模拟官方 CLI 的参数边界；网络/真实 Magpie 另有本机端到端验证。

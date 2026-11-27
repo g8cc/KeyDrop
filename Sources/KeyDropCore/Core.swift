@@ -15,6 +15,75 @@ public final class Core {
     public static let shared = Core()
     public init() {}
 
+    private final class EntryMutationLockBox {
+        let lock = NSRecursiveLock()
+        var users = 0
+    }
+
+    private final class EntryMutationLease {
+        let id: String
+        let box: EntryMutationLockBox
+        private var locked = false
+        private var released = false
+
+        init(id: String, box: EntryMutationLockBox) {
+            self.id = id
+            self.box = box
+        }
+
+        func lock() {
+            guard !released, !locked else { return }
+            box.lock.lock()
+            locked = true
+        }
+
+        func unlock() {
+            guard !released else { return }
+            if locked {
+                box.lock.unlock()
+                locked = false
+            }
+            Core.releaseEntryMutationLease(id: id, box: box)
+            released = true
+        }
+
+        deinit { unlock() }
+    }
+
+    private static let entryMutationRegistryLock = NSLock()
+    private static var entryMutationLocks: [String: EntryMutationLockBox] = [:]
+
+    private static func entryMutationLock(for id: String) -> EntryMutationLease {
+        entryMutationRegistryLock.lock()
+        let box = entryMutationLocks[id] ?? {
+            let created = EntryMutationLockBox()
+            entryMutationLocks[id] = created
+            return created
+        }()
+        box.users += 1
+        entryMutationRegistryLock.unlock()
+        return EntryMutationLease(id: id, box: box)
+    }
+
+    private static func releaseEntryMutationLease(id: String, box: EntryMutationLockBox) {
+        entryMutationRegistryLock.lock()
+        box.users = max(0, box.users - 1)
+        if box.users == 0, entryMutationLocks[id] === box {
+            entryMutationLocks.removeValue(forKey: id)
+        }
+        entryMutationRegistryLock.unlock()
+    }
+
+    private func lockRefreshCommit(matching expected: HistoryEntry, candidate: HistoryEntry) throws -> EntryMutationLease {
+        let mutationLock = Self.entryMutationLock(for: expected.id)
+        mutationLock.lock()
+        guard history.matchesCurrentConfiguration(expected, allowing: candidate) else {
+            mutationLock.unlock()
+            throw ParseError.io("配置已变化，已丢弃旧刷新结果，请重试")
+        }
+        return mutationLock
+    }
+
     public static var defaultAppType: String {
         ProcessInfo.processInfo.environment["KEYDROP_APP"] ?? "opencode"
     }
@@ -710,6 +779,7 @@ public final class Core {
         }
 
         var anyOK = false
+        var persistMagpieFailure = false
         stage = "write"
         try operation?.advance(to: .writing)
         noteProxyWorked(needsProxy: probedNeedsProxy, used: proxyURL)
@@ -895,6 +965,12 @@ public final class Core {
             } catch {
                 entry.targetSyncErrors = entry.targetSyncErrors ?? [:]
                 entry.targetSyncErrors?["magpie"] = error.localizedDescription
+                let failure = error as? MagpieWriter.SyncFailure
+                persistMagpieFailure = failure?.providerMayExist == true || dup?.targets.contains("magpie") == true
+                if let failure, failure.providerMayExist {
+                    if !entry.targets.contains("magpie") { entry.targets.append("magpie") }
+                    if let destination = failure.destinationID { entry.magpieDestinationID = destination }
+                }
                 lines.append("✗ Magpie 失败: \(error.localizedDescription)")
             }
         }
@@ -922,14 +998,25 @@ public final class Core {
             throw ParseError.io("没有选中的目标(cc-switch / Grok Build / CPA / DSH / Magpie)")
         }
 
-        entry.status = anyOK ? "active" : "error"
+        let needsMagpieRecoveryRecord = !anyOK && persistMagpieFailure
+            && entry.targets.contains("magpie") && entry.targetSyncErrors?["magpie"] != nil
+        // Keep an unresolved remote provider actionable: public retry/delete paths
+        // require an active ledger owner, while targetSyncErrors keeps it out of the
+        // available state until the provider is verified again.
+        entry.status = anyOK || needsMagpieRecoveryRecord ? "active" : "error"
         entry.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
         lines.append(contentsOf: notes)
 
         var historySaved = false
-        if anyOK {
+        if anyOK || needsMagpieRecoveryRecord {
             do {
-                if let dup {
+                if needsMagpieRecoveryRecord {
+                    // A failed create whose compensation could not be confirmed still
+                    // needs a durable owner so the user can retry/delete the residue.
+                    // Keep this failed import non-usable and do not treat it as success.
+                    if let dup { try saveAfterMagpie(entry, previous: dup) }
+                    else { try history.append(entry) }
+                } else if let dup {
                     try saveAfterMagpie(entry, previous: dup)
                 } else if let survivor = try history.appendDedupByKey(entry) {
                     // 网络测试期间另一进程(CLI/app)刚导入了同一 key。
@@ -988,10 +1075,15 @@ public final class Core {
                 anyOK = false
                 lines.append("✗ 历史保存失败，本次导入未完成: \(error.localizedDescription)")
                 lines.append("  (目标配置可能已写入，请检查记录后重试)")
-                if dup == nil, entry.targets.contains("magpie"), history.find(idPrefix: entry.id) == nil {
+                if dup == nil, entry.targets.contains("magpie"),
+                   entry.targetSyncErrors?["magpie"] == nil, history.find(idPrefix: entry.id) == nil {
                     entry.status = "error"
                     do {
-                        _ = try MagpieWriter.remove(providerID: entry.id, expectedDestinationID: entry.magpieDestinationID)
+                        let state = MagpieWriter.ProviderState(baseURL: entry.url ?? "",
+                                                               key: extractKey(entry) ?? "",
+                                                               models: entry.configuredModels, apiStyle: entry.apiStyle)
+                        _ = try MagpieWriter.remove(providerID: entry.id, expectedDestinationID: entry.magpieDestinationID,
+                                                    onlyIfMatches: state)
                         entry.targets.removeAll { $0 == "magpie" }
                     }
                     catch { lines.append("⚠ Magpie 回滚失败: \(error.localizedDescription)") }
@@ -1233,11 +1325,12 @@ public final class Core {
         AppLog.info("自动代理: 直连失败、经 \(used) 连通,已写入设置(可在设置中修改/清除)")
     }
 
-    /// history.update 的统一入口:落盘失败(磁盘满/权限)必须留痕,
-    /// 否则「已标记/已更新」的返回值与磁盘事实不一致且无迹可查
-    private func historyUpdateLogged(_ e: HistoryEntry) {
-        do { try history.update(e) } catch {
+    /// Long-running refresh commits are conditional so a key/model edited while the
+    /// network request or picker is open remains the current ledger entry.
+    private func historyUpdateIfUnchangedLogged(_ e: HistoryEntry, matching expected: HistoryEntry) throws -> Bool {
+        do { return try history.updateIfUnchanged(e, matching: expected) } catch {
             AppLog.error("history.update 保存失败: \(error.localizedDescription)")
+            throw error
         }
     }
 
@@ -2290,7 +2383,7 @@ public final class Core {
         return lines.joined(separator: "\n")
     }
 
-    func testEntry(entryIDPrefix: String) throws -> String {
+    public func testEntry(entryIDPrefix: String) throws -> String {
         guard let entry = history.find(idPrefix: entryIDPrefix) else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
@@ -2298,7 +2391,9 @@ public final class Core {
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法测试")
         }
+        let testedConfigurationID = entry.probeConfigurationID
         let px = proxyForHealth()
+        let probeStartedAt = Date().timeIntervalSince1970
         let test = APITester.test(url: url, key: key, proxy: px, preferredModel: entry.model,
                                   importedModels: entry.models, probePool: entry.configuredModels,
                                   styleHint: entry.apiStyle)
@@ -2308,27 +2403,29 @@ public final class Core {
             try history.mergePoolEvidence([updated])
             return "暂缓探测: " + test.detail
         }
-        noteProxyWorked(needsProxy: test.needsProxy, used: px)
         let h = Self.healthFor(test)
+        var updated = entry
         if test.ok {
-            if var found = history.find(idPrefix: entryIDPrefix) {
-                found.health = h.health
-                found.apiStyle = test.style
-                found.healthDetail = h.detail
-                found.healthAt = Date().timeIntervalSince1970
-                found.failStreak = nil   // 手动重测成功即清零(审计 2026-11-14 P2)
-                recordProbeResult(test, for: &found)
-                historyUpdateLogged(found)
-            }
+            updated.health = h.health
+            updated.apiStyle = test.style
+            updated.healthDetail = h.detail
+            updated.healthAt = probeStartedAt
+            updated.failStreak = nil   // 手动重测成功即清零(审计 2026-11-14 P2)
+        } else {
+            updated.health = h.health
+            updated.healthDetail = h.detail
+            updated.healthAt = probeStartedAt
+        }
+        let evidence = recordProbeResult(test, for: &updated, persist: false)
+        guard try history.mergeManualProbe(updated, matching: entry, expectedConfigurationID: testedConfigurationID,
+                                           at: updated.healthAt ?? Date().timeIntervalSince1970,
+                                           keyPoint: evidence.keyPoint, modelPoints: evidence.modelPoints) else {
+            return "配置已变化，旧探测结果已丢弃，请重试"
+        }
+        noteProxyWorked(needsProxy: test.needsProxy, used: px)
+        if test.ok {
             let label = history.find(idPrefix: entryIDPrefix)?.availability.label ?? h.health
             return "\(label): \(h.detail) (\(test.models.count) 个模型)"
-        }
-        if var found = history.find(idPrefix: entryIDPrefix) {
-            found.health = h.health
-            found.healthDetail = h.detail
-            found.healthAt = Date().timeIntervalSince1970
-            recordProbeResult(test, for: &found)
-            historyUpdateLogged(found)
         }
         return "✗ 不可用: \(test.detail)"
     }
@@ -2581,33 +2678,45 @@ public final class Core {
     }
 
     /// 所有手动重测分支共享监控落盘,包括失败和改选后的第二次探测。
-    private func recordProbeResult(_ test: APITestResult, for entry: inout HistoryEntry) {
+    private func recordProbeResult(_ test: APITestResult, for entry: inout HistoryEntry, persist: Bool = true)
+        -> (keyPoint: ProbePoint?, modelPoints: [String: ProbePoint]) {
         let now = test.skippedForCooldown ? Date().timeIntervalSince1970 : (entry.healthAt ?? Date().timeIntervalSince1970)
         updatePoolProbe(for: &entry, primary: test, at: now, proxy: proxyForHealth())
-        guard !test.skippedForCooldown else { return }
+        guard !test.skippedForCooldown else { return (nil, [:]) }
         var points = test.modelProbePoints(at: now)
         let cpaResults = updateCPAProbe(for: &entry, test: test, at: now)
         for (model, passed) in cpaResults {
             points[model]?.cpa = passed
         }
         let cpa: Bool? = cpaResults.isEmpty ? nil : cpaResults.values.allSatisfy { $0 }
-        do {
-            if !test.reachabilityOnly {
-                try history.appendProbePoint(id: entry.id, ok: test.ok && !test.quotaExhausted && !test.chatDegraded, ms: test.latencyMs, cpa: cpa, at: now)
+        let scopedPoints = entry.scopedProbePoints(points)
+        let keyPoint = test.reachabilityOnly ? nil : ProbePoint(
+            t: now, ms: test.latencyMs, ok: test.ok && !test.quotaExhausted && !test.chatDegraded, cpa: cpa
+        )
+        if persist {
+            do {
+                if let keyPoint { try history.appendProbePoint(id: entry.id, ok: keyPoint.ok, ms: keyPoint.ms, cpa: keyPoint.cpa, at: now) }
+                try history.appendModelProbePoints(id: entry.id, points: scopedPoints)
+            } catch {
+                AppLog.warn("探测点写入失败: \(error.localizedDescription)")
             }
-            try history.appendModelProbePoints(id: entry.id, points: entry.scopedProbePoints(points))
-        } catch {
-            AppLog.warn("探测点写入失败: \(error.localizedDescription)")
         }
+        return (keyPoint, scopedPoints)
     }
 
     private func syncMagpie(_ entry: inout HistoryEntry) throws -> String {
         guard let url = entry.url, let key = extractKey(entry) else { throw ParseError.io("Magpie 同步缺少地址或凭据") }
         let destination = try entry.magpieDestinationID ?? MagpieWriter.destinationID()
-        let message = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
+        entry.magpieDestinationID = destination
+        let message: String
+        do {
+            message = try MagpieWriter.sync(providerID: entry.id, baseURL: url, key: key,
                                             models: entry.configuredModels, apiStyle: entry.apiStyle,
                                             expectedDestinationID: destination)
-        entry.magpieDestinationID = destination
+        } catch let failure as MagpieWriter.SyncFailure {
+            if let actualDestination = failure.destinationID { entry.magpieDestinationID = actualDestination }
+            throw failure
+        }
         entry.targetSyncErrors?.removeValue(forKey: "magpie")
         return message
     }
@@ -2644,13 +2753,22 @@ public final class Core {
     }
 
     private func saveAfterMagpie(_ entry: HistoryEntry, previous: HistoryEntry) throws {
-        do { try history.update(entry) }
+        let committed: Bool
+        do { committed = try history.updateIfUnchanged(entry, matching: previous) }
         catch {
             do { try restoreMagpie(after: entry, to: previous) }
             catch let rollbackError {
                 throw ParseError.io("账本保存失败: \(error.localizedDescription);Magpie 回滚未完成: \(rollbackError.localizedDescription)")
             }
             throw error
+        }
+        guard committed else {
+            let latest = history.find(idPrefix: entry.id) ?? previous
+            do { try restoreMagpie(after: entry, to: latest) }
+            catch let rollbackError {
+                throw ParseError.io("配置已变化，未覆盖新记录；Magpie 回滚未完成: \(rollbackError.localizedDescription)")
+            }
+            throw ParseError.io("配置已变化，已丢弃旧刷新结果，请重试")
         }
     }
 
@@ -2663,11 +2781,13 @@ public final class Core {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
         let previousEntry = entry
+        let expectedConfigurationID = previousEntry.probeConfigurationID
         let effProxy = proxy ?? proxyForHealth()
         guard !entry.isDSHOnly else { throw ParseError.io("DSH 专用条目，请在 DSH 内验证") }
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法重新测试")
         }
+        let initialProbeStartedAt = Date().timeIntervalSince1970
         let test = APITester.test(url: url, key: key, proxy: effProxy,
                                   preferredModel: entry.model, importedModels: entry.models,
                                   probePool: entry.configuredModels, styleHint: entry.apiStyle)
@@ -2689,9 +2809,14 @@ public final class Core {
             // health="dead" + status="active" 会正常进入「探测失败」,与健康扫描路径一致
             entry.health = h.health
             entry.healthDetail = h.detail
-            entry.healthAt = Date().timeIntervalSince1970
-            recordProbeResult(test, for: &entry)
-            historyUpdateLogged(entry)
+            entry.healthAt = initialProbeStartedAt
+            let evidence = recordProbeResult(test, for: &entry, persist: false)
+            guard try history.mergeManualProbe(entry, matching: previousEntry,
+                                               expectedConfigurationID: expectedConfigurationID,
+                                               at: entry.healthAt ?? Date().timeIntervalSince1970,
+                                               keyPoint: evidence.keyPoint, modelPoints: evidence.modelPoints) else {
+                throw ParseError.io("配置已变化，旧探测结果已丢弃，请重试")
+            }
             let deadMark = (test.authFailed || test.detail.contains("401") || test.detail.contains("403"))
                 ? "(接口拒绝认证，已移入探测失败区)" : ""
             throw ParseError.io("✗ 不可用: \(test.detail)\(deadMark)")
@@ -2719,16 +2844,28 @@ public final class Core {
             } else {
                 entry.healthDetail = quotaNote ?? test.detail
             }
-            entry.healthAt = Date().timeIntervalSince1970
+            entry.healthAt = initialProbeStartedAt
             entry.failStreak = nil   // 手动重测成功即清零
-            recordProbeResult(test, for: &entry)
+            let evidence = recordProbeResult(test, for: &entry, persist: false)
+            guard try history.mergeManualProbe(entry, matching: previousEntry,
+                                               expectedConfigurationID: expectedConfigurationID,
+                                               at: entry.healthAt ?? Date().timeIntervalSince1970,
+                                               keyPoint: evidence.keyPoint, modelPoints: evidence.modelPoints) else {
+                throw ParseError.io("配置已变化，旧探测结果已丢弃，请重试")
+            }
         } else if !test.skippedForCooldown {
             // 改选路径:先如实记下本次失败,选完再重探覆盖(别停在旧模型的 503 上)
             let h = Self.healthFor(test)
             entry.health = h.health
             entry.healthDetail = h.detail
-            entry.healthAt = Date().timeIntervalSince1970
-            recordProbeResult(test, for: &entry)
+            entry.healthAt = initialProbeStartedAt
+            let evidence = recordProbeResult(test, for: &entry, persist: false)
+            guard try history.mergeManualProbe(entry, matching: previousEntry,
+                                               expectedConfigurationID: expectedConfigurationID,
+                                               at: entry.healthAt ?? Date().timeIntervalSince1970,
+                                               keyPoint: evidence.keyPoint, modelPoints: evidence.modelPoints) else {
+                throw ParseError.io("配置已变化，旧探测结果已丢弃，请重试")
+            }
         }
         let previousModels = entry.configuredModels
         let currentModels = Set(previousModels)
@@ -2896,6 +3033,8 @@ public final class Core {
 
         if testModels.isEmpty, !repickAfterFail {
             // 端点无模型列表也同步: wire_api 探测(chat-only 网关)需保持 DB/config 新鲜
+            let mutationLock = try lockRefreshCommit(matching: previousEntry, candidate: entry)
+            defer { mutationLock.unlock() }
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
             let magpieNote = syncMagpieIfNeeded(&entry)
@@ -2913,7 +3052,11 @@ public final class Core {
         let modelsChanged = currentModels != Set(test.models)
 
         if !modelsChanged, !repickAfterFail {
-            historyUpdateLogged(entry)
+            let mutationLock = try lockRefreshCommit(matching: previousEntry, candidate: entry)
+            defer { mutationLock.unlock() }
+            guard try historyUpdateIfUnchangedLogged(entry, matching: previousEntry) else {
+                throw ParseError.io("配置已变化，已丢弃旧刷新结果，请重试")
+            }
             // 模型无变化也同步: wire_api 探测可能已变化(chat-only 网关)且 DB/config 需保持新鲜
             let migrateNote = grokSyncOrMigrate(&entry, models: currentModels.sorted())
                 ?? ccSyncOrMigrate(&entry, models: currentModels.sorted())
@@ -2929,7 +3072,9 @@ public final class Core {
             let sel = picker(test.models)
             if sel.isEmpty {
                 // 取消选择也是一次有效测试结果,落盘 health 再抛,避免结果丢失
-                historyUpdateLogged(entry)
+                guard try historyUpdateIfUnchangedLogged(entry, matching: previousEntry) else {
+                    throw ParseError.io("配置已变化，已丢弃旧刷新结果，请重试")
+                }
                 throw ParseError.io("已取消选择模型")
             }
             // 刷新时保留用户勾选/手输,不因启发式误杀
@@ -2938,7 +3083,9 @@ public final class Core {
             filtered = testModels
         }
         guard !filtered.isEmpty else {
-            historyUpdateLogged(entry)
+            guard try historyUpdateIfUnchangedLogged(entry, matching: previousEntry) else {
+                throw ParseError.io("配置已变化，已丢弃旧刷新结果，请重试")
+            }
             throw ParseError.io("测试通过但未识别到模型,无法刷新")
         }
         entry.models = filtered
@@ -2955,6 +3102,7 @@ public final class Core {
                 entry.viaCPAOk = nil
                 entry.viaCPAAt = nil
             }
+            let retestStartedAt = Date().timeIntervalSince1970
             let retest = APITester.test(url: url, key: key, proxy: effProxy,
                                         preferredModel: filtered.first, importedModels: filtered,
                                         probePool: filtered, styleHint: entry.apiStyle)
@@ -2963,7 +3111,7 @@ public final class Core {
                 if retest.ok { entry.apiStyle = retest.style }
                 entry.health = h.health
                 entry.healthDetail = h.detail
-                entry.healthAt = Date().timeIntervalSince1970
+                entry.healthAt = retestStartedAt
                 entry.failStreak = retest.ok ? nil : 1
                 selectionTest = retest
             } else if filtered != previousModels {
@@ -2976,6 +3124,17 @@ public final class Core {
                 ? "✓ 改选的模型实测可用: \(h.detail)"
                 : "⚠ 已改选 \(filtered.count) 个模型,尚未验证可用: \(h.detail)(下次扫描自动重测)"
         }
+        if let selectionTest {
+            let evidence = recordProbeResult(selectionTest, for: &entry, persist: false)
+            guard try history.mergeManualProbe(entry, matching: previousEntry,
+                                               expectedConfigurationID: expectedConfigurationID,
+                                               at: entry.healthAt ?? Date().timeIntervalSince1970,
+                                               keyPoint: evidence.keyPoint, modelPoints: evidence.modelPoints) else {
+                throw ParseError.io("配置已变化，旧探测结果已丢弃，请重试")
+            }
+        }
+        let mutationLock = try lockRefreshCommit(matching: previousEntry, candidate: entry)
+        defer { mutationLock.unlock() }
 
         var syncWarn: String? = nil
         // 主分支:模型已变化,ccSyncOrMigrate 会按新模型列表决定原地 sync 还是迁移家族
@@ -3021,7 +3180,6 @@ public final class Core {
                 }
             }
         }
-        if let selectionTest { recordProbeResult(selectionTest, for: &entry) }
         let magpieNote = syncMagpieIfNeeded(&entry)
         try saveAfterMagpie(entry, previous: previousEntry)
         let q = quotaNote.map { " ⚠ \($0) — 充值后刷新自动恢复" } ?? ""
@@ -3065,6 +3223,13 @@ public final class Core {
         else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
+        let mutationLock = Self.entryMutationLock(for: entry.id)
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
+        guard history.matchesCurrentConfiguration(entry) else {
+            throw ParseError.io("配置已变化，请重新打开编辑窗口")
+        }
+        entry = history.find(idPrefix: entry.id) ?? entry
         guard let url = entry.url, let key = extractKey(entry), !key.isEmpty else {
             throw ParseError.io("该记录缺少 URL 或 key,无法编辑")
         }
@@ -3512,11 +3677,18 @@ public final class Core {
         else {
             throw ParseError.io("历史记录中找不到: \(entryIDPrefix)")
         }
-        guard entry.status == "active" else {
-            throw ParseError.io("该记录已删除,无法同步")
-        }
+        let mutationLock = Self.entryMutationLock(for: entry.id)
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
         if entry.isDSHOnly && target != "dsh" {
             throw ParseError.io("此凭据仅配置给 DSH")
+        }
+        guard history.matchesCurrentConfiguration(entry) else {
+            throw ParseError.io("配置已变化，请重新尝试同步")
+        }
+        entry = history.find(idPrefix: entry.id) ?? entry
+        guard entry.status == "active" else {
+            throw ParseError.io("该记录已删除,无法同步")
         }
         guard let url = entry.url, !url.isEmpty,
               let key = extractKey(entry), !key.isEmpty else {
@@ -3613,7 +3785,11 @@ public final class Core {
             let msg: String
             do { msg = try syncMagpie(&entry) }
             catch {
-                if alreadyHadMagpie {
+                let failure = error as? MagpieWriter.SyncFailure
+                if alreadyHadMagpie || failure?.providerMayExist == true {
+                    if failure?.providerMayExist == true && !entry.targets.contains("magpie") {
+                        entry.targets.append("magpie")
+                    }
                     entry.targetSyncErrors = entry.targetSyncErrors ?? [:]
                     entry.targetSyncErrors?["magpie"] = error.localizedDescription
                     try history.update(entry)
@@ -3646,6 +3822,13 @@ public final class Core {
 
     private func deleteEntry(_ original: HistoryEntry, deletedAt: TimeInterval) throws -> String {
         var entry = original
+        let mutationLock = Self.entryMutationLock(for: entry.id)
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
+        guard history.matchesCurrentConfiguration(original) else {
+            throw ParseError.io("配置已变化，请刷新后再删除")
+        }
+        entry = history.find(idPrefix: entry.id) ?? entry
         var lines: [String] = []
         var failures: [String] = []
         var remaining = entry.targets

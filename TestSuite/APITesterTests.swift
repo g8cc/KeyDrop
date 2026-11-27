@@ -60,6 +60,10 @@ final class MockHTTPServer {
     var magpieExpectedKey: String? = nil
     var magpieFailSave = false
     var magpieAfterSave: (() -> Void)? = nil
+    // Consume these failures only after the next successful save, so tests can
+    // reproduce a committed write followed by a failed verification/compensation read.
+    var magpieFailProviderListsAfterSave = 0
+    private var magpieProviderListsToFail = 0
     var magpieIgnoreSave = false
     var magpieIgnoreDelete = false
     var magpiePublicShape = false
@@ -403,6 +407,11 @@ final class MockHTTPServer {
             body = (try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]) ?? [:]
         }
         if target.hasPrefix("/api/providers") {
+            if magpieProviderListsToFail > 0 {
+                magpieProviderListsToFail -= 1
+                respond(client, 502, "Bad Gateway", "{}")
+                return
+            }
             let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
             respond(client, 200, "OK", payload, contentType: "application/json")
             return
@@ -430,6 +439,8 @@ final class MockHTTPServer {
                 magpieProviders.append(body)
                 magpieAfterSave?()
             }
+            magpieProviderListsToFail = max(0, magpieFailProviderListsAfterSave)
+            magpieFailProviderListsAfterSave = 0
             let payload = "{\"providers\":" + magpieJSON(magpieProviders) + "}"
             respond(client, 200, "OK", payload, contentType: "application/json")
             return

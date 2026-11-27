@@ -4,6 +4,21 @@ import Darwin
 
 /// 本机通过官方 CLI 写入，由 Magpie 自己加锁并通知网关；显式 Web 链接使用管理 API。
 public enum MagpieWriter {
+    /// A write may have reached Magpie even when its acknowledgement/readback failed.
+    /// Callers use this metadata to retain deletion responsibility without claiming success.
+    public struct SyncFailure: LocalizedError {
+        public let message: String
+        public let providerMayExist: Bool
+        public let destinationID: String?
+        public var errorDescription: String? { message }
+
+        fileprivate init(message: String, providerMayExist: Bool, destinationID: String?) {
+            self.message = message
+            self.providerMayExist = providerMayExist
+            self.destinationID = destinationID
+        }
+    }
+
     public struct Config {
         public let baseURL: String
         public let webKey: String
@@ -199,6 +214,20 @@ public enum MagpieWriter {
         return legacy.first
     }
 
+    /// Compensate a failed first-time Web write only after proving the row still has
+    /// the exact URL, secret, and model set KeyDrop attempted to create. A changed or
+    /// unverifiable row is left untouched and reported as potentially present.
+    private static func compensateWebCreate(_ web: WebClient, id: String, state: ProviderState) -> Bool {
+        do {
+            guard let row = try web.providers().first(where: { $0["id"] as? String == id }) else { return true }
+            guard try matches(row, state, web: web) else { return false }
+            _ = try web.request("/api/provider/delete", body: ["id": id])
+            return try !web.providers().contains(where: { $0["id"] as? String == id })
+        } catch {
+            return false
+        }
+    }
+
     /// 只声明识别出的协议，其他客户端协议由 Magpie 转换。
     private static func endpoints(_ baseURL: String, apiStyle: String?) throws -> [String: String] {
         guard var c = URLComponents(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -295,10 +324,26 @@ public enum MagpieWriter {
                 for (field, value) in endpoints { payload[field] = value }
                 payload["id"] = id; payload["name"] = name; payload["key"] = key
                 payload["models"] = models; payload["keyProtocol"] = ""
-                _ = try web.request("/api/provider/save", body: payload)
-                guard let saved = try web.providers().first(where: { $0["id"] as? String == id }),
-                      try matches(saved, .init(baseURL: baseURL, key: key, models: models, apiStyle: apiStyle), web: web) else {
-                    throw WriterError.file("Magpie 写入未确认，请检查 Magpie 界面")
+                let desired = ProviderState(baseURL: baseURL, key: key, models: models, apiStyle: apiStyle)
+                do {
+                    _ = try web.request("/api/provider/save", body: payload)
+                    guard let saved = try web.providers().first(where: { $0["id"] as? String == id }),
+                          try matches(saved, desired, web: web) else {
+                        throw WriterError.file("Magpie 写入未确认，请检查 Magpie 界面")
+                    }
+                } catch {
+                    if existing == nil {
+                        let removed = compensateWebCreate(web, id: id, state: desired)
+                        let detail = removed
+                            ? "\(error.localizedDescription)；新建 provider 已安全回滚"
+                            : "\(error.localizedDescription)；新建 provider 状态无法确认，已保留清理责任"
+                        throw SyncFailure(message: detail, providerMayExist: !removed,
+                                          destinationID: expectedDestinationID ?? (try? destinationID()))
+                    }
+                    // An update can have committed before its acknowledgement failed.
+                    // Preserve ownership and never delete/restore over the existing row here.
+                    throw SyncFailure(message: error.localizedDescription, providerMayExist: true,
+                                      destinationID: expectedDestinationID ?? (try? destinationID()))
                 }
             } else if let executable {
                 var args = existing == nil ? ["provider", "add", name, "id=" + id] : ["provider", "set", id, "name=" + name]
@@ -307,11 +352,24 @@ public enum MagpieWriter {
                 // 命令可能先落盘、后在通知网关阶段失败。读回完整字段后再决定结果。
                 var commandError: Error?
                 do { try runCLI(executable, args, secret: key) } catch { commandError = error }
-                guard let saved = try localProviders().first(where: { $0["id"] as? String == id }),
-                      saved["key"] as? String == key,
-                      Set(saved["models"] as? [String] ?? []) == Set(models),
-                      ["chat", "responses", "anthropic"].allSatisfy({ (saved[$0] as? String ?? "") == endpoints[$0] }) else {
+                let saved: [String: Any]?
+                do { saved = try localProviders().first(where: { $0["id"] as? String == id }) }
+                catch {
+                    throw SyncFailure(message: commandError?.localizedDescription ?? error.localizedDescription,
+                                      providerMayExist: true,
+                                      destinationID: expectedDestinationID ?? (try? destinationID()))
+                }
+                guard let saved else {
                     throw commandError ?? WriterError.file("Magpie 写入后核验失败，请检查 Magpie 的 provider 配置")
+                }
+                let stateMatches = saved["key"] as? String == key
+                    && Set(saved["models"] as? [String] ?? []) == Set(models)
+                    && ["chat", "responses", "anthropic"].allSatisfy({ (saved[$0] as? String ?? "") == endpoints[$0] })
+                guard stateMatches else {
+                    throw SyncFailure(message: commandError?.localizedDescription
+                                      ?? "Magpie 写入后核验失败，请检查 Magpie 的 provider 配置",
+                                      providerMayExist: true,
+                                      destinationID: expectedDestinationID ?? (try? destinationID()))
                 }
             }
             return "已\(existing == nil ? "新建" : "更新") provider「\(name)」(\(models.count) 个模型)"

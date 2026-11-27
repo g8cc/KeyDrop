@@ -589,9 +589,10 @@ public enum APITester {
     private static let cooldownLock = NSLock()
     private static var cooldowns: [String: (until: Date, outcome: ChatProbeOutcome)] = [:]
 
-    // 使用摘要做索引，不在缓存中保留凭据；按模型、代理隔离，避免一个限流模型阻止其他模型。
-    private static func cooldownID(base: String, key: String, proxy: String?, model: String) -> String {
-        let data = (try? JSONEncoder().encode([base, key, proxy ?? "", model])) ?? Data()
+    // 使用摘要做索引，不在缓存中保留凭据；按协议路由、模型和代理隔离，避免
+    // OpenAI Chat 的限流阻止 Responses/Anthropic 探测。
+    private static func cooldownID(base: String, route: String, style: String, key: String, proxy: String?, model: String) -> String {
+        let data = (try? JSONEncoder().encode([base, route, style, key, proxy ?? "", model])) ?? Data()
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -612,28 +613,37 @@ public enum APITester {
     ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
     ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
     private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String, style: String = "openai", canFallback: Bool = true, stream: Bool = true, useCooldown: Bool = true) -> ChatProbeOutcome {
-        let cooldownKey = cooldownID(base: base, key: key, proxy: proxy, model: model)
-        cooldownLock.lock()
-        let cached = cooldowns[cooldownKey]
-        if let cached, cached.until <= Date() { cooldowns.removeValue(forKey: cooldownKey) }
-        cooldownLock.unlock()
-        if useCooldown, let cached, cached.until > Date() {
-            var result = cached.outcome
-            result.skippedForCooldown = true
-            result.detail = "服务端限流，暂停重复探测约 \(Int(ceil(cached.until.timeIntervalSinceNow))) 秒"
-            return result
-        }
         let base = Parser.normalizeURL(base) ?? base
         let hasVersion = base.range(of: #"/v[0-9]+(?:beta[0-9]*)?$"#, options: .regularExpression) != nil
         let native = style == "anthropic"
         let suffix = native ? "/messages" : (style == "responses" ? "/responses" : "/chat/completions")
         let chatPaths = hasVersion ? [suffix] : [suffix, "/v1" + suffix]
+        // A base without an explicit version exposes two equivalent mounts. A
+        // rate limit on either mount applies to the same upstream operation;
+        // using one scope prevents a later retry from bypassing the cooldown by
+        // switching between `/chat/...` and `/v1/chat/...`. Keep versioned bases
+        // keyed by their concrete route and preserve protocol isolation below.
+        let cooldownRoute = chatPaths.count > 1 ? "__mount-family__" : base + (chatPaths.first ?? suffix)
         let s = session(for: proxy)
         var sawNetworkError = false
         var lastFailure: String?
         var lastStatus: Int?
+        var cooldownSkippedCount = 0
+        var cooldownOutcome: (until: Date, outcome: ChatProbeOutcome)?
         for path in chatPaths {
             guard let u = URL(string: base + path) else { continue }
+            let cooldownKey = cooldownID(base: base, route: cooldownRoute, style: style, key: key, proxy: proxy, model: model)
+            if useCooldown {
+                cooldownLock.lock()
+                let cached = cooldowns[cooldownKey]
+                if let cached, cached.until <= Date() { cooldowns.removeValue(forKey: cooldownKey) }
+                cooldownLock.unlock()
+                if let cached, cached.until > Date() {
+                    cooldownSkippedCount += 1
+                    cooldownOutcome = cached
+                    continue
+                }
+            }
             var req = URLRequest(url: u)
             req.httpMethod = "POST"
             req.timeoutInterval = timeout
@@ -700,6 +710,12 @@ public enum APITester {
                 }
                 continue
             }
+        }
+        if useCooldown, cooldownSkippedCount == chatPaths.count, let cooldownOutcome {
+            var result = cooldownOutcome.outcome
+            result.skippedForCooldown = true
+            result.detail = "服务端限流，暂停重复探测约 \(Int(ceil(cooldownOutcome.until.timeIntervalSinceNow))) 秒"
+            return result
         }
         // 目录形状不能决定协议；仅路由缺失或无效响应允许试其他协议，认证/限流不绕过。
         if canFallback, !sawNetworkError {
