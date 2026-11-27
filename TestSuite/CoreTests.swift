@@ -364,6 +364,44 @@ enum CoreTests {
             t.contains(res.detail, "chat 端点 HTTP 424", "detail 标注 chat 状态")
         }
 
+        h.runSuite("Core.refresh 客户端策略拒绝不报 key 失效") { t in
+            let env = try! TestEnv("core-client-policy")
+            defer { env.cleanup() }
+            let core = Core()
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS providers (
+                    id TEXT PRIMARY KEY, app_type TEXT, name TEXT, settings_config TEXT,
+                    website_url TEXT, category TEXT, created_at TEXT, sort_index INTEGER,
+                    notes TEXT, icon TEXT, icon_color TEXT, meta TEXT, is_current INTEGER DEFAULT 0,
+                    in_failover_queue INTEGER DEFAULT 0
+                )
+            """)
+            try? DB(path: env.dir + "/cc-switch.db").run("""
+                CREATE TABLE IF NOT EXISTS provider_endpoints (
+                    provider_id TEXT, app_type TEXT, url TEXT, added_at TEXT
+                )
+            """)
+            guard let srv = try? MockHTTPServer(mode: .clientPolicy403) else {
+                t.expect(false, "mock 启动失败")
+                return
+            }
+            let base = "http://127.0.0.1:\(srv.port)/v1"
+            let added = try! core.add(raw: "\(base) sk-clientpolicy111111111", ccOverride: true,
+                                      cpaOverride: false, dshOverride: false,
+                                      models: ["gpt-test"], force: true,
+                                      appType: "opencode", appTypeForced: true)
+            let entry = added.entry
+            do {
+                _ = try core.refreshModels(entryIDPrefix: entry.id)
+                t.expect(false, "客户端策略拒绝应让刷新保持待验证")
+            } catch {
+                t.contains(error.localizedDescription, "渠道策略限制探测客户端", "错误解释策略限制")
+                t.expect(!error.localizedDescription.contains("接口拒绝认证"), "不再误称 key 失效")
+            }
+            let updated = core.history.find(idPrefix: entry.id)
+            t.equal(updated?.health, "err", "状态保留为待复测而非 key 失效")
+        }
+
         // 真实卡死(c30beaa0):勾选的模型 503/424 → 刷新一上来就抛错,勾选弹窗永远出不来,
         // 模型改不了;又因 cc-switch 在跑删不掉 → 两头堵。端点自己 /models 有清单就必须给改选机会
         h.runSuite("Core.refresh 端点报错仍可改选") { t in

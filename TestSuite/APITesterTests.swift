@@ -34,6 +34,7 @@ final class MockHTTPServer {
         case billingCentsSpent // 同上但 total_usage=10000(美分=$100)→ 用尽
         case html200All        // 任意路径 200 + HTML 兜底页(SPA),chat 也不例外
         case regionBlock403    // 任意路径 → 403 + JSON「access from your region is not available」(地域封锁,非 key 失效)
+        case clientPolicy403, unrelatedCLIAuth401 // 正向客户端策略拒绝 / 反向误判保护
         case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
         case webdav   // WebDAV:PUT 存/GET 取/MKCOL(账本同步回环测试)
         case magpie   // Magpie Web API:?k= 登录换 Cookie + providers 增删改
@@ -279,6 +280,10 @@ final class MockHTTPServer {
             body = "<!doctype html><html><body>app</body></html>"
         } else if mode == .regionBlock403 {
             body = "{\"error\":{\"message\":\"API access from your region is not available. Token Harbor cannot serve requests from regions under US sanctions or export controls.\"}}"
+        } else if mode == .clientPolicy403 {
+            body = "{\"error\":{\"message\":\"Only Codex CLI requests are permitted for this provider.\"}}"
+        } else if mode == .unrelatedCLIAuth401 {
+            body = "{\"error\":{\"message\":\"Unauthorized: only clients with valid API keys can use this endpoint. The CLI SDK guide is available here.\"}}"
         } else if mode == .balanceNoInfo {
             body = "{\"data\":[{\"id\":\"gpt-5.6-sol\",\"object\":\"model\"}]}"
         } else if mode == .html200 {
@@ -358,6 +363,10 @@ final class MockHTTPServer {
             status = "200 OK"
         } else if mode == .regionBlock403 {
             status = "403 Forbidden"
+        } else if mode == .clientPolicy403 {
+            status = "403 Forbidden"
+        } else if mode == .unrelatedCLIAuth401 {
+            status = "401 Unauthorized"
         } else if mode == .openAI || mode == .catalogOnly || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || mode == .partialCatalog && target.hasSuffix("/models") || (mode == .chat524 && target.hasSuffix("/models")) {
             status = "200 OK"
         } else {
@@ -702,6 +711,30 @@ enum APITesterTests {
             let result = APITester.test(url: "http://127.0.0.1:\(invalid.port)/v1", key: "sk-fixture-invalid", timeout: 2)
             t.expect(!result.ok && result.authFailed, "明确认证失败仍保留失效状态")
             t.equal(invalid.countRequests("/v1/chat/completions"), 1, "明确认证失败仍及时结束")
+        }
+        h.runSuite("APITester.client policy denial is inconclusive") { t in
+            let server = try MockHTTPServer(mode: .clientPolicy403)
+            let result = APITester.test(
+                url: "http://127.0.0.1:\(server.port)/v1",
+                key: "sk-fixture-client-policy",
+                timeout: 2
+            )
+            let health = Core.healthFor(result)
+            t.expect(!result.ok, "渠道策略拒绝探测不能算验证通过")
+            t.expect(!result.authFailed, "仅限 CLI 的 403 不应判定 key 失效")
+            t.equal(health.health, "err", "客户端策略限制保留为状态未知的探测失败")
+            t.contains(result.detail, "渠道策略限制探测客户端", "说明可在目标客户端手动验证")
+            t.contains(result.detail, "key 状态未知", "明确保留凭据状态未知")
+        }
+        h.runSuite("APITester.client policy detection ignores unrelated CLI mentions") { t in
+            let server = try MockHTTPServer(mode: .unrelatedCLIAuth401)
+            let result = APITester.test(
+                url: "http://127.0.0.1:\(server.port)/v1",
+                key: "sk-fixture-invalid-with-cli-text",
+                timeout: 2
+            )
+            t.expect(!result.ok && result.authFailed, "无关 CLI 文本不能掩盖普通认证失败")
+            t.expect(!result.detail.contains("渠道策略限制探测客户端"), "无关 CLI 文本不触发客户端策略提示")
         }
         h.runSuite("APITester.空聊天响应") { t in
             let emptyResponses = [

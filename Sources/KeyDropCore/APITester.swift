@@ -449,7 +449,8 @@ public enum APITester {
             // 401/403 需区分「认证失败」与「CF 盾拦截」:盾页是 HTML(如 Cloudflare 挑战页),
             // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(真实事故:某中转站多代理链)
             // 区域封锁 403 同理——它是 JSON,但说的是所在地而非 key
-            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) {
+            let clientRestricted = isClientRestrictedBody(body)
+            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) && !clientRestricted {
                 authFailed = true
             }
             if status == 200 {
@@ -461,7 +462,8 @@ public enum APITester {
                 return probeChatModels(models, catalogDetail: "GET \(ep) → 200")
             }
             if status == 0 { sawTransient = true }
-            lastErr = "GET \(ep) → \(status == 0 ? "超时/无响应" : "HTTP \(status)")"
+            let restrictionNote = clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : ""
+            lastErr = "GET \(ep) → \(status == 0 ? "超时/无响应" : "HTTP \(status)")\(restrictionNote)"
         }
 
         if probePool?.isEmpty == false || preferredModel?.isEmpty == false {
@@ -671,6 +673,11 @@ public enum APITester {
             // HTML 盾页(CF 挑战/basic-auth realm)≠ 认证失败,与 /models 探测口径一致:
             // /models 已返回 JSON 200 证明 key 有效,chat 撞盾页不得判 authFailed,
             // 否则 reconcile 会把活 key 当死 key 删除401/403 + JSON 才判认证失败,HTML 盾页同等豁免
+            if (status == 401 || status == 403), isClientRestrictedBody(body) {
+                return ChatProbeOutcome(style: style,
+                                        detail: "HTTP \(status)：渠道策略限制探测客户端，key 状态未知",
+                                        degraded: status)
+            }
             if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) {
                 return ChatProbeOutcome(style: style, detail: lastFailure, authStatus: status)
             }
@@ -764,8 +771,10 @@ public enum APITester {
                 return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)", verified)
             }
             // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败,不计入 authFailed
-            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) { authFailed = true }
-            lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))")
+            let clientRestricted = isClientRestrictedBody(body)
+            if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) && !clientRestricted { authFailed = true }
+            let restrictionNote = clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : ""
+            lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")\(restrictionNote)" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }
         return (false, authFailed, lastDesc, false)
     }
@@ -783,6 +792,28 @@ public enum APITester {
             of: "(access from your (region|country)|region(s)? (is|are) not available|not available in your (region|country)|under [a-z ]{0,24}sanction|sanctions|export controls?|geo[- ]?blocked|regional(ly)? (unavailable|blocked|restricted))",
             options: [.regularExpression, .caseInsensitive]
         ) != nil
+    }
+
+    /// A provider may deny the probe client while allowing a particular CLI or
+    /// agent. Treat only explicit client-policy wording as inconclusive; never
+    /// imitate a client identity to get around that policy.
+    private static func isClientRestrictedBody(_ s: String) -> Bool {
+        let low = s.lowercased().replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        let explicitMarkers = [
+            "unsupported client", "client is not supported", "client not supported",
+            "unsupported user agent", "user agent is required", "user agent required",
+            "user agent not supported", "user agent is not supported", "invalid user agent",
+            "expected user agent", "must use user agent",
+            "codex cli only", "only codex cli", "only for codex", "codex only",
+            "cli only", "official cli required", "official client required",
+            "client identity is required", "client must be codex", "must use codex",
+            "only clients using codex", "only to codex cli", "restricted to codex cli",
+            "codex cli is required", "codex cli required", "must use codex cli",
+            "cli is required", "cli required", "must use the cli"
+        ]
+        if explicitMarkers.contains(where: { low.contains($0) }) { return true }
+        return false
     }
 
     /// HTTP 成功码仍可能携带空体、错误 JSON 或前端兜底页。
@@ -925,9 +956,10 @@ public enum APITester {
         let body = String(data: o.data ?? Data(), encoding: .utf8) ?? ""
         let ok = status == 200 && isSuccessfulChatBody(body, style: "anthropic")
         // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败
-        let authFail = status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body))
+        let clientRestricted = isClientRestrictedBody(body)
+        let authFail = (status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body))) && !clientRestricted
         return (ok, authFail,
-                "POST \(messagesPath) → HTTP \(status == 0 ? "超时" : "\(status)")" + (body.isEmpty ? "" : " \(body.prefix(100))"))
+                "POST \(messagesPath) → HTTP \(status == 0 ? "超时" : "\(status)")" + (clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : "") + (body.isEmpty ? "" : " \(body.prefix(100))"))
     }
 
     /// 生成一条可直接粘贴运行的 curl(优先 chat,其次 models 探测)

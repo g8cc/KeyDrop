@@ -2817,8 +2817,7 @@ public final class Core {
                                                keyPoint: evidence.keyPoint, modelPoints: evidence.modelPoints) else {
                 throw ParseError.io("配置已变化，旧探测结果已丢弃，请重试")
             }
-            let deadMark = (test.authFailed || test.detail.contains("401") || test.detail.contains("403"))
-                ? "(接口拒绝认证，已移入探测失败区)" : ""
+            let deadMark = test.authFailed ? "(接口拒绝认证，已移入探测失败区)" : ""
             throw ParseError.io("✗ 不可用: \(test.detail)\(deadMark)")
         }
         // 额度状态:仅标记不提前返回——提前返回会让 quota 条目永远无法再选模型/更新列表。
