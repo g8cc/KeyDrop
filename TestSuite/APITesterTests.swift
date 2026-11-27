@@ -34,7 +34,7 @@ final class MockHTTPServer {
         case billingCentsSpent // 同上但 total_usage=10000(美分=$100)→ 用尽
         case html200All        // 任意路径 200 + HTML 兜底页(SPA),chat 也不例外
         case regionBlock403    // 任意路径 → 403 + JSON「access from your region is not available」(地域封锁,非 key 失效)
-        case clientPolicy403, unrelatedCLIAuth401 // 正向客户端策略拒绝 / 反向误判保护
+        case clientPolicy403, clientPolicyCodex, clientPolicyCodexGatewayOnly, unrelatedCLIAuth401 // 正向客户端策略拒绝 / Codex 兼容回退 / 仅网关可达 / 反向误判保护
         case cpaMgmt  // CPA 管理 API:config.yaml GET/PUT + auth-files 列表/下载/字段 PATCH(真实事故 v1.4.13)
         case webdav   // WebDAV:PUT 存/GET 取/MKCOL(账本同步回环测试)
         case magpie   // Magpie Web API:?k= 登录换 Cookie + providers 增删改
@@ -185,6 +185,8 @@ final class MockHTTPServer {
         // different headers; selectiveAuth must model invalid credentials for
         // either protocol so a fallback probe cannot mask a 401.
         let invalidKey = authorization.contains("invalid") || apiKey.contains("invalid")
+        let codexIdentity = req.lowercased().contains("originator: codex_cli_rs")
+            && req.lowercased().contains("user-agent: codex-cli")
         // POST body 里的 model 字段(selectiveModelQuota 按模型区分响应):
         // JSON 形如 "model":"xxx",用捕获组直接取引号内值
         var requestedModel = ""
@@ -286,6 +288,22 @@ final class MockHTTPServer {
             body = "{\"error\":{\"message\":\"API access from your region is not available. Token Harbor cannot serve requests from regions under US sanctions or export controls.\"}}"
         } else if mode == .clientPolicy403 {
             body = "{\"error\":{\"message\":\"Only Codex CLI requests are permitted for this provider.\"}}"
+        } else if mode == .clientPolicyCodex {
+            if codexIdentity, method == "GET", target.hasSuffix("/models") {
+                body = "{\"data\":[{\"id\":\"gpt-codex-compatible\",\"object\":\"model\"}]}"
+            } else if codexIdentity, method == "POST", target.contains("/chat/completions") {
+                body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+            } else {
+                body = "{\"error\":{\"message\":\"Only Codex CLI requests are permitted for this provider.\"}}"
+            }
+        } else if mode == .clientPolicyCodexGatewayOnly {
+            if codexIdentity, method == "POST", target.contains("/chat/completions") {
+                body = "{\"error\":{\"message\":\"unsupported model\"}}"
+            } else if codexIdentity, method == "GET", target.hasSuffix("/models") {
+                body = "{\"error\":{\"message\":\"not found\"}}"
+            } else {
+                body = "{\"error\":{\"message\":\"Only Codex CLI requests are permitted for this provider.\"}}"
+            }
         } else if mode == .unrelatedCLIAuth401 {
             body = "{\"error\":{\"message\":\"Unauthorized: only clients with valid API keys can use this endpoint. The CLI SDK guide is available here.\"}}"
         } else if mode == .balanceNoInfo {
@@ -369,6 +387,16 @@ final class MockHTTPServer {
             status = "403 Forbidden"
         } else if mode == .clientPolicy403 {
             status = "403 Forbidden"
+        } else if mode == .clientPolicyCodex {
+            status = codexIdentity ? "200 OK" : "403 Forbidden"
+        } else if mode == .clientPolicyCodexGatewayOnly {
+            if codexIdentity, method == "POST", target.contains("/chat/completions") {
+                status = "400 Bad Request"
+            } else if codexIdentity, method == "GET", target.hasSuffix("/models") {
+                status = "404 Not Found"
+            } else {
+                status = "403 Forbidden"
+            }
         } else if mode == .unrelatedCLIAuth401 {
             status = "401 Unauthorized"
         } else if mode == .openAI || mode == .catalogOnly || mode == .balanceOK || mode == .balanceZero || mode == .balanceNoInfo || mode == .quota429 || mode == .chat401 || mode == .manyModels || mode == .chatOK || mode == .claudeModels || mode == .nonChatModels || mode == .dottedModels || mode == .selectiveAuth || mode == .selectiveModelQuota || mode == .partialCatalog && target.hasSuffix("/models") || (mode == .chat524 && target.hasSuffix("/models")) {
@@ -739,6 +767,29 @@ enum APITesterTests {
             )
             t.expect(!result.ok && result.authFailed, "无关 CLI 文本不能掩盖普通认证失败")
             t.expect(!result.detail.contains("渠道策略限制探测客户端"), "无关 CLI 文本不触发客户端策略提示")
+        }
+        h.runSuite("APITester.client policy retries Codex-compatible identity") { t in
+            let server = try MockHTTPServer(mode: .clientPolicyCodex)
+            let base = "http://127.0.0.1:\(server.port)/v1"
+            let result = APITester.test(url: base, key: "sk-fixture-codex-policy", timeout: 2,
+                                        preferredModel: "gpt-codex-compatible")
+            t.expect(result.ok, "明确要求 Codex CLI 的 provider 兼容探测后可用")
+            t.expect(!result.authFailed, "兼容身份成功不得误报 key 失效")
+            t.contains(result.detail, "Codex CLI 兼容身份探测通过", "结果说明实际使用兼容身份")
+            t.expect(server.countRequests("/v1/models") >= 2, "先走标准身份，再走 Codex 兼容身份")
+
+            let model = APITester.testModelChat(base: base, key: "sk-fixture-codex-policy",
+                                                model: "gpt-codex-compatible", timeout: 2)
+            t.expect(model.ok, "显式模型验证也复用 Codex 兼容身份")
+            t.contains(model.detail, "Codex CLI 兼容身份探测通过", "显式模型结果说明兼容身份")
+        }
+        h.runSuite("APITester.client compatibility keeps unverified gateway reachable") { t in
+            let server = try MockHTTPServer(mode: .clientPolicyCodexGatewayOnly)
+            let result = APITester.test(url: "http://127.0.0.1:\(server.port)/v1",
+                                        key: "sk-fixture-codex-gateway-only", timeout: 2)
+            t.expect(result.ok && result.reachabilityOnly, "兼容身份只能证明网关可达时保留可达状态")
+            t.contains(result.detail, "尚未验证具体模型", "未验证模型时明确标注限制")
+            t.expect(!result.detail.contains("Codex CLI 兼容身份探测通过"), "未验证模型不显示探测通过")
         }
         h.runSuite("APITester.空聊天响应") { t in
             let emptyResponses = [

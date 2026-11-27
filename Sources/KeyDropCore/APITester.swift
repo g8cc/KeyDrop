@@ -30,7 +30,10 @@ public struct APITestResult {
     public let transientFailure: Bool
     public let reachabilityOnly: Bool
     public let skippedForCooldown: Bool
-    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], failedModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false, skippedForCooldown: Bool = false) {
+    /// 服务端明确要求特定 CLI/客户端身份，普通探测未能确认 key 状态。
+    /// test() 会在这个信号出现时自动进行一次受限的 Codex 兼容探测。
+    public let clientPolicyRestricted: Bool
+    public init(ok: Bool, style: String, models: [String], detail: String, authFailed: Bool, needsProxy: Bool = false, quotaExhausted: Bool = false, chatDegraded: Bool = false, workingModels: [String] = [], quotaModels: [String] = [], failedModels: [String] = [], latencyMs: Double? = nil, modelLatencies: [String: Double]? = nil, transientFailure: Bool = false, reachabilityOnly: Bool = false, skippedForCooldown: Bool = false, clientPolicyRestricted: Bool = false) {
         self.ok = ok
         self.style = style
         self.models = models
@@ -47,6 +50,7 @@ public struct APITestResult {
         self.transientFailure = transientFailure
         self.reachabilityOnly = reachabilityOnly
         self.skippedForCooldown = skippedForCooldown
+        self.clientPolicyRestricted = clientPolicyRestricted
     }
 
     /// 只将真实请求的结果转成监控点;冷却/仅目录可达不会制造模型结果。
@@ -72,6 +76,29 @@ public enum BalanceStatus: Equatable {
 }
 
 public enum APITester {
+
+    /// 请求身份只在 provider 明确返回客户端策略限制时启用。
+    /// 这不是完整的 Codex 进程模拟；它只复现官方客户端公开使用的稳定标识头，
+    /// 仍以真实有效的模型响应作为成功条件。
+    private enum ProbeClientProfile {
+        case standard
+        case codexCLI
+
+        var label: String {
+            switch self {
+            case .standard: return "KeyDrop"
+            case .codexCLI: return "Codex CLI 兼容"
+            }
+        }
+    }
+
+    private static func applyProbeClientHeaders(_ profile: ProbeClientProfile, to request: inout URLRequest) {
+        guard profile == .codexCLI else { return }
+        // Codex 的默认 HTTP client 使用 originator 标识；User-Agent 采用稳定前缀，
+        // 避免伪造未知的本机版本/系统细节。provider 通常只需识别客户端家族。
+        request.setValue("codex_cli_rs", forHTTPHeaderField: "originator")
+        request.setValue("codex-cli", forHTTPHeaderField: "User-Agent")
+    }
 
     private static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
@@ -227,7 +254,7 @@ public enum APITester {
     public static func test(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, knownNeedsProxy: Bool = false, styleHint: String? = nil) -> APITestResult {
         let p = proxy?.trimmingCharacters(in: .whitespaces)
         if knownNeedsProxy, let p, !p.isEmpty {
-            let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
+            let via = testWithClientCompatibility(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
             if via.skippedForCooldown { return via }
             if via.ok {
                 return APITestResult(ok: true, style: via.style, models: via.models,
@@ -236,11 +263,12 @@ public enum APITester {
                                      quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
                                      workingModels: via.workingModels, quotaModels: via.quotaModels, failedModels: via.failedModels,
                                      latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
-                                     transientFailure: false, reachabilityOnly: via.reachabilityOnly)
+                                     transientFailure: false, reachabilityOnly: via.reachabilityOnly,
+                                     clientPolicyRestricted: via.clientPolicyRestricted)
             }
             // 代理侧也不通才回退直连一次:可能是本机代理挂了,也可能是地区限制解除
             // (或 key 真失效)。直连恢复可用就不再标 needsProxy,下轮回到常规路径
-            let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
+            let direct = testWithClientCompatibility(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
             if direct.ok { return direct }
             if direct.authFailed, !via.authFailed { return direct }
             // 两侧都失败:暂时性 = 两侧都暂时(一侧被明确拒绝就不是网络问题)
@@ -250,10 +278,11 @@ public enum APITester {
                                  chatDegraded: via.chatDegraded, workingModels: via.workingModels,
                                  quotaModels: via.quotaModels, failedModels: via.failedModels, latencyMs: via.latencyMs,
                                  modelLatencies: via.modelLatencies,
-                                 transientFailure: via.transientFailure && direct.transientFailure)
+                                 transientFailure: via.transientFailure && direct.transientFailure,
+                                 clientPolicyRestricted: via.clientPolicyRestricted || direct.clientPolicyRestricted)
         }
         // 先按真实环境(直连)测试;直连失败且配置了代理时补测代理,并标记需代理
-        let direct = testOnce(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
+        let direct = testWithClientCompatibility(url: url, key: key, timeout: timeout, proxy: nil, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
         if direct.ok || direct.skippedForCooldown { return direct }
         if p == nil || p!.isEmpty {
             return direct
@@ -262,7 +291,7 @@ public enum APITester {
         // 但区域/合规封锁返回的正是 JSON 403(真实事故:tokenharbor
         // 「API access from your region is not available」),key 有效、经代理 200,
         // 短路把这类 key 直接判死,用户配好的代理一次都没用上
-        let via = testOnce(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
+        let via = testWithClientCompatibility(url: url, key: key, timeout: timeout, proxy: p, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint)
         if via.ok {
             // 必须透传探测明细:只拷 ok/models/detail 会把 workingModels/quotaModels/延迟/
             // quotaExhausted 全部丢掉 → 需代理的 key 导入时限流模型不被排除、监控图无延迟、
@@ -273,7 +302,8 @@ public enum APITester {
                                  quotaExhausted: via.quotaExhausted, chatDegraded: via.chatDegraded,
                                  workingModels: via.workingModels, quotaModels: via.quotaModels, failedModels: via.failedModels,
                                  latencyMs: via.latencyMs, modelLatencies: via.modelLatencies,
-                                 reachabilityOnly: via.reachabilityOnly)
+                                 reachabilityOnly: via.reachabilityOnly,
+                                 clientPolicyRestricted: via.clientPolicyRestricted)
         }
         // 两路都失败:直连拿到了 key 级结论(401/403)而代理侧只是连不通
         // (超时/无响应)→ 保留直连结论,别把代理故障说成 key 失效
@@ -281,7 +311,53 @@ public enum APITester {
         return via
     }
 
-    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, styleHint: String? = nil) -> APITestResult {
+    /// 普通探测只在服务端明确返回客户端策略限制时重试一次兼容身份。
+    /// 兼容请求仍必须拿到真实模型响应，不能因为换了 User-Agent 就报成功。
+    private static func testWithClientCompatibility(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, styleHint: String? = nil) -> APITestResult {
+        let standard = testOnce(url: url, key: key, timeout: timeout, proxy: proxy, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint, clientProfile: .standard)
+        guard standard.clientPolicyRestricted else { return standard }
+
+        let compatible = testOnce(url: url, key: key, timeout: timeout, proxy: proxy, preferredModel: preferredModel, modelProbeTimes: modelProbeTimes, importedModels: importedModels, probePool: probePool, styleHint: styleHint, clientProfile: .codexCLI)
+        if compatible.ok {
+            let compatibilityDetail = compatible.reachabilityOnly
+                ? compatible.detail + " | Codex CLI 兼容身份已接受，但尚未验证具体模型"
+                : compatible.detail + " | Codex CLI 兼容身份探测通过"
+            return APITestResult(ok: compatible.ok, style: compatible.style, models: compatible.models,
+                                 detail: compatibilityDetail,
+                                 authFailed: compatible.authFailed, needsProxy: compatible.needsProxy,
+                                 quotaExhausted: compatible.quotaExhausted, chatDegraded: compatible.chatDegraded,
+                                 workingModels: compatible.workingModels, quotaModels: compatible.quotaModels,
+                                 failedModels: compatible.failedModels, latencyMs: compatible.latencyMs,
+                                 modelLatencies: compatible.modelLatencies, transientFailure: compatible.transientFailure,
+                                 reachabilityOnly: compatible.reachabilityOnly,
+                                 skippedForCooldown: compatible.skippedForCooldown,
+                                 clientPolicyRestricted: false)
+        }
+        if compatible.authFailed {
+            return APITestResult(ok: false, style: compatible.style, models: compatible.models,
+                                 detail: compatible.detail + " | Codex CLI 兼容身份已接受，但 key 认证失败",
+                                 authFailed: true, needsProxy: compatible.needsProxy,
+                                 quotaExhausted: compatible.quotaExhausted, chatDegraded: compatible.chatDegraded,
+                                 workingModels: compatible.workingModels, quotaModels: compatible.quotaModels,
+                                 failedModels: compatible.failedModels, latencyMs: compatible.latencyMs,
+                                 modelLatencies: compatible.modelLatencies, transientFailure: compatible.transientFailure,
+                                 reachabilityOnly: compatible.reachabilityOnly,
+                                 skippedForCooldown: compatible.skippedForCooldown,
+                                 clientPolicyRestricted: false)
+        }
+        return APITestResult(ok: standard.ok, style: standard.style, models: standard.models,
+                             detail: standard.detail + " | 已尝试 Codex CLI 兼容身份，仍未通过",
+                             authFailed: standard.authFailed, needsProxy: standard.needsProxy,
+                             quotaExhausted: standard.quotaExhausted, chatDegraded: standard.chatDegraded,
+                             workingModels: standard.workingModels, quotaModels: standard.quotaModels,
+                             failedModels: standard.failedModels, latencyMs: standard.latencyMs,
+                             modelLatencies: standard.modelLatencies, transientFailure: standard.transientFailure,
+                             reachabilityOnly: standard.reachabilityOnly,
+                             skippedForCooldown: standard.skippedForCooldown,
+                             clientPolicyRestricted: true)
+    }
+
+    private static func testOnce(url: String, key: String, timeout: TimeInterval = 12, proxy: String? = nil, preferredModel: String? = nil, modelProbeTimes: [String: TimeInterval]? = nil, importedModels: [String]? = nil, probePool: [String]? = nil, styleHint: String? = nil, clientProfile: ProbeClientProfile = .standard) -> APITestResult {
         let base = Parser.normalizeURL(url) ?? url
         let styleHint = styleHint ?? Parser.apiStyle(for: url)
         let candidates = endpointCandidates(base)
@@ -290,11 +366,12 @@ public enum APITester {
         var lastErr = "无"
         let style = ""
         var authFailed = false
+        var clientPolicyRestricted = false
         // 暂时性网络层失败标记(超时/不可达):健康扫描防抖判定依据。
         // 服务端明确应答(HTTP 任意状态)反证网络层可达 → 非暂时性
         var sawTransient = false
         // 目录可选；显式模型应始终用自己的请求验证，不能借用占位模型结果。
-        func probeChatModels(_ models: [String], catalogDetail: String, catalogAuthFailed: Bool = false) -> APITestResult {
+        func probeChatModels(_ models: [String], catalogDetail: String, catalogAuthFailed: Bool = false, catalogClientRestricted: Bool = false) -> APITestResult {
             var lastErr = "无"
             var style = ["anthropic", "responses"].contains(styleHint ?? "") ? styleHint! : "openai"
             // models 200 后补测 chat 端点(用渠道真实模型,伪模型 test 会被网关先以 400 拒绝):
@@ -322,9 +399,11 @@ public enum APITester {
             var skippedCount = 0
             var cooldownDetail: String?
             var modelLatencies: [String: Double] = [:]
+            var clientPolicyRestricted = catalogClientRestricted
             for probe in probeOrder {
-                let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe, style: style)
+                let chat = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: probe, style: style, clientProfile: clientProfile)
                 if let detectedStyle = chat.style { style = detectedStyle }
+                if chat.clientPolicyRestricted { clientPolicyRestricted = true }
                 if chat.skippedForCooldown {
                     skippedCount += 1
                     cooldownDetail = chat.detail
@@ -382,7 +461,8 @@ public enum APITester {
                 return APITestResult(ok: false, style: style, models: models,
                                      detail: "\(catalogDetail), 但 chat 端点 HTTP \(st)(\(m) 认证失败/key 失效)",
                                      authFailed: true, quotaModels: quotaModels.filter { realModels.contains($0) },
-                                     failedModels: reportedFailures, modelLatencies: modelLatencies)
+                                     failedModels: reportedFailures, modelLatencies: modelLatencies,
+                                     clientPolicyRestricted: clientPolicyRestricted)
             }
             // models 为空时探测用的是占位 "test",不得混进返回模型列表;有真实模型才重排
             let hasRealModels = !models.isEmpty
@@ -400,7 +480,8 @@ public enum APITester {
                                      workingModels: working.filter { realModels.contains($0) },
                                      quotaModels: quotaModels.filter { realModels.contains($0) }, failedModels: reportedFailures,
                                      latencyMs: firstWorkingLatency,
-                                     modelLatencies: modelLatencies.isEmpty ? nil : modelLatencies)
+                                     modelLatencies: modelLatencies.isEmpty ? nil : modelLatencies,
+                                     clientPolicyRestricted: clientPolicyRestricted)
             }
             if let (m, st) = degradedModel {
                 let stDesc = st == 0 ? "超时/无响应" : "HTTP \(st)"
@@ -408,17 +489,20 @@ public enum APITester {
                                      detail: "\(catalogDetail), 但 chat 端点 \(stDesc)(\(m) 服务不可用/限流)" + (lastErr == "无" ? "" : " | \(lastErr)"),
                                      authFailed: catalogAuthFailed, quotaModels: quotaModels.filter { realModels.contains($0) },
                                      failedModels: reportedFailures, modelLatencies: modelLatencies,
-                                     transientFailure: !catalogAuthFailed && failedModels.count > 0 && modelLatencies.isEmpty && st == 0)
+                                     transientFailure: !catalogAuthFailed && failedModels.count > 0 && modelLatencies.isEmpty && st == 0,
+                                     clientPolicyRestricted: clientPolicyRestricted)
             }
             if !quotaModels.isEmpty, !realModels.isEmpty {
                 return APITestResult(ok: true, style: style, models: models,
                                      detail: "\(catalogDetail), 但探测的 \(quotaModels.count) 个模型均 quota exhausted(无额度)",
                                      authFailed: false, quotaExhausted: true, quotaModels: quotaModels.filter { realModels.contains($0) },
-                                     failedModels: reportedFailures, modelLatencies: modelLatencies)
+                                     failedModels: reportedFailures, modelLatencies: modelLatencies,
+                                     clientPolicyRestricted: clientPolicyRestricted)
             }
             return APITestResult(ok: true, style: style, models: models,
                                  detail: "\(catalogDetail)，未验证对话模型",
-                                 authFailed: false, failedModels: reportedFailures, reachabilityOnly: true)
+                                 authFailed: false, failedModels: reportedFailures, reachabilityOnly: true,
+                                 clientPolicyRestricted: clientPolicyRestricted)
         }
 
         for ep in candidates {
@@ -429,6 +513,7 @@ public enum APITester {
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
             req.setValue(key, forHTTPHeaderField: "x-api-key")
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+            applyProbeClientHeaders(clientProfile, to: &req)
 
             let o = NetSync.run(session: s, request: req, timeout: timeout)
             let status = NetSync.statusCode(o)
@@ -450,6 +535,7 @@ public enum APITester {
             // key 本身可能有效、经代理可达;误标 authFailed 会短路后续代理补测(真实事故:某中转站多代理链)
             // 区域封锁 403 同理——它是 JSON,但说的是所在地而非 key
             let clientRestricted = isClientRestrictedBody(body)
+            if clientRestricted { clientPolicyRestricted = true }
             if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) && !clientRestricted {
                 authFailed = true
             }
@@ -459,7 +545,7 @@ public enum APITester {
                     lastErr = "GET \(ep) → 200 但非 JSON(疑似前端兜底页)"
                     continue
                 }
-                return probeChatModels(models, catalogDetail: "GET \(ep) → 200")
+                return probeChatModels(models, catalogDetail: "GET \(ep) → 200", catalogClientRestricted: clientPolicyRestricted)
             }
             if status == 0 { sawTransient = true }
             let restrictionNote = clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : ""
@@ -468,29 +554,31 @@ public enum APITester {
 
         if probePool?.isEmpty == false || preferredModel?.isEmpty == false {
             return probeChatModels([], catalogDetail: "模型目录不可用\(authFailed ? "（认证被拒绝）" : "")，使用已配置模型",
-                                   catalogAuthFailed: authFailed)
+                                   catalogAuthFailed: authFailed, catalogClientRestricted: clientPolicyRestricted)
         }
 
-        let anthropic = anthropicTest(base: base, key: key, timeout: timeout, proxy: proxy)
+        let anthropic = anthropicTest(base: base, key: key, timeout: timeout, proxy: proxy, clientProfile: clientProfile)
         if anthropic.0 {
             return APITestResult(ok: true, style: "anthropic", models: [],
                                  detail: "\(anthropic.2) (Anthropic 兼容认证通过)",
-                                 authFailed: false)
+                                 authFailed: false, clientPolicyRestricted: anthropic.3)
         }
         authFailed = authFailed || anthropic.1
         lastErr += "; \(anthropic.2)"
 
-        let chat = openaiChatTest(base: base, key: key, timeout: timeout, proxy: proxy)
+        let chat = openaiChatTest(base: base, key: key, timeout: timeout, proxy: proxy, clientProfile: clientProfile)
         if chat.0 {
             return APITestResult(ok: true, style: "openai", models: [],
                                  detail: chat.2,
-                                 authFailed: false, reachabilityOnly: !chat.3)
+                                 authFailed: false, reachabilityOnly: !chat.3,
+                                 clientPolicyRestricted: anthropic.3 || chat.4)
         }
         authFailed = authFailed || chat.1
         lastErr += "; \(chat.2)"
         // 服务端明确拒绝(401/403)或任何 HTTP 应答都不是「暂时性」;纯网络层失败才是
         return APITestResult(ok: false, style: style, models: [], detail: lastErr,
-                             authFailed: authFailed, transientFailure: sawTransient && !authFailed)
+                             authFailed: authFailed, transientFailure: sawTransient && !authFailed,
+                             clientPolicyRestricted: anthropic.3 || chat.4 || clientPolicyRestricted)
     }
 
     /// chat 探测模型采样:preferredModel(用户实际激活的模型)置顶 —— 显示可用
@@ -586,6 +674,7 @@ public enum APITester {
         var skippedForCooldown = false
         var invalidResponse = false
         var invalidStatus: Int?
+        var clientPolicyRestricted = false
     }
 
     private static let cooldownLock = NSLock()
@@ -614,7 +703,7 @@ public enum APITester {
     /// - authStatus: 401/403(非 HTML 盾页)→ 认证失败/key 失效。/models 常是公共端点(无 key 也 200),
     ///   只有 chat 探测能发现 key 失效;遗漏会让无额度/失效 key 的条目刷新后仍判 ok(真实事故:ollama.com
     ///   /models 200 但 chat 401,条目一直 health=ok 不被自动移出)
-    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String, style: String = "openai", canFallback: Bool = true, stream: Bool = true, useCooldown: Bool = true) -> ChatProbeOutcome {
+    private static func chatHealthCheck(base: String, key: String, timeout: TimeInterval, proxy: String?, model: String, style: String = "openai", canFallback: Bool = true, stream: Bool = true, useCooldown: Bool = true, clientProfile: ProbeClientProfile = .standard) -> ChatProbeOutcome {
         let base = Parser.normalizeURL(base) ?? base
         let hasVersion = base.range(of: #"/v[0-9]+(?:beta[0-9]*)?$"#, options: .regularExpression) != nil
         let native = style == "anthropic"
@@ -655,6 +744,7 @@ public enum APITester {
                 req.setValue(key, forHTTPHeaderField: "x-api-key")
                 req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
             }
+            applyProbeClientHeaders(clientProfile, to: &req)
             // stream:true 按真实使用形态探测:非流式 OK 但流式转换坏的中转站会被识别。
             // 判定兼容两种响应:SSE(data: 行)与普通 JSON —— 宽松以兼容各网关形态
             let payload: [String: Any] = style == "responses"
@@ -676,7 +766,7 @@ public enum APITester {
             if (status == 401 || status == 403), isClientRestrictedBody(body) {
                 return ChatProbeOutcome(style: style,
                                         detail: "HTTP \(status)：渠道策略限制探测客户端，key 状态未知",
-                                        degraded: status)
+                                        degraded: status, clientPolicyRestricted: true)
             }
             if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) {
                 return ChatProbeOutcome(style: style, detail: lastFailure, authStatus: status)
@@ -731,7 +821,8 @@ public enum APITester {
             alternatives.append("responses")
             for candidate in alternatives where candidate != style {
                 let result = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model,
-                                             style: candidate, canFallback: false, stream: stream, useCooldown: useCooldown)
+                                             style: candidate, canFallback: false, stream: stream, useCooldown: useCooldown,
+                                             clientProfile: clientProfile)
                 if !result.invalidResponse { return result }
             }
         }
@@ -740,12 +831,13 @@ public enum APITester {
                                 invalidStatus: lastStatus)
     }
 
-    private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String, Bool) {
+    private static func openaiChatTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil, clientProfile: ProbeClientProfile = .standard) -> (Bool, Bool, String, Bool, Bool) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let chatPaths = hasV1 ? ["/chat/completions"] : ["/chat/completions", "/v1/chat/completions"]
         let s = session(for: proxy)
         var lastDesc = ""
         var authFailed = false
+        var clientRestrictedSeen = false
         for path in chatPaths {
             guard let u = URL(string: base + path) else { continue }
             var req = URLRequest(url: u)
@@ -753,6 +845,7 @@ public enum APITester {
             req.timeoutInterval = timeout
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            applyProbeClientHeaders(clientProfile, to: &req)
             req.httpBody = try? JSONSerialization.data(withJSONObject: [
                 "model": "test",
                 "max_tokens": 1,
@@ -765,18 +858,19 @@ public enum APITester {
                 lastDesc = "POST \(base)\(path) → 连接不可达"
                 break
             }
+            // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败,不计入 authFailed
+            let clientRestricted = isClientRestrictedBody(body)
+            if clientRestricted { clientRestrictedSeen = true }
             let verified = status == 200 && isSuccessfulChatBody(body, style: "openai")
             let ok = verified || status == 400 || (status == 404 && isGatewayErrorBody(body))
             if ok {
-                return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)", verified)
+                return (true, false, "POST \(base)\(path) → HTTP \(status)(网关可达)", verified, clientRestrictedSeen)
             }
-            // HTML 盾页(CF 挑战)/区域封锁 ≠ 认证失败,不计入 authFailed
-            let clientRestricted = isClientRestrictedBody(body)
             if (status == 401 || status == 403) && !isHTMLBody(body) && !isGeoBlockBody(body) && !clientRestricted { authFailed = true }
             let restrictionNote = clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : ""
             lastDesc = "POST \(base)\(path) → HTTP \(status == 0 ? "超时" : "\(status)")\(restrictionNote)" + (body.isEmpty ? "" : " \(body.prefix(100))")
         }
-        return (false, authFailed, lastDesc, false)
+        return (false, authFailed, lastDesc, false, clientRestrictedSeen)
     }
 
     static func isHTMLBody(_ s: String) -> Bool {
@@ -795,8 +889,8 @@ public enum APITester {
     }
 
     /// A provider may deny the probe client while allowing a particular CLI or
-    /// agent. Treat only explicit client-policy wording as inconclusive; never
-    /// imitate a client identity to get around that policy.
+    /// agent. Treat only explicit client-policy wording as inconclusive; the
+    /// caller decides whether the narrow Codex-compatible retry is appropriate.
     private static func isClientRestrictedBody(_ s: String) -> Bool {
         let low = s.lowercased().replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
@@ -934,17 +1028,18 @@ public enum APITester {
         return ["\(base)/models", "\(base)/v1/models"]
     }
 
-    private static func anthropicTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil) -> (Bool, Bool, String) {
+    private static func anthropicTest(base: String, key: String, timeout: TimeInterval, proxy: String? = nil, clientProfile: ProbeClientProfile = .standard) -> (Bool, Bool, String, Bool) {
         let hasV1 = base.hasSuffix("/v1") || base.hasSuffix("/api/v1")
         let messagesPath = hasV1 ? "\(base)/messages" : "\(base)/v1/messages"
         let s = session(for: proxy)
-        guard let u = URL(string: messagesPath) else { return (false, false, "URL 非法") }
+        guard let u = URL(string: messagesPath) else { return (false, false, "URL 非法", false) }
         var req = URLRequest(url: u)
         req.httpMethod = "POST"
         req.timeoutInterval = timeout
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(key, forHTTPHeaderField: "x-api-key")
         req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        applyProbeClientHeaders(clientProfile, to: &req)
         req.httpBody = try? JSONSerialization.data(withJSONObject: [
             "model": "claude-3-5-sonnet-20241022",
             "max_tokens": 1,
@@ -959,7 +1054,8 @@ public enum APITester {
         let clientRestricted = isClientRestrictedBody(body)
         let authFail = (status == 401 || (status == 403 && !isHTMLBody(body) && !isGeoBlockBody(body))) && !clientRestricted
         return (ok, authFail,
-                "POST \(messagesPath) → HTTP \(status == 0 ? "超时" : "\(status)")" + (clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : "") + (body.isEmpty ? "" : " \(body.prefix(100))"))
+                "POST \(messagesPath) → HTTP \(status == 0 ? "超时" : "\(status)")" + (clientRestricted ? "（渠道策略限制探测客户端，key 状态未知）" : "") + (body.isEmpty ? "" : " \(body.prefix(100))"),
+                clientRestricted)
     }
 
     /// 生成一条可直接粘贴运行的 curl(优先 chat,其次 models 探测)
@@ -1013,9 +1109,21 @@ public enum APITester {
         let styleHint = styleHint ?? Parser.apiStyle(for: base)
         let style = ["anthropic", "responses"].contains(styleHint ?? "") ? styleHint! : "openai"
         let result = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model,
-                                     style: style, stream: false, useCooldown: false)
-        return (result.latencyMs != nil,
-                result.detail ?? "模型验证失败：端点不支持或请求超时/无响应",
+                                     style: style, stream: false, useCooldown: false, clientProfile: .standard)
+        if !result.clientPolicyRestricted {
+            return (result.latencyMs != nil,
+                    result.detail ?? "模型验证失败：端点不支持或请求超时/无响应",
+                    result.style ?? style)
+        }
+        let compatible = chatHealthCheck(base: base, key: key, timeout: timeout, proxy: proxy, model: model,
+                                         style: style, stream: false, useCooldown: false, clientProfile: .codexCLI)
+        if compatible.latencyMs != nil {
+            return (true,
+                    (compatible.detail ?? "模型验证通过") + " | Codex CLI 兼容身份探测通过",
+                    compatible.style ?? style)
+        }
+        return (false,
+                (result.detail ?? "模型验证失败：端点不支持或请求超时/无响应") + " | 已尝试 Codex CLI 兼容身份，仍未通过",
                 result.style ?? style)
     }
 
